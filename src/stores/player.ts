@@ -1,0 +1,127 @@
+import { defineStore } from "pinia";
+import { computed, ref } from "vue";
+import * as api from "@/lib/api";
+import type { PlaybackSnapshot, PlayContext, QueueView, Repeat, Track } from "@/lib/types";
+
+export const usePlayerStore = defineStore("player", () => {
+  const snapshot = ref<PlaybackSnapshot>({
+    playing: false,
+    positionSecs: 0,
+    durationSecs: 0,
+    volume: 1,
+    speed: 1,
+    limiterReductionDb: 0,
+    deviceName: "",
+    deviceSampleRate: 48000,
+    stream: null,
+  });
+  const track = ref<Track | null>(null);
+  const queue = ref<QueueView>({
+    items: [],
+    currentIndex: null,
+    upcoming: [],
+    shuffle: false,
+    repeat: "off",
+    context: null,
+  });
+
+  /** Set while the user drags the scrubber, so ticks do not fight the drag. */
+  const scrubbing = ref(false);
+  const scrubPosition = ref(0);
+
+  const playing = computed(() => snapshot.value.playing);
+  const position = computed(() =>
+    scrubbing.value ? scrubPosition.value : snapshot.value.positionSecs,
+  );
+  const duration = computed(
+    () => snapshot.value.durationSecs || track.value?.durationSecs || 0,
+  );
+  const progress = computed(() =>
+    duration.value > 0 ? Math.min(1, position.value / duration.value) : 0,
+  );
+
+  function applySnapshot(next: PlaybackSnapshot) {
+    snapshot.value = next;
+  }
+
+  async function refresh() {
+    const [snap, current, q] = await Promise.all([
+      api.playbackState(),
+      api.currentTrack(),
+      api.queueState(),
+    ]);
+    snapshot.value = snap;
+    track.value = current;
+    queue.value = q;
+  }
+
+  async function refreshQueue() {
+    queue.value = await api.queueState();
+  }
+
+  async function toggle() {
+    // Optimistic, so the button responds on the same frame it is pressed.
+    if (track.value) snapshot.value = { ...snapshot.value, playing: !snapshot.value.playing };
+    await api.togglePlay();
+  }
+
+  async function playTracks(
+    tracks: Track[] | string[],
+    startIndex = 0,
+    context: PlayContext | null = null,
+  ) {
+    const trackIds = tracks.map((t) => (typeof t === "string" ? t : t.id));
+    await api.playTracks({ trackIds, startIndex, context });
+  }
+
+  async function next() {
+    await api.nextTrack();
+  }
+
+  async function previous() {
+    await api.previousTrack();
+  }
+
+  async function seek(seconds: number) {
+    snapshot.value = { ...snapshot.value, positionSecs: seconds };
+    await api.seek(seconds);
+  }
+
+  async function setVolume(volume: number) {
+    snapshot.value = { ...snapshot.value, volume };
+    await api.setVolume(volume);
+  }
+
+  async function setShuffle(enabled: boolean) {
+    await api.setShuffle(enabled);
+  }
+
+  async function cycleRepeat() {
+    const order: Repeat[] = ["off", "all", "one"];
+    const nextMode = order[(order.indexOf(queue.value.repeat) + 1) % order.length];
+    await api.setRepeat(nextMode);
+  }
+
+  return {
+    snapshot,
+    track,
+    queue,
+    scrubbing,
+    scrubPosition,
+    playing,
+    position,
+    duration,
+    progress,
+    applySnapshot,
+    refresh,
+    refreshQueue,
+    toggle,
+    playTracks,
+    next,
+    previous,
+    seek,
+    setVolume,
+    setShuffle,
+    cycleRepeat,
+  };
+});
