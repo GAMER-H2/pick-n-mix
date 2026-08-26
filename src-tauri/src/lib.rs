@@ -23,7 +23,10 @@ fn artwork_response(state: &AppState, uri: &str) -> tauri::http::Response<Vec<u8
     use tauri::http::{Response, StatusCode};
 
     let not_found = || {
-        Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new()).expect("static response")
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Vec::new())
+            .expect("static response")
     };
 
     // The id is the last path segment, whichever host form the platform uses.
@@ -156,7 +159,12 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                                 let rate = state.engine.device_sample_rate();
                                 match crate::audio::decode::TrackDecoder::open(&path, rate) {
                                     Ok(decoder) => state.engine.prepare_next(
-                                        decoder, settings, gain_db, token, order_index, track_id,
+                                        decoder,
+                                        settings,
+                                        gain_db,
+                                        token,
+                                        order_index,
+                                        track_id,
                                     ),
                                     Err(e) => {
                                         eprintln!(
@@ -178,7 +186,10 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                             None => state.engine.cancel_next(),
                         }
                     }
-                    EngineEvent::TrackAdvanced { order_index, track_id } => {
+                    EngineEvent::TrackAdvanced {
+                        order_index,
+                        track_id,
+                    } => {
                         {
                             let mut player = state.player.lock();
                             match player.jump_to(order_index) {
@@ -227,7 +238,12 @@ fn spawn_ticker(app: tauri::AppHandle) {
             // Keep the OS transport in step. `publish` skips the call when
             // nothing has changed, so this is cheap at tick rate.
             let current = state.player.lock().current().cloned();
-            media::publish(&app, current.as_ref(), snapshot.playing, snapshot.position_secs);
+            media::publish(
+                &app,
+                current.as_ref(),
+                snapshot.playing,
+                snapshot.position_secs,
+            );
 
             for id in state.engine.take_bed_requests() {
                 if state.engine.has_bed(&id) {
@@ -243,7 +259,8 @@ fn spawn_ticker(app: tauri::AppHandle) {
                 match audio::ambience::load_bed(std::path::Path::new(&path), rate) {
                     Ok(samples) => state.engine.install_bed(id, samples),
                     Err(e) => {
-                        let _ = app.emit("engine-error", format!("could not load filter {id}: {e}"));
+                        let _ =
+                            app.emit("engine-error", format!("could not load filter {id}: {e}"));
                     }
                 }
             }

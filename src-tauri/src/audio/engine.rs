@@ -60,7 +60,10 @@ pub enum EngineEvent {
     /// A prepared voice has taken over from the current one on the worker's
     /// own schedule. The app should move its queue cursor to match — it must
     /// *not* also call `engine.load()`, since the audio never stopped.
-    TrackAdvanced { order_index: usize, track_id: String },
+    TrackAdvanced {
+        order_index: usize,
+        track_id: String,
+    },
     /// Something went wrong; the message is safe to show to the user.
     Error { message: String },
 }
@@ -150,7 +153,12 @@ struct Voice {
 }
 
 enum Cmd {
-    Load { path: PathBuf, start_secs: f64, gain_db: f32, reply: Sender<Result<StreamInfo>> },
+    Load {
+        path: PathBuf,
+        start_secs: f64,
+        gain_db: f32,
+        reply: Sender<Result<StreamInfo>>,
+    },
     Seek(f64),
     Clear,
     /// A decoder opened and ready on the app side, in reply to `NeedNext`.
@@ -215,26 +223,46 @@ impl AudioEngine {
         let (device_rate, _channels) = ready_rx
             .recv()
             .map_err(|_| anyhow!("audio thread died during start-up"))??;
-        let producer = ring_rx.recv().map_err(|_| anyhow!("audio ring was never handed over"))?;
+        let producer = ring_rx
+            .recv()
+            .map_err(|_| anyhow!("audio ring was never handed over"))?;
 
         let worker_shared = Arc::clone(&shared);
         let worker_beds = bed_tx.clone();
         std::thread::Builder::new()
             .name("pnm-audio-dsp".into())
             .spawn(move || {
-                worker(worker_shared, cmd_rx, producer, events, worker_beds, device_rate)
+                worker(
+                    worker_shared,
+                    cmd_rx,
+                    producer,
+                    events,
+                    worker_beds,
+                    device_rate,
+                )
             })
             .map_err(|e| anyhow!("spawning dsp thread: {e}"))?;
 
-        Ok(AudioEngine { shared, cmd_tx, bed_requests, bed_tx })
+        Ok(AudioEngine {
+            shared,
+            cmd_tx,
+            bed_requests,
+            bed_tx,
+        })
     }
 
     pub fn load(&self, path: PathBuf, start_secs: f64, gain_db: f32) -> Result<StreamInfo> {
         let (reply, rx) = bounded(1);
         self.cmd_tx
-            .send(Cmd::Load { path, start_secs, gain_db, reply })
+            .send(Cmd::Load {
+                path,
+                start_secs,
+                gain_db,
+                reply,
+            })
             .map_err(|_| anyhow!("audio worker is gone"))?;
-        rx.recv().map_err(|_| anyhow!("audio worker dropped the request"))?
+        rx.recv()
+            .map_err(|_| anyhow!("audio worker dropped the request"))?
     }
 
     pub fn play(&self) {
@@ -259,7 +287,9 @@ impl AudioEngine {
     }
 
     pub fn set_volume(&self, volume: f32) {
-        self.shared.volume.store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        self.shared
+            .volume
+            .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn set_settings(&self, settings: Resolved) {
@@ -271,7 +301,9 @@ impl AudioEngine {
     }
 
     pub fn set_track_gain_db(&self, db: f32) {
-        self.shared.track_gain_db.store(db.to_bits(), Ordering::Relaxed);
+        self.shared
+            .track_gain_db
+            .store(db.to_bits(), Ordering::Relaxed);
     }
 
     pub fn set_crossfade(&self, settings: CrossfadeSettings) {
@@ -425,7 +457,11 @@ where
                     }
                 }
 
-                let want_fade = if shared.playing.load(Ordering::Relaxed) { 1.0 } else { 0.0 };
+                let want_fade = if shared.playing.load(Ordering::Relaxed) {
+                    1.0
+                } else {
+                    0.0
+                };
                 let target_volume = shared.volume();
 
                 for frame in data.chunks_mut(channels) {
@@ -520,8 +556,15 @@ fn worker(
         let mut shutdown = false;
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
-                Cmd::Load { path, start_secs, gain_db, reply } => {
-                    shared.track_gain_db.store(gain_db.to_bits(), Ordering::Relaxed);
+                Cmd::Load {
+                    path,
+                    start_secs,
+                    gain_db,
+                    reply,
+                } => {
+                    shared
+                        .track_gain_db
+                        .store(gain_db.to_bits(), Ordering::Relaxed);
                     match TrackDecoder::open(&path, device_rate) {
                         Ok(mut d) => {
                             if start_secs > 0.0 {
@@ -533,10 +576,9 @@ fn worker(
                             shared
                                 .duration_ms
                                 .store((info.duration_secs * 1000.0) as u64, Ordering::Relaxed);
-                            shared.position_ms.store(
-                                (d.decoded_secs() * 1000.0) as u64,
-                                Ordering::Relaxed,
-                            );
+                            shared
+                                .position_ms
+                                .store((d.decoded_secs() * 1000.0) as u64, Ordering::Relaxed);
                             shared.stream_info.store(Arc::new(Some(info.clone())));
                             current = Some(Voice {
                                 decoder: d,
@@ -566,7 +608,9 @@ fn worker(
                 Cmd::Seek(secs) => {
                     if let Some(cur) = current.as_mut() {
                         if let Err(e) = cur.decoder.seek(secs) {
-                            let _ = events.send(EngineEvent::Error { message: e.to_string() });
+                            let _ = events.send(EngineEvent::Error {
+                                message: e.to_string(),
+                            });
                         }
                         // A seek can move arbitrarily far from the track's own
                         // end, which invalidates any in-flight crossfade
@@ -575,9 +619,10 @@ fn worker(
                         next_wait_token = None;
                         drain(&shared);
                         finished_reported = false;
-                        shared
-                            .position_ms
-                            .store((cur.decoder.decoded_secs() * 1000.0) as u64, Ordering::Relaxed);
+                        shared.position_ms.store(
+                            (cur.decoder.decoded_secs() * 1000.0) as u64,
+                            Ordering::Relaxed,
+                        );
                     }
                 }
                 Cmd::Clear => {
@@ -589,7 +634,14 @@ fn worker(
                     shared.duration_ms.store(0, Ordering::Relaxed);
                     drain(&shared);
                 }
-                Cmd::PrepareNext { decoder, settings, gain_db, token, order_index, track_id } => {
+                Cmd::PrepareNext {
+                    decoder,
+                    settings,
+                    gain_db,
+                    token,
+                    order_index,
+                    track_id,
+                } => {
                     // Only accepted if it answers the request currently
                     // outstanding; anything else is stale.
                     if next_wait_token == Some(token) {
@@ -599,7 +651,10 @@ fn worker(
                             settings,
                             track_gain_db: gain_db,
                             chain_ix,
-                            queue_ref: Some(QueueRef { order_index, track_id }),
+                            queue_ref: Some(QueueRef {
+                                order_index,
+                                track_id,
+                            }),
                         });
                         next_wait_token = None;
                     }
@@ -629,8 +684,11 @@ fn worker(
         let bank = shared.bank.load_full();
 
         if let Some(cur) = current.as_ref() {
-            let filters: &[crate::audio::params::Filter] =
-                if cur.settings.enabled { &cur.settings.filters } else { &[] };
+            let filters: &[crate::audio::params::Filter] = if cur.settings.enabled {
+                &cur.settings.filters
+            } else {
+                &[]
+            };
             ambience.sync(filters, &bank);
             for id in ambience.missing(filters, &bank) {
                 if !requested_beds.iter().any(|r| r == id) {
@@ -639,8 +697,14 @@ fn worker(
                 }
             }
 
-            let speed = if cur.settings.enabled { cur.settings.pitch.ratio() } else { 1.0 };
-            shared.speed_millis.store((speed * 1000.0) as u64, Ordering::Relaxed);
+            let speed = if cur.settings.enabled {
+                cur.settings.pitch.ratio()
+            } else {
+                1.0
+            };
+            shared
+                .speed_millis
+                .store((speed * 1000.0) as u64, Ordering::Relaxed);
         }
 
         // --- idle / backpressure ------------------------------------------
@@ -656,7 +720,11 @@ fn worker(
             let cur = current.as_ref().expect("checked by `idle` above");
             let remaining_track =
                 (cur.decoder.info.duration_secs - cur.decoder.decoded_secs()).max(0.0);
-            let speed = if cur.settings.enabled { cur.settings.pitch.ratio() } else { 1.0 };
+            let speed = if cur.settings.enabled {
+                cur.settings.pitch.ratio()
+            } else {
+                1.0
+            };
             let remaining_wall = remaining_track / speed.max(0.05);
             let lead = crossfade.lead_secs() as f64 + TRIGGER_HEADROOM_SECS;
             if remaining_wall <= lead {
@@ -681,7 +749,9 @@ fn worker(
                 chains[retiring_ix].prepare(device_rate as f32);
 
                 shared.settings.store(Arc::clone(&promoted.settings));
-                shared.track_gain_db.store(promoted.track_gain_db.to_bits(), Ordering::Relaxed);
+                shared
+                    .track_gain_db
+                    .store(promoted.track_gain_db.to_bits(), Ordering::Relaxed);
                 shared.duration_ms.store(
                     (promoted.decoder.info.duration_secs * 1000.0) as u64,
                     Ordering::Relaxed,
@@ -690,7 +760,9 @@ fn worker(
                     (promoted.decoder.decoded_secs() * 1000.0) as u64,
                     Ordering::Relaxed,
                 );
-                shared.stream_info.store(Arc::new(Some(promoted.decoder.info.clone())));
+                shared
+                    .stream_info
+                    .store(Arc::new(Some(promoted.decoder.info.clone())));
 
                 let queue_ref = promoted.queue_ref.clone();
                 current = Some(promoted);
@@ -714,15 +786,23 @@ fn worker(
         // would fight the immutable borrow that section needs.
         let (frames, speed) = {
             let cur = current.as_mut().expect("checked by `idle` above");
-            let speed = if cur.settings.enabled { cur.settings.pitch.ratio() } else { 1.0 };
+            let speed = if cur.settings.enabled {
+                cur.settings.pitch.ratio()
+            } else {
+                1.0
+            };
             if let Err(e) = cur.decoder.set_speed(speed) {
-                let _ = events.send(EngineEvent::Error { message: e.to_string() });
+                let _ = events.send(EngineEvent::Error {
+                    message: e.to_string(),
+                });
             }
 
             let got_a = match cur.decoder.read(&mut interleaved_a) {
                 Ok(n) => n,
                 Err(e) => {
-                    let _ = events.send(EngineEvent::Error { message: e.to_string() });
+                    let _ = events.send(EngineEvent::Error {
+                        message: e.to_string(),
+                    });
                     0
                 }
             };
@@ -767,16 +847,24 @@ fn worker(
             }
 
             let nx = next.as_mut().expect("checked by outer `if`");
-            let nx_speed = if nx.settings.enabled { nx.settings.pitch.ratio() } else { 1.0 };
+            let nx_speed = if nx.settings.enabled {
+                nx.settings.pitch.ratio()
+            } else {
+                1.0
+            };
             if let Err(e) = nx.decoder.set_speed(nx_speed) {
-                let _ = events.send(EngineEvent::Error { message: e.to_string() });
+                let _ = events.send(EngineEvent::Error {
+                    message: e.to_string(),
+                });
             }
 
             let want_b = frames * CHANNELS;
             let got_b = match nx.decoder.read(&mut interleaved_b[..want_b]) {
                 Ok(n) => n,
                 Err(e) => {
-                    let _ = events.send(EngineEvent::Error { message: e.to_string() });
+                    let _ = events.send(EngineEvent::Error {
+                        message: e.to_string(),
+                    });
                     0
                 }
             };
@@ -784,7 +872,11 @@ fn worker(
 
             for ch in 0..CHANNELS {
                 for f in 0..frames {
-                    scratch_b[ch][f] = if f < frames_b { interleaved_b[f * CHANNELS + ch] } else { 0.0 };
+                    scratch_b[ch][f] = if f < frames_b {
+                        interleaved_b[f * CHANNELS + ch]
+                    } else {
+                        0.0
+                    };
                 }
             }
 
@@ -828,13 +920,17 @@ fn worker(
         let queued_frames = (capacity - producer.slots()) / CHANNELS;
         let queued_secs = queued_frames as f64 / device_rate as f64 * speed;
         let position = (cur.decoder.decoded_secs() - queued_secs).max(0.0);
-        shared.position_ms.store((position * 1000.0) as u64, Ordering::Relaxed);
+        shared
+            .position_ms
+            .store((position * 1000.0) as u64, Ordering::Relaxed);
 
         meter_countdown += 1;
         if meter_countdown >= 4 {
             meter_countdown = 0;
             let red = master_limiter.take_reduction_db();
-            shared.reduction_millidb.store((red * 1000.0) as u32, Ordering::Relaxed);
+            shared
+                .reduction_millidb
+                .store((red * 1000.0) as u32, Ordering::Relaxed);
         }
     }
 }

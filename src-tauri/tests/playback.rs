@@ -79,7 +79,9 @@ fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn playing_a_track_advances_the_position() {
-    let Some((engine, _rx)) = engine() else { return };
+    let Some((engine, _rx)) = engine() else {
+        return;
+    };
     let path = fixture("advance", 5.0);
 
     let info = engine.load(path, 0.0, 0.0).expect("loading the track");
@@ -87,7 +89,8 @@ fn playing_a_track_advances_the_position() {
 
     engine.play();
     assert!(
-        wait_for(Duration::from_secs(3), || engine.snapshot().position_secs > 0.3),
+        wait_for(Duration::from_secs(3), || engine.snapshot().position_secs
+            > 0.3),
         "position never advanced; last was {}",
         engine.snapshot().position_secs
     );
@@ -96,12 +99,17 @@ fn playing_a_track_advances_the_position() {
 
 #[test]
 fn pausing_holds_the_position_still() {
-    let Some((engine, _rx)) = engine() else { return };
-    engine.load(fixture("pause", 6.0), 0.0, 0.0).expect("loading");
+    let Some((engine, _rx)) = engine() else {
+        return;
+    };
+    engine
+        .load(fixture("pause", 6.0), 0.0, 0.0)
+        .expect("loading");
     engine.play();
 
     assert!(
-        wait_for(Duration::from_secs(3), || engine.snapshot().position_secs > 0.3),
+        wait_for(Duration::from_secs(3), || engine.snapshot().position_secs
+            > 0.3),
         "playback never started"
     );
     engine.pause();
@@ -121,10 +129,17 @@ fn pausing_holds_the_position_still() {
 
 #[test]
 fn seeking_jumps_the_position() {
-    let Some((engine, _rx)) = engine() else { return };
-    engine.load(fixture("seek", 10.0), 0.0, 0.0).expect("loading");
+    let Some((engine, _rx)) = engine() else {
+        return;
+    };
+    engine
+        .load(fixture("seek", 10.0), 0.0, 0.0)
+        .expect("loading");
     engine.play();
-    assert!(wait_for(Duration::from_secs(3), || engine.snapshot().position_secs > 0.2));
+    assert!(wait_for(Duration::from_secs(3), || engine
+        .snapshot()
+        .position_secs
+        > 0.2));
 
     engine.seek(6.0);
     assert!(
@@ -141,7 +156,9 @@ fn seeking_jumps_the_position() {
 fn reaching_the_end_reports_the_track_as_finished() {
     let Some((engine, rx)) = engine() else { return };
     // Short enough that the test does not drag.
-    engine.load(fixture("finish", 1.0), 0.0, 0.0).expect("loading");
+    engine
+        .load(fixture("finish", 1.0), 0.0, 0.0)
+        .expect("loading");
     engine.play();
 
     let mut seen = Vec::new();
@@ -161,7 +178,10 @@ fn reaching_the_end_reports_the_track_as_finished() {
             Err(_) => {}
         }
     }
-    assert!(finished, "never reported as finished; errors seen: {seen:?}");
+    assert!(
+        finished,
+        "never reported as finished; errors seen: {seen:?}"
+    );
     // Running off the end of a file is not an error, and must not be
     // reported as one: it would surface as a toast after every track.
     assert!(seen.is_empty(), "clean end of file raised errors: {seen:?}");
@@ -169,13 +189,20 @@ fn reaching_the_end_reports_the_track_as_finished() {
 
 #[test]
 fn pitch_changes_the_reported_playback_speed() {
-    let Some((engine, _rx)) = engine() else { return };
-    engine.load(fixture("pitch", 8.0), 0.0, 0.0).expect("loading");
+    let Some((engine, _rx)) = engine() else {
+        return;
+    };
+    engine
+        .load(fixture("pitch", 8.0), 0.0, 0.0)
+        .expect("loading");
 
     // An octave up is exactly double speed under varispeed.
     let settings = MixerSettings {
         enabled: Some(true),
-        pitch: Some(Pitch { semitones: 12.0, cents: 0.0 }),
+        pitch: Some(Pitch {
+            semitones: 12.0,
+            cents: 0.0,
+        }),
         ..Default::default()
     };
     engine.set_settings(MixerSettings::resolve(&[&settings]));
@@ -201,26 +228,44 @@ fn pitch_changes_the_reported_playback_speed() {
 
 #[test]
 fn the_effect_chain_runs_without_starving_playback() {
-    let Some((engine, _rx)) = engine() else { return };
-    engine.load(fixture("effects", 6.0), 0.0, 0.0).expect("loading");
+    let Some((engine, _rx)) = engine() else {
+        return;
+    };
+    engine
+        .load(fixture("effects", 6.0), 0.0, 0.0)
+        .expect("loading");
 
     // Everything on at once: the heaviest the chain gets.
     let settings = MixerSettings {
         enabled: Some(true),
-        reverb: Some(Reverb { enabled: true, size: 0.9, mix: 0.5, ..Default::default() }),
+        reverb: Some(Reverb {
+            enabled: true,
+            size: 0.9,
+            mix: 0.5,
+            ..Default::default()
+        }),
         delay: Some(pick_n_mix_lib::audio::params::Delay {
             enabled: true,
             ..Default::default()
         }),
-        lofi: Some(Lofi { enabled: true, sample_rate_hz: 8000.0, bit_depth: 8.0, mix: 1.0 }),
-        pitch: Some(Pitch { semitones: -3.0, cents: 0.0 }),
+        lofi: Some(Lofi {
+            enabled: true,
+            sample_rate_hz: 8000.0,
+            bit_depth: 8.0,
+            mix: 1.0,
+        }),
+        pitch: Some(Pitch {
+            semitones: -3.0,
+            cents: 0.0,
+        }),
         ..Default::default()
     };
     engine.set_settings(MixerSettings::resolve(&[&settings]));
     engine.play();
 
     assert!(
-        wait_for(Duration::from_secs(4), || engine.snapshot().position_secs > 0.5),
+        wait_for(Duration::from_secs(4), || engine.snapshot().position_secs
+            > 0.5),
         "playback stalled with the full effect chain engaged"
     );
 }
@@ -276,8 +321,13 @@ mod crossfade_tests {
         // A 6 s track with a short crossfade: the trigger (lead + 2 s
         // headroom) fires with 3.5 s of it still to play, giving the test
         // ample time to answer before the boundary arrives.
-        let info = engine.load(fixture("cf-a", 6.0), 0.0, 0.0).expect("loading the first track");
-        engine.set_crossfade(CrossfadeSettings { length_secs: 1.5, ..Default::default() });
+        let info = engine
+            .load(fixture("cf-a", 6.0), 0.0, 0.0)
+            .expect("loading the first track");
+        engine.set_crossfade(CrossfadeSettings {
+            length_secs: 1.5,
+            ..Default::default()
+        });
         engine.play();
 
         let token = wait_for_need_next(&rx, Duration::from_secs(6))
@@ -312,12 +362,17 @@ mod crossfade_tests {
         let before_promotion = &events[..promotion_at];
 
         assert!(
-            !before_promotion.iter().any(|e| matches!(e, EngineEvent::TrackFinished)),
+            !before_promotion
+                .iter()
+                .any(|e| matches!(e, EngineEvent::TrackFinished)),
             "the outgoing track must not be reported finished before the prepared \
              voice is promoted, or the queue would skip a track: {events:?}"
         );
         let advanced = match &events[promotion_at] {
-            EngineEvent::TrackAdvanced { order_index, track_id } => (*order_index, track_id.clone()),
+            EngineEvent::TrackAdvanced {
+                order_index,
+                track_id,
+            } => (*order_index, track_id.clone()),
             _ => unreachable!("checked by `position` above"),
         };
         assert_eq!(
@@ -343,8 +398,13 @@ mod crossfade_tests {
     fn cancelling_a_pending_next_falls_back_to_a_normal_finish() {
         let Some((engine, rx)) = engine() else { return };
 
-        engine.load(fixture("cf-cancel", 2.0), 0.0, 0.0).expect("loading");
-        engine.set_crossfade(CrossfadeSettings { length_secs: 1.5, ..Default::default() });
+        engine
+            .load(fixture("cf-cancel", 2.0), 0.0, 0.0)
+            .expect("loading");
+        engine.set_crossfade(CrossfadeSettings {
+            length_secs: 1.5,
+            ..Default::default()
+        });
         engine.play();
 
         wait_for_need_next(&rx, Duration::from_secs(4))
@@ -355,7 +415,10 @@ mod crossfade_tests {
             Ok(EngineEvent::TrackFinished) => true,
             _ => false,
         });
-        assert!(finished, "cancelling a pending crossfade should not prevent a normal finish");
+        assert!(
+            finished,
+            "cancelling a pending crossfade should not prevent a normal finish"
+        );
     }
 
     /// A stale reply — answering a request that has already been superseded
@@ -364,8 +427,13 @@ mod crossfade_tests {
     fn a_reply_with_the_wrong_token_is_ignored() {
         let Some((engine, rx)) = engine() else { return };
 
-        engine.load(fixture("cf-stale", 2.0), 0.0, 0.0).expect("loading");
-        engine.set_crossfade(CrossfadeSettings { length_secs: 1.5, ..Default::default() });
+        engine
+            .load(fixture("cf-stale", 2.0), 0.0, 0.0)
+            .expect("loading");
+        engine.set_crossfade(CrossfadeSettings {
+            length_secs: 1.5,
+            ..Default::default()
+        });
         engine.play();
 
         let real_token = wait_for_need_next(&rx, Duration::from_secs(4))
@@ -375,7 +443,14 @@ mod crossfade_tests {
         let decoder =
             TrackDecoder::open(&path, engine.device_sample_rate()).expect("opening a decoder");
         // Answer with a token that cannot possibly be the one just issued.
-        engine.prepare_next(decoder, Resolved::default(), 0.0, real_token.wrapping_add(1), 0, "x".into());
+        engine.prepare_next(
+            decoder,
+            Resolved::default(),
+            0.0,
+            real_token.wrapping_add(1),
+            0,
+            "x".into(),
+        );
 
         // Playback must still reach an ordinary, un-promoted finish: the
         // bogus reply must not have been accepted as the pending voice.
@@ -386,7 +461,10 @@ mod crossfade_tests {
             }
             _ => false,
         });
-        assert!(finished, "a stale reply should leave the track free to finish normally");
+        assert!(
+            finished,
+            "a stale reply should leave the track free to finish normally"
+        );
     }
 
     /// With crossfading off (the default), behaviour is byte-for-byte the
@@ -395,17 +473,23 @@ mod crossfade_tests {
     #[test]
     fn crossfading_off_never_asks_for_a_next_track() {
         let Some((engine, rx)) = engine() else { return };
-        engine.load(fixture("cf-off", 1.0), 0.0, 0.0).expect("loading");
+        engine
+            .load(fixture("cf-off", 1.0), 0.0, 0.0)
+            .expect("loading");
         // Default settings: length_secs == 0, i.e. disabled.
         engine.play();
 
         let events = collect_events(&rx, Duration::from_secs(4));
         assert!(
-            !events.iter().any(|e| matches!(e, EngineEvent::NeedNext { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::NeedNext { .. })),
             "crossfading must stay off unless explicitly enabled: {events:?}"
         );
         assert!(
-            events.iter().any(|e| matches!(e, EngineEvent::TrackFinished)),
+            events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::TrackFinished)),
             "should still reach an ordinary finish: {events:?}"
         );
     }

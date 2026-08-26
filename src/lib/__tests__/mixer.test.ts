@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { symmetricCurve } from "../crossfadeCurve";
 import { overlay, pitchRatio, presetSections, resolve, tempoPercent } from "../mixer";
 import type { MixerSettings } from "../types";
 
@@ -27,6 +28,15 @@ describe("mixer cascade", () => {
   it("falls through to the layer below for untouched sections", () => {
     const fx = resolve([global, {}, {}]);
     expect(fx.reverb.mix).toBe(0.1);
+  });
+
+  it("allows a playlist crossfade but ignores an entry crossfade", () => {
+    const fx = resolve([
+      { crossfade: { lengthSecs: 1, curve: { ...symmetricCurve(1) } } },
+      { crossfade: { lengthSecs: 2, curve: { ...symmetricCurve(2) } } },
+      { crossfade: { lengthSecs: 3, curve: { ...symmetricCurve(3) } } },
+    ]);
+    expect(fx.crossfade.lengthSecs).toBe(2);
   });
 
   it("fills in defaults when no layer mentions a section", () => {

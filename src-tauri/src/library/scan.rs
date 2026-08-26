@@ -20,8 +20,9 @@ use crate::library::model::{stable_id, ScanReport, Track};
 
 pub const SOURCE_LOCAL: &str = "local";
 
-pub const SUPPORTED_EXTENSIONS: &[&str] =
-    &["flac", "mp3", "m4a", "mp4", "aac", "ogg", "oga", "opus", "wav", "aiff", "aif", "wv", "ape"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "flac", "mp3", "m4a", "mp4", "aac", "ogg", "oga", "opus", "wav", "aiff", "aif", "wv", "ape",
+];
 
 /// Walk `folders`, index everything found, and forget anything that has gone.
 pub fn scan_folders(
@@ -35,7 +36,11 @@ pub fn scan_folders(
     let mut seen: HashSet<String> = HashSet::new();
 
     for folder in folders {
-        for entry in WalkDir::new(folder).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(folder)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -114,7 +119,9 @@ pub fn read_track(path: &Path, artwork_dir: &Path) -> Result<Track> {
         sample_rate: properties.sample_rate(),
         channels: properties.channels().map(|c| c as u32),
         bits_per_sample: properties.bit_depth().map(|b| b as u32),
-        bitrate_kbps: properties.audio_bitrate().or_else(|| properties.overall_bitrate()),
+        bitrate_kbps: properties
+            .audio_bitrate()
+            .or_else(|| properties.overall_bitrate()),
         file_size,
         format: path
             .extension()
@@ -130,7 +137,10 @@ pub fn read_track(path: &Path, artwork_dir: &Path) -> Result<Track> {
             match store_artwork(artwork_dir, picture) {
                 Ok(id) => track.artwork_id = Some(id),
                 // Bad artwork is not a reason to skip an otherwise fine track.
-                Err(e) => eprintln!("library: could not save artwork for {}: {e}", track.location),
+                Err(e) => eprintln!(
+                    "library: could not save artwork for {}: {e}",
+                    track.location
+                ),
             }
         }
     }
@@ -151,7 +161,10 @@ fn apply_tag(track: &mut Track, tag: &Tag) {
     if let Some(v) = tag.album().filter(|v| !v.trim().is_empty()) {
         track.album = v.to_string();
     }
-    if let Some(v) = tag.get_string(&ItemKey::AlbumArtist).filter(|v| !v.trim().is_empty()) {
+    if let Some(v) = tag
+        .get_string(&ItemKey::AlbumArtist)
+        .filter(|v| !v.trim().is_empty())
+    {
         track.album_artist = v.to_string();
     }
     track.track_number = tag.track();
@@ -162,16 +175,24 @@ fn apply_tag(track: &mut Track, tag: &Tag) {
             .and_then(|d| d.get(..4).and_then(|y| y.parse().ok()))
     });
     track.genre = tag.genre().map(|g| g.to_string());
-    track.musicbrainz_recording_id =
-        tag.get_string(&ItemKey::MusicBrainzRecordingId).map(|s| s.to_string());
-    track.musicbrainz_release_id =
-        tag.get_string(&ItemKey::MusicBrainzReleaseId).map(|s| s.to_string());
-    track.gain_db = tag.get_string(&ItemKey::ReplayGainTrackGain).and_then(parse_replay_gain);
+    track.musicbrainz_recording_id = tag
+        .get_string(&ItemKey::MusicBrainzRecordingId)
+        .map(|s| s.to_string());
+    track.musicbrainz_release_id = tag
+        .get_string(&ItemKey::MusicBrainzReleaseId)
+        .map(|s| s.to_string());
+    track.gain_db = tag
+        .get_string(&ItemKey::ReplayGainTrackGain)
+        .and_then(parse_replay_gain);
 }
 
 /// ReplayGain values look like "-7.53 dB"; take the number.
 fn parse_replay_gain(raw: &str) -> Option<f32> {
-    raw.split_whitespace().next()?.parse::<f32>().ok().filter(|v| v.is_finite())
+    raw.split_whitespace()
+        .next()?
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
 }
 
 /// Prefer the front cover, then any cover, then whatever is there.

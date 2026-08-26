@@ -109,7 +109,9 @@ export const useMixerStore = defineStore("mixer", () => {
     await refresh();
     target.value = { kind: "entry", playlistId, index, name };
     targetLayer.value = mixer ? clone(mixer) : {};
-    underlyingLayers.value = playlistMixer ? [global.value, playlistMixer] : [global.value];
+    // Keep an explicit empty playlist layer so the frontend resolver can
+    // consistently exclude the entry layer from crossfade resolution.
+    underlyingLayers.value = [global.value, playlistMixer ?? {}];
   }
 
   /** Write a whole section into the layer being edited, then persist. */
@@ -162,7 +164,11 @@ export const useMixerStore = defineStore("mixer", () => {
 
   /** Layer a preset on top of the current edits, touching only its sections. */
   async function applyPreset(preset: Preset) {
-    targetLayer.value = { ...targetLayer.value, ...clone(preset.settings), preset: preset.name };
+    const settings = clone(preset.settings);
+    // A crossfade spans playlist entries, so an entry preset may not introduce
+    // one even if that preset carries a crossfade setting.
+    if (target.value.kind === "entry") delete settings.crossfade;
+    targetLayer.value = { ...targetLayer.value, ...settings, preset: preset.name };
     await persist();
   }
 

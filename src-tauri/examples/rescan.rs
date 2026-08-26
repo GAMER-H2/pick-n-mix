@@ -11,8 +11,8 @@ use pick_n_mix_lib::library::db::Db;
 use pick_n_mix_lib::library::scan;
 
 fn main() -> anyhow::Result<()> {
-    let data_dir = PathBuf::from(std::env::var("HOME")?)
-        .join("Library/Application Support/com.picknmix.app");
+    let data_dir =
+        PathBuf::from(std::env::var("HOME")?).join("Library/Application Support/com.picknmix.app");
     let artwork = data_dir.join("artwork");
     let db = Db::open(&data_dir.join("library.db"))?;
 

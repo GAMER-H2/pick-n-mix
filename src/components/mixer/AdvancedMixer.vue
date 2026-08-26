@@ -19,23 +19,31 @@ import CrossfadeGraph from "./CrossfadeGraph.vue";
 import { audibleMix, DEFAULT_EQ_FREQS, tempoPercent } from "@/lib/mixer";
 import { formatHz, semitonesLabel } from "@/lib/format";
 import { formatSeconds } from "@/lib/crossfadeCurve";
+import { withCrossfadeLength } from "@/lib/crossfadeCurve";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
-import { useCrossfadeStore } from "@/stores/crossfade";
 import type { BandKind, CrossfadeCurve, Eq } from "@/lib/types";
 
 const mixer = useMixerStore();
 const player = usePlayerStore();
-const crossfade = useCrossfadeStore();
 
 const eqExpanded = ref(false);
 const fx = computed(() => mixer.effective);
 const canOverride = computed(() => mixer.target.kind !== "global");
+// Crossfades apply between playlist entries, not to an individual entry's
+// mixer override. Keep the global and playlist controls available, but do not
+// offer a misleading per-song crossfade editor.
+const canEditCrossfade = computed(() => mixer.target.kind !== "entry");
 
 const MAX_CROSSFADE_SECS = 12;
+const crossfadeSettings = computed(() => fx.value.crossfade);
+
+function onCrossfadeLength(lengthSecs: number) {
+  mixer.setSection("crossfade", withCrossfadeLength(crossfadeSettings.value, lengthSecs));
+}
 
 function onCrossfadeCurve(curve: CrossfadeCurve) {
-  crossfade.setCurve(curve);
+  mixer.setSection("crossfade", { ...crossfadeSettings.value, curve });
 }
 
 function overridden(section: string) {
@@ -442,29 +450,36 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </section>
 
       <!-- Crossfade ----------------------------------------------------------->
-      <section class="panel__section">
-        <SectionHeader title="Crossfade">
+      <section v-if="canEditCrossfade" class="panel__section">
+        <SectionHeader
+          title="Crossfade"
+          :overridden="overridden('crossfade')"
+          :can-override="canOverride"
+          @clear="mixer.clearSection('crossfade')"
+        >
           <div class="panel__spacer" />
-          <span v-if="canOverride" class="panel__global-note">Applies to all playback</span>
+          <span v-if="mixer.target.kind === 'playlist'" class="panel__global-note">
+            Applies to this playlist
+          </span>
         </SectionHeader>
 
         <div class="row">
           <label>Length</label>
           <AppSlider
-            :model-value="crossfade.settings.lengthSecs"
+            :model-value="crossfadeSettings.lengthSecs"
             :min="0"
             :max="MAX_CROSSFADE_SECS"
             :step="0.5"
-            @update:model-value="crossfade.setLength($event)"
+            @update:model-value="onCrossfadeLength($event)"
           />
-          <span class="row__value">{{ formatSeconds(crossfade.settings.lengthSecs) }}</span>
+          <span class="row__value">{{ formatSeconds(crossfadeSettings.lengthSecs) }}</span>
         </div>
 
         <CrossfadeGraph
           class="panel__crossfade-graph"
-          :curve="crossfade.settings.curve"
-          :length-secs="crossfade.settings.lengthSecs"
-          :disabled="crossfade.settings.lengthSecs <= 0"
+          :curve="crossfadeSettings.curve"
+          :length-secs="crossfadeSettings.lengthSecs"
+          :disabled="crossfadeSettings.lengthSecs <= 0"
           @change="onCrossfadeCurve"
         />
 

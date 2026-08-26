@@ -58,7 +58,9 @@ pub struct LocalSource {
 
 impl LocalSource {
     pub fn new() -> Self {
-        LocalSource { id: crate::library::scan::SOURCE_LOCAL.to_string() }
+        LocalSource {
+            id: crate::library::scan::SOURCE_LOCAL.to_string(),
+        }
     }
 }
 
@@ -78,6 +80,8 @@ impl LibrarySource for LocalSource {
     }
 
     fn playable(&self, track: &Track) -> Result<Playable> {
-        Ok(Playable::LocalFile(std::path::PathBuf::from(&track.location)))
+        Ok(Playable::LocalFile(std::path::PathBuf::from(
+            &track.location,
+        )))
     }
 }

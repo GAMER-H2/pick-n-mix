@@ -108,7 +108,10 @@ impl Player {
 
     /// Replace the queue and start at `start_index` (an index into `tracks`).
     pub fn set_queue(&mut self, tracks: Vec<Track>, start_index: usize) {
-        self.set_queue_items(tracks.into_iter().map(QueueItem::from).collect(), start_index);
+        self.set_queue_items(
+            tracks.into_iter().map(QueueItem::from).collect(),
+            start_index,
+        );
     }
 
     /// Replace the queue with entries that may carry their own overrides.
@@ -170,7 +173,8 @@ impl Player {
             return;
         }
         let insert_at = self.queue.len();
-        self.queue.extend(tracks.iter().cloned().map(QueueItem::from));
+        self.queue
+            .extend(tracks.iter().cloned().map(QueueItem::from));
         let new_indices: Vec<usize> = (insert_at..self.queue.len()).collect();
         for (offset, index) in new_indices.into_iter().enumerate() {
             self.order.insert(self.cursor + 1 + offset, index);
@@ -314,7 +318,10 @@ impl Player {
     }
 
     fn item_at(&self, order_index: usize) -> Option<(usize, &QueueItem)> {
-        self.order.get(order_index).and_then(|&i| self.queue.get(i)).map(|item| (order_index, item))
+        self.order
+            .get(order_index)
+            .and_then(|&i| self.queue.get(i))
+            .map(|item| (order_index, item))
     }
 
     pub fn view(&self) -> QueueView {
@@ -340,7 +347,10 @@ impl Player {
         let empty = MixerSettings::default();
         // The innermost layer belongs to the queue entry, not the track, so the
         // same song played from the library carries no override at all.
-        let entry = self.current_item().and_then(|item| item.mixer.as_ref()).unwrap_or(&empty);
+        let entry = self
+            .current_item()
+            .and_then(|item| item.mixer.as_ref())
+            .unwrap_or(&empty);
         self.resolve_mixer(entry)
     }
 
@@ -428,14 +438,21 @@ mod tests {
         p.set_queue(tracks(3), 0);
         p.set_repeat(Repeat::One);
         assert_eq!(p.advance(true).unwrap().id, "t0", "auto-advance repeats");
-        assert_eq!(p.advance(false).unwrap().id, "t1", "pressing next still moves on");
+        assert_eq!(
+            p.advance(false).unwrap().id,
+            "t1",
+            "pressing next still moves on"
+        );
     }
 
     #[test]
     fn play_next_lands_immediately_after_the_current_track() {
         let mut p = Player::new();
         p.set_queue(tracks(3), 0);
-        let extra = vec![Track { id: "x".into(), ..Default::default() }];
+        let extra = vec![Track {
+            id: "x".into(),
+            ..Default::default()
+        }];
         p.play_next(extra);
         assert_eq!(p.advance(false).unwrap().id, "x");
         assert_eq!(p.advance(false).unwrap().id, "t1");
@@ -445,7 +462,10 @@ mod tests {
     fn add_to_queue_goes_to_the_back() {
         let mut p = Player::new();
         p.set_queue(tracks(2), 0);
-        p.add_to_queue(vec![Track { id: "x".into(), ..Default::default() }]);
+        p.add_to_queue(vec![Track {
+            id: "x".into(),
+            ..Default::default()
+        }]);
         assert_eq!(p.advance(false).unwrap().id, "t1");
         assert_eq!(p.advance(false).unwrap().id, "x");
     }
@@ -466,7 +486,10 @@ mod tests {
         p.remove_at(1);
         let view = p.view();
         assert_eq!(view.items.len(), 3);
-        assert_eq!(view.items.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["t0", "t2", "t3"]);
+        assert_eq!(
+            view.items.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["t0", "t2", "t3"]
+        );
         assert_eq!(p.advance(false).unwrap().id, "t2");
     }
 
@@ -483,20 +506,35 @@ mod tests {
     fn the_mixer_cascade_runs_global_then_playlist_then_track() {
         let mut p = Player::new();
         let entry = QueueItem {
-            track: Track { id: "t0".into(), ..Default::default() },
+            track: Track {
+                id: "t0".into(),
+                ..Default::default()
+            },
             mixer: Some(MixerSettings {
-                reverb: Some(Reverb { enabled: true, mix: 0.9, ..Default::default() }),
+                reverb: Some(Reverb {
+                    enabled: true,
+                    mix: 0.9,
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
         };
         p.set_queue_items(vec![entry], 0);
 
         p.global_mixer = MixerSettings {
-            reverb: Some(Reverb { enabled: true, mix: 0.1, ..Default::default() }),
+            reverb: Some(Reverb {
+                enabled: true,
+                mix: 0.1,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         p.context_mixer = Some(MixerSettings {
-            reverb: Some(Reverb { enabled: true, mix: 0.5, ..Default::default() }),
+            reverb: Some(Reverb {
+                enabled: true,
+                mix: 0.5,
+                ..Default::default()
+            }),
             ..Default::default()
         });
 
@@ -507,13 +545,27 @@ mod tests {
     #[test]
     fn a_playlist_override_applies_when_the_track_has_none() {
         let mut p = Player::new();
-        p.set_queue(vec![Track { id: "t0".into(), ..Default::default() }], 0);
+        p.set_queue(
+            vec![Track {
+                id: "t0".into(),
+                ..Default::default()
+            }],
+            0,
+        );
         p.global_mixer = MixerSettings {
-            reverb: Some(Reverb { enabled: true, mix: 0.1, ..Default::default() }),
+            reverb: Some(Reverb {
+                enabled: true,
+                mix: 0.1,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         p.context_mixer = Some(MixerSettings {
-            reverb: Some(Reverb { enabled: true, mix: 0.5, ..Default::default() }),
+            reverb: Some(Reverb {
+                enabled: true,
+                mix: 0.5,
+                ..Default::default()
+            }),
             ..Default::default()
         });
         assert_eq!(p.effective_mixer().reverb.mix, 0.5);
@@ -535,12 +587,19 @@ mod scope_tests {
     use crate::audio::params::Reverb;
 
     fn track(id: &str) -> Track {
-        Track { id: id.into(), ..Default::default() }
+        Track {
+            id: id.into(),
+            ..Default::default()
+        }
     }
 
     fn wet(mix: f32) -> MixerSettings {
         MixerSettings {
-            reverb: Some(Reverb { enabled: true, mix, ..Default::default() }),
+            reverb: Some(Reverb {
+                enabled: true,
+                mix,
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -562,14 +621,20 @@ mod scope_tests {
         p.global_mixer = wet(0.1);
 
         p.set_queue_items(
-            vec![QueueItem { track: track("shared"), mixer: Some(wet(0.8)) }],
+            vec![QueueItem {
+                track: track("shared"),
+                mixer: Some(wet(0.8)),
+            }],
             0,
         );
         assert_eq!(p.effective_mixer().reverb.mix, 0.8);
 
         // Re-queued from a different playlist with its own override.
         p.set_queue_items(
-            vec![QueueItem { track: track("shared"), mixer: Some(wet(0.3)) }],
+            vec![QueueItem {
+                track: track("shared"),
+                mixer: Some(wet(0.3)),
+            }],
             0,
         );
         assert_eq!(p.effective_mixer().reverb.mix, 0.3);
@@ -578,7 +643,13 @@ mod scope_tests {
     #[test]
     fn editing_an_entry_applies_to_the_live_queue() {
         let mut p = Player::new();
-        p.set_queue_items(vec![QueueItem { track: track("t0"), mixer: None }], 0);
+        p.set_queue_items(
+            vec![QueueItem {
+                track: track("t0"),
+                mixer: None,
+            }],
+            0,
+        );
         assert_eq!(p.effective_mixer().reverb.mix, 0.25);
         assert!(!p.effective_mixer().reverb.enabled);
 
@@ -605,7 +676,11 @@ mod scope_tests {
 
         // Drag the last entry to the top.
         assert!(p.move_item(3, 0));
-        assert_eq!(p.current().unwrap().id, "b", "the playing track must not change");
+        assert_eq!(
+            p.current().unwrap().id,
+            "b",
+            "the playing track must not change"
+        );
 
         let view = p.view();
         let ids: Vec<&str> = view.items.iter().map(|t| t.id.as_str()).collect();
@@ -618,8 +693,14 @@ mod scope_tests {
         let mut p = Player::new();
         p.set_queue_items(
             vec![
-                QueueItem { track: track("a"), mixer: None },
-                QueueItem { track: track("b"), mixer: Some(wet(0.7)) },
+                QueueItem {
+                    track: track("a"),
+                    mixer: None,
+                },
+                QueueItem {
+                    track: track("b"),
+                    mixer: Some(wet(0.7)),
+                },
             ],
             0,
         );
@@ -685,7 +766,11 @@ mod scope_tests {
         for _ in 0..len - 1 {
             p.advance(false);
         }
-        assert_eq!(p.view().current_index, Some(len - 1), "should be at the last position");
+        assert_eq!(
+            p.view().current_index,
+            Some(len - 1),
+            "should be at the last position"
+        );
         assert!(
             p.peek_next().is_none(),
             "a shuffled repeat-all wrap reshuffles and cannot be predicted"
@@ -709,13 +794,23 @@ mod scope_tests {
         p.global_mixer = wet(0.1);
         p.set_queue_items(
             vec![
-                QueueItem { track: track("a"), mixer: Some(wet(0.9)) },
-                QueueItem { track: track("b"), mixer: Some(wet(0.4)) },
+                QueueItem {
+                    track: track("a"),
+                    mixer: Some(wet(0.9)),
+                },
+                QueueItem {
+                    track: track("b"),
+                    mixer: Some(wet(0.4)),
+                },
             ],
             0,
         );
 
-        assert_eq!(p.effective_mixer().reverb.mix, 0.9, "current track's own override");
+        assert_eq!(
+            p.effective_mixer().reverb.mix,
+            0.9,
+            "current track's own override"
+        );
         let (_, next) = p.peek_next().unwrap();
         let next = next.clone();
         assert_eq!(

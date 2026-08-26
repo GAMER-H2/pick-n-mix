@@ -19,8 +19,7 @@ use crate::player::{Context, QueueItem, QueueView, Repeat};
 use crate::playlist::{self, Playlist};
 use crate::presets::{self, Preset};
 use crate::state::{
-    AppState, SETTING_CROSSFADE, SETTING_GLOBAL_MIXER, SETTING_REPEAT, SETTING_SHUFFLE,
-    SETTING_VOLUME,
+    AppState, SETTING_GLOBAL_MIXER, SETTING_REPEAT, SETTING_SHUFFLE, SETTING_VOLUME,
 };
 
 type Cmd<T> = Result<T, String>;
@@ -64,7 +63,10 @@ pub fn scan_library(app: AppHandle, state: State<'_, AppState>) -> Cmd<ScanRepor
         // Throttle so the event stream cannot outrun the webview.
         if last_emit.elapsed() > std::time::Duration::from_millis(100) {
             last_emit = std::time::Instant::now();
-            let _ = app.emit("scan-progress", serde_json::json!({ "count": count, "path": path }));
+            let _ = app.emit(
+                "scan-progress",
+                serde_json::json!({ "count": count, "path": path }),
+            );
         }
     })
     .map_err(err)?;
@@ -347,7 +349,9 @@ pub fn clear_queue(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
 #[tauri::command]
 pub fn set_shuffle(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Cmd<()> {
     state.player.lock().set_shuffle(enabled);
-    let _ = state.db.set_setting(SETTING_SHUFFLE, if enabled { "true" } else { "false" });
+    let _ = state
+        .db
+        .set_setting(SETTING_SHUFFLE, if enabled { "true" } else { "false" });
     // What comes after the current track can change completely.
     state.engine.cancel_next();
     let _ = app.emit("queue-changed", state.player.lock().view());
@@ -435,9 +439,7 @@ pub fn set_global_mixer(
         let mut player = state.player.lock();
         player.global_mixer = settings;
     }
-    if let Ok(raw) = serde_json::to_string(&state.player.lock().global_mixer) {
-        let _ = state.db.set_setting(SETTING_GLOBAL_MIXER, &raw);
-    }
+    persist_global_mixer(&state);
     state.sync_mixer();
     request_missing_beds(&state);
 
@@ -499,23 +501,36 @@ pub fn delete_preset(state: State<'_, AppState>, id: String) -> Cmd<Vec<Preset>>
 // ---------------------------------------------------------------------------
 // Crossfade
 //
-// Global only, and deliberately not part of the mixer cascade above — see the
-// doc comment on `audio::crossfade::CrossfadeSettings` for why.
+// A global mixer section, with an optional playlist override. These commands
+// edit the global layer; `crossfade_settings` returns the effective value.
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
 pub fn crossfade_settings(state: State<'_, AppState>) -> Cmd<CrossfadeSettings> {
-    Ok((*state.engine.crossfade()).clone())
+    Ok(state.player.lock().effective_mixer().crossfade)
 }
 
 /// Set the crossfade length from the simple slider. Keeps the curve's shape
 /// (symmetric, or whatever the advanced graph left it as) and rescales it to
 /// the new length.
 #[tauri::command]
-pub fn set_crossfade_length(state: State<'_, AppState>, length_secs: f32) -> Cmd<CrossfadeSettings> {
-    let next = state.engine.crossfade().with_length(length_secs);
-    state.engine.set_crossfade(next.clone());
-    persist_crossfade(&state, &next);
+pub fn set_crossfade_length(
+    state: State<'_, AppState>,
+    length_secs: f32,
+) -> Cmd<CrossfadeSettings> {
+    let next = {
+        let mut player = state.player.lock();
+        let next = player
+            .global_mixer
+            .crossfade
+            .clone()
+            .unwrap_or_default()
+            .with_length(length_secs);
+        player.global_mixer.crossfade = Some(next.clone());
+        next
+    };
+    persist_global_mixer(&state);
+    state.sync_mixer();
     Ok(next)
 }
 
@@ -527,17 +542,29 @@ pub fn set_crossfade_curve(
     state: State<'_, AppState>,
     curve: crate::audio::crossfade::CrossfadeCurve,
 ) -> Cmd<CrossfadeSettings> {
-    let length = state.engine.crossfade().length_secs;
-    let clamped = curve.clamp(length);
-    let next = CrossfadeSettings { length_secs: length, curve: clamped };
-    state.engine.set_crossfade(next.clone());
-    persist_crossfade(&state, &next);
+    let next = {
+        let mut player = state.player.lock();
+        let length = player
+            .global_mixer
+            .crossfade
+            .as_ref()
+            .map(|crossfade| crossfade.length_secs)
+            .unwrap_or_default();
+        let next = CrossfadeSettings {
+            length_secs: length,
+            curve: curve.clamp(length),
+        };
+        player.global_mixer.crossfade = Some(next.clone());
+        next
+    };
+    persist_global_mixer(&state);
+    state.sync_mixer();
     Ok(next)
 }
 
-fn persist_crossfade(state: &AppState, settings: &CrossfadeSettings) {
-    if let Ok(raw) = serde_json::to_string(settings) {
-        let _ = state.db.set_setting(SETTING_CROSSFADE, &raw);
+fn persist_global_mixer(state: &AppState) {
+    if let Ok(raw) = serde_json::to_string(&state.player.lock().global_mixer) {
+        let _ = state.db.set_setting(SETTING_GLOBAL_MIXER, &raw);
     }
 }
 
@@ -599,9 +626,15 @@ pub fn create_playlist(
     name: String,
     description: Option<String>,
 ) -> Cmd<PlaylistSummary> {
-    let mut p = Playlist { name: name.clone(), ..Default::default() };
+    let mut p = Playlist {
+        name: name.clone(),
+        ..Default::default()
+    };
     p.description = description.unwrap_or_default();
-    let path = state.paths.playlists.join(playlist::file_name_for(&p.name, &p.id));
+    let path = state
+        .paths
+        .playlists
+        .join(playlist::file_name_for(&p.name, &p.id));
     p.save(&path).map_err(err)?;
 
     let _ = app.emit("playlists-changed", ());
@@ -717,8 +750,13 @@ pub fn set_playlist_entry_mixer(
     state: State<'_, AppState>,
     playlist_id: String,
     index: usize,
-    settings: Option<MixerSettings>,
+    mut settings: Option<MixerSettings>,
 ) -> Cmd<()> {
+    // Crossfade is scoped only to global and playlist mixer layers.
+    if let Some(settings) = settings.as_mut() {
+        settings.crossfade = None;
+    }
+
     let Some((path, mut p)) = find_playlist(&state, &playlist_id) else {
         return Err("playlist not found".into());
     };
@@ -744,7 +782,12 @@ pub fn set_playlist_entry_mixer(
     if playing_this {
         if let Some(track) = state
             .db
-            .resolve(entry_mbid.as_deref(), &entry_artist, &entry_title, &entry_album)
+            .resolve(
+                entry_mbid.as_deref(),
+                &entry_artist,
+                &entry_title,
+                &entry_album,
+            )
             .map_err(err)?
         {
             let changed = state.player.lock().set_entry_mixer(&track.id, settings);
@@ -761,7 +804,12 @@ pub fn set_playlist_entry_mixer(
 
 /// Reorder the play queue.
 #[tauri::command]
-pub fn move_in_queue(app: AppHandle, state: State<'_, AppState>, from: usize, to: usize) -> Cmd<()> {
+pub fn move_in_queue(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    from: usize,
+    to: usize,
+) -> Cmd<()> {
     if state.player.lock().move_item(from, to) {
         // Reordering can change what immediately follows the current track.
         state.engine.cancel_next();
@@ -776,8 +824,12 @@ pub fn import_playlist(app: AppHandle, state: State<'_, AppState>, path: String)
     let source = PathBuf::from(&path);
     let mut p = Playlist::load(&source).map_err(err)?;
     // Give the import a fresh id so it cannot collide with an existing file.
-    p.id = crate::library::model::stable_id("pl", &format!("{}{}", p.name, crate::library::db::now()));
-    let destination = state.paths.playlists.join(playlist::file_name_for(&p.name, &p.id));
+    p.id =
+        crate::library::model::stable_id("pl", &format!("{}{}", p.name, crate::library::db::now()));
+    let destination = state
+        .paths
+        .playlists
+        .join(playlist::file_name_for(&p.name, &p.id));
     p.save(&destination).map_err(err)?;
     let _ = app.emit("playlists-changed", ());
     Ok(p.id)
@@ -803,8 +855,11 @@ pub fn play_playlist(
     let Some((_, p)) = find_playlist(&state, &id) else {
         return Err("playlist not found".into());
     };
-    let context =
-        Context { kind: "playlist".into(), id: p.id.clone(), name: p.name.clone() };
+    let context = Context {
+        kind: "playlist".into(),
+        id: p.id.clone(),
+        name: p.name.clone(),
+    };
     let context_mixer = p.mixer.clone();
     let resolved = p.resolve(&state.db).map_err(err)?;
 
@@ -819,7 +874,10 @@ pub fn play_playlist(
                 adjusted_start = items.len();
             }
             // The entry's own override rides along with the queue entry.
-            items.push(QueueItem { track: track.clone(), mixer: item.entry.mixer.clone() });
+            items.push(QueueItem {
+                track: track.clone(),
+                mixer: item.entry.mixer.clone(),
+            });
         }
     }
     if items.is_empty() {
@@ -850,7 +908,9 @@ fn load_tracks(state: &AppState, ids: &[String]) -> Cmd<Vec<Track>> {
 }
 
 fn find_playlist(state: &AppState, id: &str) -> Option<(PathBuf, Playlist)> {
-    playlist::list(&state.paths.playlists).into_iter().find(|(_, p)| p.id == id)
+    playlist::list(&state.paths.playlists)
+        .into_iter()
+        .find(|(_, p)| p.id == id)
 }
 
 /// Kick off decoding for any ambience bed the mixer now wants but has not got.

@@ -212,7 +212,13 @@ impl TrackDecoder {
         let time = Time::try_from_secs_f64(secs.max(0.0))
             .ok_or_else(|| anyhow!("seek position {secs} is out of range"))?;
         self.reader
-            .seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) })
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time,
+                    track_id: Some(self.track_id),
+                },
+            )
             .map_err(|e| anyhow!("seeking: {e}"))?;
         self.decoder.reset();
         self.pending.clear();
@@ -397,8 +403,8 @@ impl TrackDecoder {
                 // Trust the container's timestamp when it has one.
                 if let Some(t) = tb.calc_time(packet.pts) {
                     let secs = t.as_secs_f64();
-                    self.source_frames = ((secs * self.source_rate as f64) as u64)
-                        .saturating_add(frames as u64);
+                    self.source_frames =
+                        ((secs * self.source_rate as f64) as u64).saturating_add(frames as u64);
                 }
             }
         }

@@ -1,19 +1,22 @@
 //! Mixer presets: the built-in set plus whatever the user saves.
 //!
-//! A preset is just a partial `MixerSettings`, so it layers through the same
-//! cascade as everything else. A preset that only mentions reverb leaves the
-//! EQ exactly as the user left it.
+//! A preset contains a partial `MixerSettings`, including its crossfade
+//! section, so every setting layers through the normal cascade.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::audio::params::{
-    default_bands, BandKind, Delay, Eq, EqBand, Lofi, MixerSettings, Normalisation, Pitch, Reverb,
+use crate::audio::{
+    crossfade::{CrossfadeCurve, CrossfadeSettings},
+    params::{
+        default_bands, BandKind, Delay, Eq, EqBand, Lofi, MixerSettings, Normalisation, Pitch,
+        Reverb,
+    },
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preset {
     pub id: String,
@@ -34,6 +37,36 @@ impl Default for Preset {
     }
 }
 
+impl<'de> Deserialize<'de> for Preset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(default, rename_all = "camelCase")]
+        struct StoredPreset {
+            id: String,
+            name: String,
+            built_in: bool,
+            settings: MixerSettings,
+            // Read the legacy location once, but only write `settings.crossfade`.
+            crossfade: Option<CrossfadeSettings>,
+        }
+
+        let stored = StoredPreset::deserialize(deserializer)?;
+        let mut settings = stored.settings;
+        if settings.crossfade.is_none() {
+            settings.crossfade = stored.crossfade;
+        }
+        Ok(Preset {
+            id: stored.id,
+            name: stored.name,
+            built_in: stored.built_in,
+            settings,
+        })
+    }
+}
+
 fn shelved_eq(low_db: f32, mid_db: f32, high_db: f32) -> Eq {
     let mut bands = default_bands();
     for (i, band) in bands.iter_mut().enumerate() {
@@ -43,7 +76,11 @@ fn shelved_eq(low_db: f32, mid_db: f32, high_db: f32) -> Eq {
             _ => high_db,
         };
     }
-    Eq { enabled: true, preamp_db: 0.0, bands }
+    Eq {
+        enabled: true,
+        preamp_db: 0.0,
+        bands,
+    }
 }
 
 pub fn built_ins() -> Vec<Preset> {
@@ -54,6 +91,7 @@ pub fn built_ins() -> Vec<Preset> {
             built_in: true,
             settings: MixerSettings {
                 enabled: Some(true),
+                crossfade: Some(CrossfadeSettings::default()),
                 pitch: Some(Pitch::default()),
                 eq: Some(Eq::default()),
                 reverb: Some(Reverb::default()),
@@ -70,8 +108,15 @@ pub fn built_ins() -> Vec<Preset> {
             built_in: true,
             settings: MixerSettings {
                 enabled: Some(true),
+                crossfade: Some(CrossfadeSettings {
+                    length_secs: 2.0,
+                    curve: CrossfadeCurve::symmetric(2.0),
+                }),
                 // Slightly slow and low, the classic lo-fi treatment.
-                pitch: Some(Pitch { semitones: -1.0, cents: 0.0 }),
+                pitch: Some(Pitch {
+                    semitones: -1.0,
+                    cents: 0.0,
+                }),
                 eq: Some(shelved_eq(2.5, -1.0, -5.0)),
                 reverb: Some(Reverb {
                     enabled: true,
@@ -87,7 +132,10 @@ pub fn built_ins() -> Vec<Preset> {
                     bit_depth: 12.0,
                     mix: 0.7,
                 }),
-                normalisation: Some(Normalisation { enabled: true, ..Default::default() }),
+                normalisation: Some(Normalisation {
+                    enabled: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         },
@@ -97,7 +145,11 @@ pub fn built_ins() -> Vec<Preset> {
             built_in: true,
             settings: MixerSettings {
                 enabled: Some(true),
-                pitch: Some(Pitch { semitones: -4.0, cents: 0.0 }),
+                crossfade: Some(CrossfadeSettings::default()),
+                pitch: Some(Pitch {
+                    semitones: -4.0,
+                    cents: 0.0,
+                }),
                 eq: Some(shelved_eq(5.0, 0.0, -3.0)),
                 reverb: Some(Reverb {
                     enabled: true,
@@ -116,7 +168,11 @@ pub fn built_ins() -> Vec<Preset> {
             built_in: true,
             settings: MixerSettings {
                 enabled: Some(true),
-                pitch: Some(Pitch { semitones: 4.0, cents: 0.0 }),
+                crossfade: Some(CrossfadeSettings::default()),
+                pitch: Some(Pitch {
+                    semitones: 4.0,
+                    cents: 0.0,
+                }),
                 eq: Some(shelved_eq(1.0, 0.0, 2.0)),
                 ..Default::default()
             },
@@ -127,6 +183,7 @@ pub fn built_ins() -> Vec<Preset> {
             built_in: true,
             settings: MixerSettings {
                 enabled: Some(true),
+                crossfade: Some(CrossfadeSettings::default()),
                 eq: Some(shelved_eq(6.0, -1.5, 3.5)),
                 normalisation: Some(Normalisation {
                     enabled: true,
@@ -143,15 +200,46 @@ pub fn built_ins() -> Vec<Preset> {
             built_in: true,
             settings: MixerSettings {
                 enabled: Some(true),
+                crossfade: Some(CrossfadeSettings::default()),
                 eq: Some(Eq {
                     enabled: true,
                     preamp_db: -1.0,
                     bands: vec![
-                        EqBand { kind: BandKind::LowShelf, freq: 90.0, gain_db: -3.0, q: 0.7, enabled: true },
-                        EqBand { kind: BandKind::Peak, freq: 300.0, gain_db: -2.0, q: 1.0, enabled: true },
-                        EqBand { kind: BandKind::Peak, freq: 1800.0, gain_db: 3.5, q: 0.9, enabled: true },
-                        EqBand { kind: BandKind::Peak, freq: 3500.0, gain_db: 4.0, q: 1.1, enabled: true },
-                        EqBand { kind: BandKind::HighShelf, freq: 9000.0, gain_db: 1.5, q: 0.7, enabled: true },
+                        EqBand {
+                            kind: BandKind::LowShelf,
+                            freq: 90.0,
+                            gain_db: -3.0,
+                            q: 0.7,
+                            enabled: true,
+                        },
+                        EqBand {
+                            kind: BandKind::Peak,
+                            freq: 300.0,
+                            gain_db: -2.0,
+                            q: 1.0,
+                            enabled: true,
+                        },
+                        EqBand {
+                            kind: BandKind::Peak,
+                            freq: 1800.0,
+                            gain_db: 3.5,
+                            q: 0.9,
+                            enabled: true,
+                        },
+                        EqBand {
+                            kind: BandKind::Peak,
+                            freq: 3500.0,
+                            gain_db: 4.0,
+                            q: 1.1,
+                            enabled: true,
+                        },
+                        EqBand {
+                            kind: BandKind::HighShelf,
+                            freq: 9000.0,
+                            gain_db: 1.5,
+                            q: 0.7,
+                            enabled: true,
+                        },
                     ],
                 }),
                 ..Default::default()
@@ -163,6 +251,7 @@ pub fn built_ins() -> Vec<Preset> {
             built_in: true,
             settings: MixerSettings {
                 enabled: Some(true),
+                crossfade: Some(CrossfadeSettings::default()),
                 reverb: Some(Reverb {
                     enabled: true,
                     size: 0.95,
@@ -181,6 +270,7 @@ pub fn built_ins() -> Vec<Preset> {
             built_in: true,
             settings: MixerSettings {
                 enabled: Some(true),
+                crossfade: Some(CrossfadeSettings::default()),
                 delay: Some(Delay {
                     enabled: true,
                     time_ms: 375.0,
@@ -198,13 +288,32 @@ pub fn built_ins() -> Vec<Preset> {
             built_in: true,
             settings: MixerSettings {
                 enabled: Some(true),
+                crossfade: Some(CrossfadeSettings::default()),
                 eq: Some(Eq {
                     enabled: true,
                     preamp_db: 2.0,
                     bands: vec![
-                        EqBand { kind: BandKind::HighPass, freq: 500.0, gain_db: 0.0, q: 0.8, enabled: true },
-                        EqBand { kind: BandKind::Peak, freq: 1600.0, gain_db: 6.0, q: 1.2, enabled: true },
-                        EqBand { kind: BandKind::LowPass, freq: 3600.0, gain_db: 0.0, q: 0.8, enabled: true },
+                        EqBand {
+                            kind: BandKind::HighPass,
+                            freq: 500.0,
+                            gain_db: 0.0,
+                            q: 0.8,
+                            enabled: true,
+                        },
+                        EqBand {
+                            kind: BandKind::Peak,
+                            freq: 1600.0,
+                            gain_db: 6.0,
+                            q: 1.2,
+                            enabled: true,
+                        },
+                        EqBand {
+                            kind: BandKind::LowPass,
+                            freq: 3600.0,
+                            gain_db: 0.0,
+                            q: 0.8,
+                            enabled: true,
+                        },
                     ],
                 }),
                 lofi: Some(Lofi {
@@ -312,12 +421,37 @@ mod tests {
     }
 
     #[test]
+    fn lofi_study_has_a_two_second_symmetric_crossfade() {
+        let lofi = built_ins()
+            .into_iter()
+            .find(|p| p.id == "lofi-study")
+            .unwrap();
+        assert_eq!(
+            lofi.settings.crossfade,
+            Some(CrossfadeSettings {
+                length_secs: 2.0,
+                curve: CrossfadeCurve::symmetric(2.0),
+            })
+        );
+        assert!(built_ins()
+            .iter()
+            .filter(|p| p.id != "lofi-study")
+            .all(|p| p.settings.crossfade == Some(CrossfadeSettings::default())));
+    }
+
+    #[test]
     fn a_preset_only_touches_the_sections_it_names() {
         // Tape Echo says nothing about EQ, so the user's EQ must survive it.
-        let tape = built_ins().into_iter().find(|p| p.id == "tape-echo").unwrap();
+        let tape = built_ins()
+            .into_iter()
+            .find(|p| p.id == "tape-echo")
+            .unwrap();
         assert!(tape.settings.eq.is_none());
 
-        let user_eq = MixerSettings { eq: Some(shelved_eq(6.0, 0.0, 0.0)), ..Default::default() };
+        let user_eq = MixerSettings {
+            eq: Some(shelved_eq(6.0, 0.0, 0.0)),
+            ..Default::default()
+        };
         let resolved = MixerSettings::resolve(&[&user_eq, &tape.settings]);
         assert_eq!(resolved.eq.bands[0].gain_db, 6.0, "the user's EQ survived");
         assert!(resolved.delay.enabled, "the preset's delay applied");
@@ -326,8 +460,24 @@ mod tests {
     #[test]
     fn saving_a_preset_then_reloading_returns_it() {
         let path = tempfile();
+        let crossfade = CrossfadeSettings {
+            length_secs: 3.5,
+            curve: CrossfadeCurve {
+                fade_out_start: -3.5,
+                fade_out_end: -0.25,
+                fade_in_start: -2.0,
+                fade_in_end: 1.0,
+                fade_out_shape: 1.5,
+                fade_in_shape: 0.75,
+            },
+        };
         let settings = MixerSettings {
-            reverb: Some(Reverb { enabled: true, mix: 0.66, ..Default::default() }),
+            reverb: Some(Reverb {
+                enabled: true,
+                mix: 0.66,
+                ..Default::default()
+            }),
+            crossfade: Some(crossfade.clone()),
             ..Default::default()
         };
         upsert(&path, "My Mix", settings).unwrap();
@@ -336,6 +486,23 @@ mod tests {
         let mine = all.iter().find(|p| p.name == "My Mix").unwrap();
         assert!(!mine.built_in);
         assert_eq!(mine.settings.reverb.as_ref().unwrap().mix, 0.66);
+        assert_eq!(mine.settings.crossfade, Some(crossfade));
+    }
+
+    #[test]
+    fn legacy_top_level_crossfade_migrates_to_settings() {
+        let path = tempfile();
+        std::fs::write(
+            &path,
+            r#"[{"id":"legacy","name":"Legacy","settings":{},"crossfade":{"lengthSecs":2.0,"curve":{"fadeOutStart":-2.0,"fadeOutEnd":0.0,"fadeInStart":-2.0,"fadeInEnd":0.0}}}]"#,
+        )
+        .unwrap();
+
+        let legacy = load_all(&path)
+            .into_iter()
+            .find(|preset| preset.id == "legacy")
+            .unwrap();
+        assert_eq!(legacy.settings.crossfade.unwrap().length_secs, 2.0);
     }
 
     #[test]
@@ -346,7 +513,11 @@ mod tests {
             &path,
             "My Mix",
             MixerSettings {
-                reverb: Some(Reverb { enabled: true, mix: 0.9, ..Default::default() }),
+                reverb: Some(Reverb {
+                    enabled: true,
+                    mix: 0.9,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
@@ -359,7 +530,10 @@ mod tests {
         let path = tempfile();
         upsert(&path, "My Mix", MixerSettings::default()).unwrap();
         let all = delete(&path, "lofi-study").unwrap();
-        assert!(all.iter().any(|p| p.id == "lofi-study"), "built-ins are not stored on disk");
+        assert!(
+            all.iter().any(|p| p.id == "lofi-study"),
+            "built-ins are not stored on disk"
+        );
 
         let id = crate::library::model::stable_id("ps", "my mix");
         let all = delete(&path, &id).unwrap();

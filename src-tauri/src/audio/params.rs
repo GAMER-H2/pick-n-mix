@@ -1,11 +1,14 @@
 //! Mixer parameters and the global -> playlist -> track override cascade.
 //!
 //! Every section is `Option`al so a playlist or track can override just the
-//! parts it cares about, and every field inside a section has a serde default
-//! so older files keep loading as new fields are added.
+//! parts it cares about. Crossfade is the exception: it is global or playlist
+//! scoped, never an entry override. Every field inside a section has a serde
+//! default so older files keep loading as new fields are added.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::audio::crossfade::CrossfadeSettings;
 
 /// One layer of mixer settings. `None` sections fall through to the layer below.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -21,6 +24,8 @@ pub struct MixerSettings {
     pub delay: Option<Delay>,
     pub normalisation: Option<Normalisation>,
     pub lofi: Option<Lofi>,
+    /// Crossfade is layered globally and per playlist, but never per entry.
+    pub crossfade: Option<CrossfadeSettings>,
     pub filters: Option<Vec<Filter>>,
     /// Anything written by a newer version of the app is kept here and written
     /// back out untouched, so sharing a playlist between versions is lossless.
@@ -47,6 +52,7 @@ impl MixerSettings {
                 .clone()
                 .or_else(|| self.normalisation.clone()),
             lofi: over.lofi.clone().or_else(|| self.lofi.clone()),
+            crossfade: over.crossfade.clone().or_else(|| self.crossfade.clone()),
             filters: over.filters.clone().or_else(|| self.filters.clone()),
             extra,
         }
@@ -57,6 +63,15 @@ impl MixerSettings {
         let merged = layers
             .iter()
             .fold(MixerSettings::default(), |acc, l| acc.overlay(l));
+        // Crossfade applies globally and per playlist, but never per entry.
+        // Keep that scope at the resolver boundary so legacy or hand-edited
+        // entry data cannot affect playback.
+        let crossfade = layers
+            .iter()
+            .take(2)
+            .fold(MixerSettings::default(), |acc, layer| acc.overlay(layer))
+            .crossfade
+            .unwrap_or_default();
         let on = merged.enabled.unwrap_or(true);
         Resolved {
             enabled: on,
@@ -66,6 +81,7 @@ impl MixerSettings {
             delay: merged.delay.unwrap_or_default(),
             normalisation: merged.normalisation.unwrap_or_default(),
             lofi: merged.lofi.unwrap_or_default(),
+            crossfade,
             filters: merged.filters.unwrap_or_default(),
         }
     }
@@ -83,7 +99,10 @@ pub struct Pitch {
 
 impl Default for Pitch {
     fn default() -> Self {
-        Pitch { semitones: 0.0, cents: 0.0 }
+        Pitch {
+            semitones: 0.0,
+            cents: 0.0,
+        }
     }
 }
 
@@ -123,7 +142,13 @@ pub struct EqBand {
 
 impl Default for EqBand {
     fn default() -> Self {
-        EqBand { kind: BandKind::Peak, freq: 1000.0, gain_db: 0.0, q: 1.0, enabled: true }
+        EqBand {
+            kind: BandKind::Peak,
+            freq: 1000.0,
+            gain_db: 0.0,
+            q: 1.0,
+            enabled: true,
+        }
     }
 }
 
@@ -138,7 +163,11 @@ pub struct Eq {
 
 impl Default for Eq {
     fn default() -> Self {
-        Eq { enabled: true, preamp_db: 0.0, bands: default_bands() }
+        Eq {
+            enabled: true,
+            preamp_db: 0.0,
+            bands: default_bands(),
+        }
     }
 }
 
@@ -261,7 +290,12 @@ pub struct Lofi {
 
 impl Default for Lofi {
     fn default() -> Self {
-        Lofi { enabled: false, sample_rate_hz: 44100.0, bit_depth: 16.0, mix: 1.0 }
+        Lofi {
+            enabled: false,
+            sample_rate_hz: 44100.0,
+            bit_depth: 16.0,
+            mix: 1.0,
+        }
     }
 }
 
@@ -280,7 +314,12 @@ pub struct Filter {
 
 impl Default for Filter {
     fn default() -> Self {
-        Filter { id: String::new(), enabled: false, volume: 0.4, tone_hz: 20000.0 }
+        Filter {
+            id: String::new(),
+            enabled: false,
+            volume: 0.4,
+            tone_hz: 20000.0,
+        }
     }
 }
 
@@ -295,6 +334,8 @@ pub struct Resolved {
     pub delay: Delay,
     pub normalisation: Normalisation,
     pub lofi: Lofi,
+    /// Fully resolved so the audio engine can always apply a concrete setting.
+    pub crossfade: CrossfadeSettings,
     pub filters: Vec<Filter>,
 }
 
@@ -311,15 +352,26 @@ mod tests {
     #[test]
     fn track_layer_wins_over_playlist_and_global() {
         let global = MixerSettings {
-            reverb: Some(Reverb { enabled: true, mix: 0.1, ..Default::default() }),
+            reverb: Some(Reverb {
+                enabled: true,
+                mix: 0.1,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let playlist = MixerSettings {
-            reverb: Some(Reverb { enabled: true, mix: 0.5, ..Default::default() }),
+            reverb: Some(Reverb {
+                enabled: true,
+                mix: 0.5,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let track = MixerSettings {
-            delay: Some(Delay { enabled: true, ..Default::default() }),
+            delay: Some(Delay {
+                enabled: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -336,6 +388,26 @@ mod tests {
         assert!(r.enabled);
         assert_eq!(r.pitch.ratio(), 1.0);
         assert_eq!(r.eq.bands.len(), 6);
+        assert_eq!(r.crossfade, CrossfadeSettings::default());
+    }
+
+    #[test]
+    fn playlist_crossfade_overrides_global_but_not_an_entry() {
+        let global = MixerSettings {
+            crossfade: Some(CrossfadeSettings::default().with_length(3.0)),
+            ..Default::default()
+        };
+        let playlist = MixerSettings {
+            crossfade: Some(CrossfadeSettings::default().with_length(1.5)),
+            ..Default::default()
+        };
+        let entry = MixerSettings {
+            crossfade: Some(CrossfadeSettings::default().with_length(8.0)),
+            ..Default::default()
+        };
+
+        let resolved = MixerSettings::resolve(&[&global, &playlist, &entry]);
+        assert_eq!(resolved.crossfade.length_secs, 1.5);
     }
 
     #[test]
@@ -349,7 +421,25 @@ mod tests {
 
     #[test]
     fn semitones_map_to_octave_ratios() {
-        assert!((Pitch { semitones: 12.0, cents: 0.0 }.ratio() - 2.0).abs() < 1e-9);
-        assert!((Pitch { semitones: -12.0, cents: 0.0 }.ratio() - 0.5).abs() < 1e-9);
+        assert!(
+            (Pitch {
+                semitones: 12.0,
+                cents: 0.0
+            }
+            .ratio()
+                - 2.0)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (Pitch {
+                semitones: -12.0,
+                cents: 0.0
+            }
+            .ratio()
+                - 0.5)
+                .abs()
+                < 1e-9
+        );
     }
 }

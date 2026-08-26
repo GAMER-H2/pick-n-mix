@@ -13,24 +13,24 @@ import PresetSelect from "./PresetSelect.vue";
 import FilterGrid from "./FilterGrid.vue";
 import { audibleMix, DEFAULTS, tempoPercent } from "@/lib/mixer";
 import { semitonesLabel } from "@/lib/format";
-import { formatSeconds } from "@/lib/crossfadeCurve";
+import { formatSeconds, withCrossfadeLength } from "@/lib/crossfadeCurve";
 import { useMixerStore } from "@/stores/mixer";
-import { useCrossfadeStore } from "@/stores/crossfade";
 import type { Eq } from "@/lib/types";
 
 const mixer = useMixerStore();
-const crossfade = useCrossfadeStore();
 
 /** Slider max: long enough to be a real DJ-style overlap, short enough that
  * dragging the whole track still feels precise. */
 const MAX_CROSSFADE_SECS = 12;
 
-const crossfadeLength = computed({
-  get: () => crossfade.settings.lengthSecs,
-  set: (secs: number) => crossfade.setLength(secs),
-});
-
 const fx = computed(() => mixer.effective);
+const canEditCrossfade = computed(() => mixer.target.kind !== "entry");
+
+const crossfadeLength = computed({
+  get: () => fx.value.crossfade.lengthSecs,
+  set: (secs: number) =>
+    mixer.setSection("crossfade", withCrossfadeLength(fx.value.crossfade, secs)),
+});
 
 // Reads 0 while reverb is bypassed, and dragging off zero switches it on.
 const reverbMix = computed({
@@ -108,7 +108,7 @@ function openAdvanced() {
       <AppToggle v-model="normalisation" label="Normalisation" />
     </div>
 
-    <div class="popover__row">
+    <div v-if="canEditCrossfade" class="popover__row">
       <label class="popover__label">Crossfade</label>
       <AppSlider v-model="crossfadeLength" :min="0" :max="MAX_CROSSFADE_SECS" :step="0.5" />
       <span class="popover__value">{{ formatSeconds(crossfadeLength) }}</span>

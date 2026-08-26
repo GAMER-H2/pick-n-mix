@@ -59,17 +59,16 @@ fn scanning_indexes_audio_and_ignores_everything_else() {
     let (music, artwork, _) = fixture("scan");
     let db = Db::open_in_memory().expect("opening db");
 
-    let report = scan::scan_folders(
-        &db,
-        &artwork,
-        &[music.display().to_string()],
-        |_, _| {},
-    )
-    .expect("scanning");
+    let report = scan::scan_folders(&db, &artwork, &[music.display().to_string()], |_, _| {})
+        .expect("scanning");
 
     assert_eq!(report.scanned, 3, "the jpg should not be scanned");
     assert_eq!(report.added, 3);
-    assert!(report.errors.is_empty(), "unexpected errors: {:?}", report.errors);
+    assert!(
+        report.errors.is_empty(),
+        "unexpected errors: {:?}",
+        report.errors
+    );
 
     let tracks = db.all_tracks().expect("listing tracks");
     assert_eq!(tracks.len(), 3);
@@ -77,7 +76,10 @@ fn scanning_indexes_audio_and_ignores_everything_else() {
     // Titles fall back to the file name when there are no tags.
     assert!(tracks.iter().any(|t| t.title == "01 First Light"));
 
-    let night_bus = tracks.iter().find(|t| t.title == "03 Night Bus").expect("finding track");
+    let night_bus = tracks
+        .iter()
+        .find(|t| t.title == "03 Night Bus")
+        .expect("finding track");
     assert_eq!(night_bus.sample_rate, Some(48000));
     assert_eq!(night_bus.channels, Some(2));
     assert!((night_bus.duration_secs - 1.0).abs() < 0.1);
@@ -110,20 +112,30 @@ fn deleted_files_drop_out_of_the_index() {
     scan::scan_folders(&db, &artwork, &folders, |_, _| {}).expect("second scan");
 
     assert_eq!(db.track_count().expect("counting"), 2);
-    assert!(db.all_tracks().unwrap().iter().all(|t| t.title != "02 Slow Drift"));
+    assert!(db
+        .all_tracks()
+        .unwrap()
+        .iter()
+        .all(|t| t.title != "02 Slow Drift"));
 }
 
 #[test]
 fn a_playlist_survives_being_shared_with_a_different_library() {
     let (music, artwork, playlists) = fixture("share");
     let db = Db::open_in_memory().expect("opening db");
-    scan::scan_folders(&db, &artwork, &[music.display().to_string()], |_, _| {})
-        .expect("scanning");
+    scan::scan_folders(&db, &artwork, &[music.display().to_string()], |_, _| {}).expect("scanning");
 
     // Build a playlist on "their" machine.
-    let mut playlist = Playlist { name: "Late Night".into(), ..Default::default() };
+    let mut playlist = Playlist {
+        name: "Late Night".into(),
+        ..Default::default()
+    };
     playlist.mixer = Some(MixerSettings {
-        reverb: Some(Reverb { enabled: true, mix: 0.4, ..Default::default() }),
+        reverb: Some(Reverb {
+            enabled: true,
+            mix: 0.4,
+            ..Default::default()
+        }),
         ..Default::default()
     });
     for track in db.all_tracks().expect("listing") {
@@ -135,8 +147,13 @@ fn a_playlist_survives_being_shared_with_a_different_library() {
     // "Our" machine: same music, completely different paths.
     let (our_music, our_artwork, _) = fixture("share-receiver");
     let our_db = Db::open_in_memory().expect("opening db");
-    scan::scan_folders(&our_db, &our_artwork, &[our_music.display().to_string()], |_, _| {})
-        .expect("scanning");
+    scan::scan_folders(
+        &our_db,
+        &our_artwork,
+        &[our_music.display().to_string()],
+        |_, _| {},
+    )
+    .expect("scanning");
 
     let received = Playlist::load(&file).expect("loading the shared playlist");
     assert_ne!(
@@ -146,7 +163,10 @@ fn a_playlist_survives_being_shared_with_a_different_library() {
     );
 
     let resolved = received.resolve(&our_db).expect("resolving");
-    assert_eq!(resolved.missing_count, 0, "every entry should re-match by identity");
+    assert_eq!(
+        resolved.missing_count, 0,
+        "every entry should re-match by identity"
+    );
     assert_eq!(resolved.items.len(), 3);
     assert_eq!(
         resolved.playlist.mixer.unwrap().reverb.unwrap().mix,
@@ -159,10 +179,13 @@ fn a_playlist_survives_being_shared_with_a_different_library() {
 fn artwork_is_not_written_for_files_that_have_none() {
     let (music, artwork, _) = fixture("artwork");
     let db = Db::open_in_memory().expect("opening db");
-    scan::scan_folders(&db, &artwork, &[music.display().to_string()], |_, _| {})
-        .expect("scanning");
+    scan::scan_folders(&db, &artwork, &[music.display().to_string()], |_, _| {}).expect("scanning");
 
-    assert!(db.all_tracks().unwrap().iter().all(|t| t.artwork_id.is_none()));
+    assert!(db
+        .all_tracks()
+        .unwrap()
+        .iter()
+        .all(|t| t.artwork_id.is_none()));
     let written = std::fs::read_dir(&artwork).map(|d| d.count()).unwrap_or(0);
     assert_eq!(written, 0, "no artwork should have been cached");
 }

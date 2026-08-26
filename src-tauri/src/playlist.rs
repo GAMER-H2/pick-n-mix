@@ -201,10 +201,18 @@ impl Playlist {
             if track.is_none() {
                 missing += 1;
             }
-            items.push(ResolvedEntry { index, entry: entry.clone(), track });
+            items.push(ResolvedEntry {
+                index,
+                entry: entry.clone(),
+                track,
+            });
         }
 
-        Ok(Resolved { playlist: self, items, missing_count: missing })
+        Ok(Resolved {
+            playlist: self,
+            items,
+            missing_count: missing,
+        })
     }
 }
 
@@ -239,7 +247,13 @@ pub fn list(dir: &Path) -> Vec<(PathBuf, Playlist)> {
 pub fn file_name_for(name: &str, id: &str) -> String {
     let slug: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == ' ' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == ' ' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -304,15 +318,26 @@ mod tests {
         p.save(&path).unwrap();
 
         let round_tripped = std::fs::read_to_string(&path).unwrap();
-        assert!(round_tripped.contains("smartRules"), "playlist-level unknowns must survive");
-        assert!(round_tripped.contains("crossfadeMs"), "entry-level unknowns must survive");
+        assert!(
+            round_tripped.contains("smartRules"),
+            "playlist-level unknowns must survive"
+        );
+        assert!(
+            round_tripped.contains("crossfadeMs"),
+            "entry-level unknowns must survive"
+        );
     }
 
     #[test]
     fn entries_resolve_by_identity_when_the_path_is_wrong() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&track("Come Together", "The Beatles", "Abbey Road", "/mine/1.flac"))
-            .unwrap();
+        db.upsert_track(&track(
+            "Come Together",
+            "The Beatles",
+            "Abbey Road",
+            "/mine/1.flac",
+        ))
+        .unwrap();
 
         let mut playlist = Playlist::default();
         playlist.tracks.push(Entry {
@@ -326,7 +351,10 @@ mod tests {
 
         let resolved = playlist.resolve(&db).unwrap();
         assert_eq!(resolved.missing_count, 0);
-        assert_eq!(resolved.items[0].track.as_ref().unwrap().location, "/mine/1.flac");
+        assert_eq!(
+            resolved.items[0].track.as_ref().unwrap().location,
+            "/mine/1.flac"
+        );
     }
 
     #[test]
@@ -352,13 +380,21 @@ mod tests {
 
         let mut playlist = Playlist::default();
         playlist.mixer = Some(MixerSettings {
-            reverb: Some(Reverb { enabled: true, mix: 0.4, ..Default::default() }),
+            reverb: Some(Reverb {
+                enabled: true,
+                mix: 0.4,
+                ..Default::default()
+            }),
             ..Default::default()
         });
         playlist.tracks.push(Entry {
             title: "A".into(),
             mixer: Some(MixerSettings {
-                reverb: Some(Reverb { enabled: true, mix: 0.9, ..Default::default() }),
+                reverb: Some(Reverb {
+                    enabled: true,
+                    mix: 0.9,
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -367,7 +403,17 @@ mod tests {
 
         let loaded = Playlist::load(&path).unwrap();
         assert_eq!(loaded.mixer.unwrap().reverb.unwrap().mix, 0.4);
-        assert_eq!(loaded.tracks[0].mixer.as_ref().unwrap().reverb.as_ref().unwrap().mix, 0.9);
+        assert_eq!(
+            loaded.tracks[0]
+                .mixer
+                .as_ref()
+                .unwrap()
+                .reverb
+                .as_ref()
+                .unwrap()
+                .mix,
+            0.9
+        );
     }
 
     #[test]
@@ -379,8 +425,10 @@ mod tests {
     }
 
     fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("pnm-test-{}", crate::library::model::stable_id("d", &format!("{:?}", std::time::Instant::now()))));
+        let dir = std::env::temp_dir().join(format!(
+            "pnm-test-{}",
+            crate::library::model::stable_id("d", &format!("{:?}", std::time::Instant::now()))
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

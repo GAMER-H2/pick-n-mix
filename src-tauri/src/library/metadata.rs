@@ -92,11 +92,17 @@ impl MusicBrainz {
         );
 
         self.throttle();
-        let response = self.client.get(&url).send().context("querying MusicBrainz")?;
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .context("querying MusicBrainz")?;
         if !response.status().is_success() {
             return Err(anyhow!("MusicBrainz returned {}", response.status()));
         }
-        let body: RecordingSearch = response.json().context("parsing the MusicBrainz response")?;
+        let body: RecordingSearch = response
+            .json()
+            .context("parsing the MusicBrainz response")?;
 
         // Prefer a candidate whose duration is close to the file's, which
         // reliably separates a studio cut from a live or extended version.
@@ -225,7 +231,9 @@ fn year_of(date: &str) -> Option<i32> {
 
 /// Lucene special characters would otherwise break the query.
 fn escape(s: &str) -> String {
-    s.replace('\\', "").replace('"', "").replace(['(', ')', '[', ']', ':', '^', '~'], " ")
+    s.replace('\\', "")
+        .replace('"', "")
+        .replace(['(', ')', '[', ']', ':', '^', '~'], " ")
 }
 
 // -- MusicBrainz response shapes --------------------------------------------
@@ -299,7 +307,10 @@ mod tests {
 
     #[test]
     fn a_close_duration_beats_a_higher_raw_score() {
-        let track = Track { duration_secs: 200.0, ..Default::default() };
+        let track = Track {
+            duration_secs: 200.0,
+            ..Default::default()
+        };
         let close = RecordingMatch {
             id: "a".into(),
             title: String::new(),

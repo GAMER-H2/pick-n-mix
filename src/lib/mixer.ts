@@ -6,7 +6,9 @@
  * round trip.
  */
 
+import { defaultCrossfade } from "./crossfadeCurve";
 import type {
+  CrossfadeSettings,
   Delay,
   Eq,
   EqBand,
@@ -61,6 +63,7 @@ export const DEFAULTS = {
   }),
   lofi: (): Lofi => ({ enabled: false, sampleRateHz: 44100, bitDepth: 16, mix: 1 }),
   filters: (): FilterSetting[] => [],
+  crossfade: () => defaultCrossfade(),
 };
 
 export type Section = keyof typeof DEFAULTS;
@@ -72,6 +75,7 @@ export const SECTIONS: Section[] = [
   "delay",
   "normalisation",
   "lofi",
+  "crossfade",
   "filters",
 ];
 
@@ -90,6 +94,9 @@ export function overlay(layers: (MixerSettings | null | undefined)[]): MixerSett
 /** Collapse a cascade into fully-populated values. */
 export function resolve(layers: (MixerSettings | null | undefined)[]): ResolvedMixer {
   const merged = overlay(layers);
+  // A crossfade belongs to the playlist transition, so entry-level layers do
+  // not participate even if older data happens to contain that field.
+  const crossfade = overlay(layers.slice(0, 2)).crossfade as CrossfadeSettings | undefined;
   return {
     enabled: merged.enabled ?? true,
     pitch: (merged.pitch as Pitch) ?? DEFAULTS.pitch(),
@@ -98,6 +105,7 @@ export function resolve(layers: (MixerSettings | null | undefined)[]): ResolvedM
     delay: (merged.delay as Delay) ?? DEFAULTS.delay(),
     normalisation: (merged.normalisation as Normalisation) ?? DEFAULTS.normalisation(),
     lofi: (merged.lofi as Lofi) ?? DEFAULTS.lofi(),
+    crossfade: crossfade ?? DEFAULTS.crossfade(),
     filters: (merged.filters as FilterSetting[]) ?? DEFAULTS.filters(),
   };
 }

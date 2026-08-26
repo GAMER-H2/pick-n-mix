@@ -29,5 +29,12 @@ export const useCrossfadeStore = defineStore("crossfade", () => {
     settings.value = await api.setCrossfadeCurve(curve);
   }
 
-  return { settings, refresh, setLength, setCurve };
+  /** Apply the crossfade snapshot carried by a mixer preset. Length is set
+   * first because the backend validates the curve against its current range. */
+  async function setSettings(next: CrossfadeSettings) {
+    settings.value = await api.setCrossfadeLength(next.lengthSecs);
+    settings.value = await api.setCrossfadeCurve(next.curve);
+  }
+
+  return { settings, refresh, setLength, setCurve, setSettings };
 });

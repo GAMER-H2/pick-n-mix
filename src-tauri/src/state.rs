@@ -37,7 +37,12 @@ impl Paths {
     }
 
     pub fn ensure(&self) -> Result<()> {
-        for dir in [&self.data_dir, &self.artwork, &self.playlists, &self.filters] {
+        for dir in [
+            &self.data_dir,
+            &self.artwork,
+            &self.playlists,
+            &self.filters,
+        ] {
             std::fs::create_dir_all(dir)?;
         }
         Ok(())
@@ -62,8 +67,8 @@ pub const SETTING_GLOBAL_MIXER: &str = "mixer.global";
 pub const SETTING_VOLUME: &str = "player.volume";
 pub const SETTING_REPEAT: &str = "player.repeat";
 pub const SETTING_SHUFFLE: &str = "player.shuffle";
-/// Global only — see `audio::crossfade` for why this is not layered through
-/// the mixer cascade with the rest of the saved settings.
+/// Legacy location for crossfade settings. On startup its value is migrated
+/// into [`SETTING_GLOBAL_MIXER`] when that mixer has no crossfade section.
 pub const SETTING_CROSSFADE: &str = "crossfade.global";
 
 impl AppState {
@@ -84,6 +89,24 @@ impl AppState {
                 Err(e) => eprintln!("state: ignoring unreadable saved mixer: {e}"),
             }
         }
+        // Migrate the former standalone crossfade setting into the global
+        // mixer once. A saved mixer section always takes precedence.
+        if player.global_mixer.crossfade.is_none() {
+            if let Ok(Some(raw)) = db.get_setting(SETTING_CROSSFADE) {
+                match serde_json::from_str::<CrossfadeSettings>(&raw) {
+                    Ok(crossfade) => {
+                        player.global_mixer.crossfade = Some(crossfade);
+                        if let Ok(raw) = serde_json::to_string(&player.global_mixer) {
+                            let _ = db.set_setting(SETTING_GLOBAL_MIXER, &raw);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("state: ignoring unreadable legacy crossfade settings: {e}")
+                    }
+                }
+            }
+        }
+
         if let Ok(Some(raw)) = db.get_setting(SETTING_VOLUME) {
             if let Ok(v) = raw.parse::<f32>() {
                 engine.set_volume(v);
@@ -98,14 +121,9 @@ impl AppState {
             }
         }
 
-        engine.set_settings(player.effective_mixer());
-
-        if let Ok(Some(raw)) = db.get_setting(SETTING_CROSSFADE) {
-            match serde_json::from_str::<CrossfadeSettings>(&raw) {
-                Ok(crossfade) => engine.set_crossfade(crossfade),
-                Err(e) => eprintln!("state: ignoring unreadable saved crossfade settings: {e}"),
-            }
-        }
+        let effective_mixer = player.effective_mixer();
+        engine.set_settings(effective_mixer.clone());
+        engine.set_crossfade(effective_mixer.crossfade);
 
         Ok(AppState {
             db,
@@ -122,7 +140,9 @@ impl AppState {
     /// change to the global, playlist or track layers, and on track change.
     pub fn sync_mixer(&self) {
         let player = self.player.lock();
-        self.engine.set_settings(player.effective_mixer());
+        let effective_mixer = player.effective_mixer();
+        self.engine.set_settings(effective_mixer.clone());
+        self.engine.set_crossfade(effective_mixer.crossfade);
         self.engine.set_track_gain_db(player.current_gain_db());
     }
 
@@ -133,7 +153,9 @@ impl AppState {
         if let Some(existing) = slot.as_ref() {
             return Ok(Arc::clone(existing));
         }
-        let provider = Arc::new(crate::library::metadata::MusicBrainz::new(&self.paths.artwork)?);
+        let provider = Arc::new(crate::library::metadata::MusicBrainz::new(
+            &self.paths.artwork,
+        )?);
         *slot = Some(Arc::clone(&provider));
         Ok(provider)
     }

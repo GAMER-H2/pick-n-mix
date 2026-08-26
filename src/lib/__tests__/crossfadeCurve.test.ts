@@ -15,7 +15,14 @@ import {
 describe("crossfade curve", () => {
   it("is full at the start and silent at the boundary", () => {
     const curve = symmetricCurve(5);
-    expect(curve).toEqual({ fadeOutStart: -5, fadeOutEnd: 0, fadeInStart: -5, fadeInEnd: 0 });
+    expect(curve).toEqual({
+      fadeOutStart: -5,
+      fadeOutEnd: 0,
+      fadeInStart: -5,
+      fadeInEnd: 0,
+      fadeOutShape: 1,
+      fadeInShape: 1,
+    });
 
     expect(gainOut(curve, -5)).toBeCloseTo(1, 6);
     expect(gainOut(curve, 0)).toBeCloseTo(0, 6);
@@ -39,8 +46,23 @@ describe("crossfade curve", () => {
     expect(gainIn(curve, 10)).toBe(1);
   });
 
+  it("adjusts each envelope when its shape changes", () => {
+    const normal = symmetricCurve(4);
+    const shaped = { ...normal, fadeOutShape: 2, fadeInShape: 0.5 };
+
+    expect(gainOut(shaped, -2)).toBeGreaterThan(gainOut(normal, -2));
+    expect(gainIn(shaped, -2)).toBeGreaterThan(gainIn(normal, -2));
+  });
+
   it("never lets the outgoing song play past its own end", () => {
-    const broken = { fadeOutStart: 2, fadeOutEnd: 3, fadeInStart: 1, fadeInEnd: 4 };
+    const broken = {
+      fadeOutStart: 2,
+      fadeOutEnd: 3,
+      fadeInStart: 1,
+      fadeInEnd: 4,
+      fadeOutShape: 1,
+      fadeInShape: 1,
+    };
     const clamped = clampCurve(broken, 5);
     expect(clamped.fadeOutEnd).toBeLessThanOrEqual(0);
     expect(clamped.fadeOutStart).toBeLessThanOrEqual(clamped.fadeOutEnd);
@@ -53,14 +75,28 @@ describe("crossfade curve", () => {
 
   it("does not forbid a gap or an overlap", () => {
     const gap = clampCurve(
-      { fadeOutStart: -3, fadeOutEnd: -1, fadeInStart: 1, fadeInEnd: 3 },
+      {
+        fadeOutStart: -3,
+        fadeOutEnd: -1,
+        fadeInStart: 1,
+        fadeInEnd: 3,
+        fadeOutShape: 1,
+        fadeInShape: 1,
+      },
       5,
     );
     expect(gainOut(gap, gap.fadeOutEnd)).toBeCloseTo(0, 5);
     expect(gainIn(gap, gap.fadeOutEnd)).toBeCloseTo(0, 5);
 
     const overlap = clampCurve(
-      { fadeOutStart: -4, fadeOutEnd: -0.5, fadeInStart: -3.5, fadeInEnd: 0 },
+      {
+        fadeOutStart: -4,
+        fadeOutEnd: -0.5,
+        fadeInStart: -3.5,
+        fadeInEnd: 0,
+        fadeOutShape: 1,
+        fadeInShape: 1,
+      },
       5,
     );
     expect(gainOut(overlap, -2)).toBeGreaterThan(0);

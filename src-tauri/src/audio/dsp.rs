@@ -17,7 +17,11 @@ pub struct Smoothed {
 
 impl Smoothed {
     pub fn new(value: f32) -> Self {
-        Smoothed { current: value, target: value, coeff: 0.0 }
+        Smoothed {
+            current: value,
+            target: value,
+            coeff: 0.0,
+        }
     }
 
     /// `time_ms` is the time constant of the one-pole glide.
@@ -84,7 +88,10 @@ pub struct Biquad {
 
 impl Biquad {
     pub fn bypass() -> Self {
-        Biquad { b0: 1.0, ..Default::default() }
+        Biquad {
+            b0: 1.0,
+            ..Default::default()
+        }
     }
 
     pub fn set(&mut self, kind: BandKind, sample_rate: f32, freq: f32, gain_db: f32, q: f32) {
@@ -215,7 +222,12 @@ impl EqChain {
         self.enabled = eq.enabled;
         self.preamp.set_target(db_to_gain(eq.preamp_db));
 
-        let bands: Vec<&EqBand> = eq.bands.iter().filter(|b| b.enabled).take(MAX_BANDS).collect();
+        let bands: Vec<&EqBand> = eq
+            .bands
+            .iter()
+            .filter(|b| b.enabled)
+            .take(MAX_BANDS)
+            .collect();
         let changed = bands.len() != self.current.len()
             || bands.iter().zip(self.current.iter()).any(|(a, b)| *a != b);
         if !changed {
@@ -226,7 +238,13 @@ impl EqChain {
         self.active = bands.len();
         for ch in 0..CHANNELS {
             for (i, band) in bands.iter().enumerate() {
-                self.filters[ch][i].set(band.kind, self.sample_rate, band.freq, band.gain_db, band.q);
+                self.filters[ch][i].set(
+                    band.kind,
+                    self.sample_rate,
+                    band.freq,
+                    band.gain_db,
+                    band.q,
+                );
             }
         }
     }
@@ -328,7 +346,11 @@ impl DelayFx {
 
                 // Fractional read for smooth time changes.
                 let read_pos = self.write[ch] as f32 - delay;
-                let read_pos = if read_pos < 0.0 { read_pos + line_len as f32 } else { read_pos };
+                let read_pos = if read_pos < 0.0 {
+                    read_pos + line_len as f32
+                } else {
+                    read_pos
+                };
                 let i0 = read_pos.floor() as usize % line_len;
                 let i1 = (i0 + 1) % line_len;
                 let frac = read_pos - read_pos.floor();
@@ -362,7 +384,11 @@ struct Comb {
 
 impl Comb {
     fn new(len: usize) -> Self {
-        Comb { buf: vec![0.0; len.max(1)], pos: 0, store: 0.0 }
+        Comb {
+            buf: vec![0.0; len.max(1)],
+            pos: 0,
+            store: 0.0,
+        }
     }
 
     #[inline]
@@ -382,7 +408,10 @@ struct Allpass {
 
 impl Allpass {
     fn new(len: usize) -> Self {
-        Allpass { buf: vec![0.0; len.max(1)], pos: 0 }
+        Allpass {
+            buf: vec![0.0; len.max(1)],
+            pos: 0,
+        }
     }
 
     #[inline]
@@ -466,13 +495,16 @@ impl ReverbFx {
     pub fn update(&mut self, r: &crate::audio::params::Reverb) {
         self.enabled = r.enabled;
         // Map 0..1 size onto Freeverb's usable room-size feedback range.
-        self.feedback.set_target(0.7 + r.size.clamp(0.0, 1.0) * 0.28);
+        self.feedback
+            .set_target(0.7 + r.size.clamp(0.0, 1.0) * 0.28);
         self.damping.set_target(r.damping.clamp(0.0, 1.0) * 0.4);
         self.mix.set_target(r.mix.clamp(0.0, 1.0));
         self.width.set_target(r.width.clamp(0.0, 1.0));
-        let pre = (r.predelay_ms.clamp(0.0, Self::MAX_PREDELAY_MS) / 1000.0 * self.sample_rate)
-            as usize;
-        self.predelay_len = pre.max(1).min(self.predelay[0].len().saturating_sub(1).max(1));
+        let pre =
+            (r.predelay_ms.clamp(0.0, Self::MAX_PREDELAY_MS) / 1000.0 * self.sample_rate) as usize;
+        self.predelay_len = pre
+            .max(1)
+            .min(self.predelay[0].len().saturating_sub(1).max(1));
     }
 
     pub fn process(&mut self, buf: &mut [Vec<f32>], frames: usize) {
@@ -661,7 +693,11 @@ impl Limiter {
             let peak = buf[0][i].abs().max(buf[1][i].abs());
 
             // Instant attack on a new peak, exponential release afterwards.
-            let needed = if peak > self.ceiling { self.ceiling / peak } else { 1.0 };
+            let needed = if peak > self.ceiling {
+                self.ceiling / peak
+            } else {
+                1.0
+            };
             if needed < self.envelope {
                 self.envelope = needed;
             } else {
@@ -808,7 +844,11 @@ mod tests {
         let mut lim = Limiter::new();
         lim.prepare(48000.0);
         lim.update(
-            &Normalisation { limiter_enabled: true, limiter_ceiling_db: -6.0, ..Default::default() },
+            &Normalisation {
+                limiter_enabled: true,
+                limiter_ceiling_db: -6.0,
+                ..Default::default()
+            },
             48000.0,
         );
         let mut buf = vec![vec![4.0f32; 4096]; CHANNELS];
@@ -816,14 +856,20 @@ mod tests {
         let ceiling = db_to_gain(-6.0);
         // Skip the look-ahead priming region.
         let worst = buf[0][1000..].iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        assert!(worst <= ceiling + 1e-3, "peak {worst} exceeded ceiling {ceiling}");
+        assert!(
+            worst <= ceiling + 1e-3,
+            "peak {worst} exceeded ceiling {ceiling}"
+        );
     }
 
     #[test]
     fn disabled_lofi_is_transparent() {
         let mut lofi = LofiFx::new();
         lofi.prepare(48000.0);
-        lofi.update(&Lofi { enabled: false, ..Default::default() });
+        lofi.update(&Lofi {
+            enabled: false,
+            ..Default::default()
+        });
         let mut buf = vec![vec![0.3f32; 128]; CHANNELS];
         lofi.process(&mut buf, 128);
         assert!((buf[0][127] - 0.3).abs() < 1e-6);
@@ -853,34 +899,54 @@ mod fade_tests {
     fn a_disabled_delay_stops_processing_once_it_has_faded() {
         let mut delay = DelayFx::new();
         delay.prepare(48000.0);
-        delay.update(&Delay { enabled: true, mix: 0.5, ..Default::default() });
+        delay.update(&Delay {
+            enabled: true,
+            mix: 0.5,
+            ..Default::default()
+        });
 
         let mut buf = vec![vec![0.2f32; 512]; CHANNELS];
         delay.process(&mut buf, 512);
 
-        delay.update(&Delay { enabled: false, ..Default::default() });
+        delay.update(&Delay {
+            enabled: false,
+            ..Default::default()
+        });
         // A second of audio is far longer than the 20 ms mix glide.
         for _ in 0..100 {
             delay.process(&mut buf, 512);
         }
-        assert!(delay.mix.is_silent(), "mix never reached the silent threshold");
+        assert!(
+            delay.mix.is_silent(),
+            "mix never reached the silent threshold"
+        );
 
         // Once silent it must pass audio through untouched.
         let mut probe = vec![vec![0.7f32; 64]; CHANNELS];
         delay.process(&mut probe, 64);
-        assert!((probe[0][63] - 0.7).abs() < 1e-6, "a faded-out delay still coloured the signal");
+        assert!(
+            (probe[0][63] - 0.7).abs() < 1e-6,
+            "a faded-out delay still coloured the signal"
+        );
     }
 
     #[test]
     fn a_disabled_reverb_stops_processing_once_it_has_faded() {
         let mut reverb = ReverbFx::new();
         reverb.prepare(48000.0);
-        reverb.update(&Reverb { enabled: true, mix: 0.6, ..Default::default() });
+        reverb.update(&Reverb {
+            enabled: true,
+            mix: 0.6,
+            ..Default::default()
+        });
 
         let mut buf = vec![vec![0.2f32; 512]; CHANNELS];
         reverb.process(&mut buf, 512);
 
-        reverb.update(&Reverb { enabled: false, ..Default::default() });
+        reverb.update(&Reverb {
+            enabled: false,
+            ..Default::default()
+        });
         for _ in 0..100 {
             reverb.process(&mut buf, 512);
         }
@@ -888,7 +954,10 @@ mod fade_tests {
 
         let mut probe = vec![vec![0.7f32; 64]; CHANNELS];
         reverb.process(&mut probe, 64);
-        assert!((probe[0][63] - 0.7).abs() < 1e-6, "a faded-out reverb still coloured the signal");
+        assert!(
+            (probe[0][63] - 0.7).abs() < 1e-6,
+            "a faded-out reverb still coloured the signal"
+        );
     }
 
     #[test]

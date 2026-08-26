@@ -137,7 +137,10 @@ pub struct AmbienceMixer {
 
 impl AmbienceMixer {
     pub fn new() -> Self {
-        AmbienceMixer { beds: Vec::new(), sample_rate: 48000.0 }
+        AmbienceMixer {
+            beds: Vec::new(),
+            sample_rate: 48000.0,
+        }
     }
 
     pub fn prepare(&mut self, sample_rate: f32) {
@@ -161,7 +164,13 @@ impl AmbienceMixer {
                 bed.retiring = false;
                 bed.gain.set_target(gain);
                 for ch in 0..CHANNELS {
-                    bed.tone[ch].set(BandKind::LowPass, self.sample_rate, filter.tone_hz, 0.0, 0.707);
+                    bed.tone[ch].set(
+                        BandKind::LowPass,
+                        self.sample_rate,
+                        filter.tone_hz,
+                        0.0,
+                        0.707,
+                    );
                 }
                 continue;
             }
@@ -176,7 +185,13 @@ impl AmbienceMixer {
             smoothed.set_target(gain);
             let mut tone = [Biquad::bypass(); CHANNELS];
             for t in tone.iter_mut() {
-                t.set(BandKind::LowPass, self.sample_rate, filter.tone_hz, 0.0, 0.707);
+                t.set(
+                    BandKind::LowPass,
+                    self.sample_rate,
+                    filter.tone_hz,
+                    0.0,
+                    0.707,
+                );
             }
             self.beds.push(ActiveBed {
                 id: filter.id.clone(),
@@ -251,8 +266,12 @@ mod tests {
         let mut bank = Bank::new();
         // Four frames of stereo, constant value.
         bank.insert("rain".into(), Arc::new(vec![1.0; 8]));
-        let wanted =
-            vec![Filter { id: "rain".into(), enabled: true, volume: 1.0, tone_hz: 20000.0 }];
+        let wanted = vec![Filter {
+            id: "rain".into(),
+            enabled: true,
+            volume: 1.0,
+            tone_hz: 20000.0,
+        }];
         mixer.sync(&wanted, &bank);
 
         let mut buf = vec![vec![0.0f32; 64]; CHANNELS];

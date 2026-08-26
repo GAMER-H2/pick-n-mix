@@ -95,7 +95,10 @@ fn output_length_matches_the_target_rate() {
         (frames as i64 - 48000).abs() < 200,
         "expected roughly 48000 frames, got {frames}"
     );
-    assert!(samples.iter().any(|s| s.abs() > 0.1), "output should not be silent");
+    assert!(
+        samples.iter().any(|s| s.abs() > 0.1),
+        "output should not be silent"
+    );
 }
 
 /// The same-rate path has no resampler, and used to drop whatever was left in
@@ -112,8 +115,14 @@ fn no_audio_is_lost_when_the_rates_already_match() {
     let samples = read_all(&mut dec);
     let frames = samples.len() / 2;
 
-    assert_eq!(frames, 44100, "every frame of a same-rate file should come out");
-    assert!(dec.is_eof(), "the decoder should report end of file once drained");
+    assert_eq!(
+        frames, 44100,
+        "every frame of a same-rate file should come out"
+    );
+    assert!(
+        dec.is_eof(),
+        "the decoder should report end of file once drained"
+    );
 }
 
 #[test]
@@ -153,7 +162,10 @@ fn mono_sources_are_widened_to_stereo() {
         .chunks_exact(2)
         .filter(|frame| (frame[0] - frame[1]).abs() > 1e-6)
         .count();
-    assert_eq!(mismatches, 0, "left and right should be identical for a mono source");
+    assert_eq!(
+        mismatches, 0,
+        "left and right should be identical for a mono source"
+    );
 }
 
 #[test]

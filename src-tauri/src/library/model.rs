@@ -67,7 +67,14 @@ pub fn normalise(s: &str) -> String {
 /// one track and something else for another; every track of theirs reduces to
 /// the same lead, which is all this is used for.
 pub fn lead_artist(credit: &str) -> String {
-    const MARKERS: [&str; 6] = [" feat. ", " feat ", " ft. ", " ft ", " featuring ", " with "];
+    const MARKERS: [&str; 6] = [
+        " feat. ",
+        " feat ",
+        " ft. ",
+        " ft ",
+        " featuring ",
+        " with ",
+    ];
     let lower = credit.to_lowercase();
 
     let mut cut = lower.len();
@@ -83,7 +90,12 @@ pub fn lead_artist(credit: &str) -> String {
 }
 
 pub fn match_key(artist: &str, title: &str, album: &str) -> String {
-    format!("{}|{}|{}", normalise(artist), normalise(title), normalise(album))
+    format!(
+        "{}|{}|{}",
+        normalise(artist),
+        normalise(title),
+        normalise(album)
+    )
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -148,8 +160,14 @@ mod tests {
 
     #[test]
     fn stable_ids_are_deterministic_and_prefixed() {
-        assert_eq!(stable_id("t", "/music/a.flac"), stable_id("t", "/music/a.flac"));
-        assert_ne!(stable_id("t", "/music/a.flac"), stable_id("t", "/music/b.flac"));
+        assert_eq!(
+            stable_id("t", "/music/a.flac"),
+            stable_id("t", "/music/a.flac")
+        );
+        assert_ne!(
+            stable_id("t", "/music/a.flac"),
+            stable_id("t", "/music/b.flac")
+        );
         assert!(stable_id("t", "x").starts_with("t_"));
     }
 }
@@ -172,7 +190,10 @@ mod lead_artist_tests {
     fn an_ampersand_in_a_band_name_is_left_alone() {
         // Splitting on "&" would break these; every track still agrees.
         assert_eq!(lead_artist("Earth, Wind & Fire"), "earth");
-        assert_eq!(lead_artist("Earth, Wind & Fire"), lead_artist("Earth, Wind & Fire"));
+        assert_eq!(
+            lead_artist("Earth, Wind & Fire"),
+            lead_artist("Earth, Wind & Fire")
+        );
         assert_eq!(lead_artist("Simon & Garfunkel"), "simon garfunkel");
     }
 

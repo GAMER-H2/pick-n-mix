@@ -24,7 +24,9 @@ impl Db {
             .with_context(|| format!("opening library database at {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Db { conn: Mutex::new(conn) };
+        let db = Db {
+            conn: Mutex::new(conn),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -32,7 +34,9 @@ impl Db {
     /// An in-memory library, used by tests and useful for a scratch session.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = Db { conn: Mutex::new(conn) };
+        let db = Db {
+            conn: Mutex::new(conn),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -123,9 +127,11 @@ impl Db {
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock();
         let v = conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| {
-                r.get::<_, String>(0)
-            })
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
             .optional()?;
         Ok(v)
     }
@@ -329,9 +335,10 @@ impl Db {
         }
 
         out.sort_by(|a, b| {
-            a.artist.to_lowercase().cmp(&b.artist.to_lowercase()).then(
-                a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            )
+            a.artist
+                .to_lowercase()
+                .cmp(&b.artist.to_lowercase())
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         Ok(out)
     }
@@ -348,7 +355,10 @@ impl Db {
             match out.iter_mut().find(|a| a.id == id) {
                 Some(artist) => {
                     artist.track_count += 1;
-                    if has_album && !seen_albums.iter().any(|(ar, al)| ar == &id && al == &album_id)
+                    if has_album
+                        && !seen_albums
+                            .iter()
+                            .any(|(ar, al)| ar == &id && al == &album_id)
                     {
                         artist.album_count += 1;
                         seen_albums.push((id.clone(), album_id));
@@ -387,8 +397,9 @@ impl Db {
         let conn = self.conn.lock();
 
         if let Some(mbid) = mbid.filter(|m| !m.is_empty()) {
-            let mut stmt =
-                conn.prepare(&format!("{TRACK_SELECT} WHERE musicbrainz_recording_id = ?1"))?;
+            let mut stmt = conn.prepare(&format!(
+                "{TRACK_SELECT} WHERE musicbrainz_recording_id = ?1"
+            ))?;
             if let Some(t) = stmt.query_row(params![mbid], row_to_track).optional()? {
                 return Ok(Some(t));
             }
@@ -458,7 +469,14 @@ pub fn album_id_for(track: &Track) -> String {
     if tagged_artist.is_empty() {
         stable_id("al", &album)
     } else {
-        stable_id("al", &format!("{}|{}", crate::library::model::normalise(tagged_artist), album))
+        stable_id(
+            "al",
+            &format!(
+                "{}|{}",
+                crate::library::model::normalise(tagged_artist),
+                album
+            ),
+        )
     }
 }
 
@@ -535,23 +553,38 @@ mod tests {
         t.title = "Song (Remaster)".into();
         assert!(!db.upsert_track(&t).unwrap());
         assert_eq!(db.track_count().unwrap(), 1);
-        assert_eq!(db.get_track(&t.id).unwrap().unwrap().title, "Song (Remaster)");
+        assert_eq!(
+            db.get_track(&t.id).unwrap().unwrap().title,
+            "Song (Remaster)"
+        );
     }
 
     #[test]
     fn resolve_finds_tracks_despite_formatting_differences() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&track("Come Together", "The Beatles", "Abbey Road", "/m/1.flac"))
-            .unwrap();
+        db.upsert_track(&track(
+            "Come Together",
+            "The Beatles",
+            "Abbey Road",
+            "/m/1.flac",
+        ))
+        .unwrap();
 
-        let hit = db.resolve(None, "the beatles", "COME TOGETHER", "abbey  road").unwrap();
+        let hit = db
+            .resolve(None, "the beatles", "COME TOGETHER", "abbey  road")
+            .unwrap();
         assert!(hit.is_some(), "should match on the normalised key");
 
         // Different album still resolves through the artist/title fallback.
-        let hit = db.resolve(None, "The Beatles", "Come Together", "Some Compilation").unwrap();
+        let hit = db
+            .resolve(None, "The Beatles", "Come Together", "Some Compilation")
+            .unwrap();
         assert!(hit.is_some(), "should fall back to artist and title");
 
-        assert!(db.resolve(None, "Nobody", "Nothing", "Nowhere").unwrap().is_none());
+        assert!(db
+            .resolve(None, "Nobody", "Nothing", "Nowhere")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -560,22 +593,36 @@ mod tests {
         let mut a = track("Wrong Name", "Wrong Artist", "Wrong Album", "/m/1.flac");
         a.musicbrainz_recording_id = Some("mbid-123".into());
         db.upsert_track(&a).unwrap();
-        db.upsert_track(&track("Right", "Right", "Right", "/m/2.flac")).unwrap();
+        db.upsert_track(&track("Right", "Right", "Right", "/m/2.flac"))
+            .unwrap();
 
-        let hit = db.resolve(Some("mbid-123"), "Right", "Right", "Right").unwrap().unwrap();
+        let hit = db
+            .resolve(Some("mbid-123"), "Right", "Right", "Right")
+            .unwrap()
+            .unwrap();
         assert_eq!(hit.location, "/m/1.flac");
     }
 
     #[test]
     fn albums_and_artists_are_grouped_from_tracks() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&track("A", "Artist", "Album One", "/m/1.flac")).unwrap();
-        db.upsert_track(&track("B", "Artist", "Album One", "/m/2.flac")).unwrap();
-        db.upsert_track(&track("C", "Artist", "Album Two", "/m/3.flac")).unwrap();
+        db.upsert_track(&track("A", "Artist", "Album One", "/m/1.flac"))
+            .unwrap();
+        db.upsert_track(&track("B", "Artist", "Album One", "/m/2.flac"))
+            .unwrap();
+        db.upsert_track(&track("C", "Artist", "Album Two", "/m/3.flac"))
+            .unwrap();
 
         let albums = db.albums().unwrap();
         assert_eq!(albums.len(), 2);
-        assert_eq!(albums.iter().find(|a| a.name == "Album One").unwrap().track_count, 2);
+        assert_eq!(
+            albums
+                .iter()
+                .find(|a| a.name == "Album One")
+                .unwrap()
+                .track_count,
+            2
+        );
 
         let artists = db.artists().unwrap();
         assert_eq!(artists.len(), 1);
@@ -587,12 +634,13 @@ mod tests {
     fn removing_a_folder_removes_its_tracks() {
         let db = Db::open_in_memory().unwrap();
         db.add_folder("/m").unwrap();
-        db.upsert_track(&track("A", "Artist", "Album", "/m/1.flac")).unwrap();
-        db.upsert_track(&track("B", "Artist", "Album", "/other/2.flac")).unwrap();
+        db.upsert_track(&track("A", "Artist", "Album", "/m/1.flac"))
+            .unwrap();
+        db.upsert_track(&track("B", "Artist", "Album", "/other/2.flac"))
+            .unwrap();
         db.remove_folder("/m").unwrap();
         assert_eq!(db.track_count().unwrap(), 1);
     }
-
 }
 
 #[cfg(test)]
@@ -616,9 +664,13 @@ mod albumless_tests {
     #[test]
     fn a_track_with_no_album_tag_produces_no_album() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&single("Loose Track", "Someone", "/m/loose.mp3")).unwrap();
+        db.upsert_track(&single("Loose Track", "Someone", "/m/loose.mp3"))
+            .unwrap();
 
-        assert!(db.albums().unwrap().is_empty(), "an albumless track invented an album");
+        assert!(
+            db.albums().unwrap().is_empty(),
+            "an albumless track invented an album"
+        );
         // The track itself is still in the library.
         assert_eq!(db.all_tracks().unwrap().len(), 1);
     }
@@ -626,8 +678,10 @@ mod albumless_tests {
     #[test]
     fn albumless_tracks_do_not_inflate_an_artists_album_count() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&single("Loose One", "Someone", "/m/a.mp3")).unwrap();
-        db.upsert_track(&single("Loose Two", "Someone", "/m/b.mp3")).unwrap();
+        db.upsert_track(&single("Loose One", "Someone", "/m/a.mp3"))
+            .unwrap();
+        db.upsert_track(&single("Loose Two", "Someone", "/m/b.mp3"))
+            .unwrap();
 
         let artists = db.artists().unwrap();
         assert_eq!(artists.len(), 1);
@@ -638,8 +692,10 @@ mod albumless_tests {
     #[test]
     fn albumless_tracks_from_different_artists_are_not_lumped_together() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&single("One", "Artist A", "/m/a.mp3")).unwrap();
-        db.upsert_track(&single("Two", "Artist B", "/m/b.mp3")).unwrap();
+        db.upsert_track(&single("One", "Artist A", "/m/a.mp3"))
+            .unwrap();
+        db.upsert_track(&single("Two", "Artist B", "/m/b.mp3"))
+            .unwrap();
 
         // The old "Unknown Album" behaviour would have merged these.
         assert!(db.albums().unwrap().is_empty());
@@ -652,7 +708,8 @@ mod albumless_tests {
         let mut on_album = single("On Album", "Someone", "/m/album.flac");
         on_album.album = "Real Album".into();
         db.upsert_track(&on_album).unwrap();
-        db.upsert_track(&single("Single", "Someone", "/m/single.mp3")).unwrap();
+        db.upsert_track(&single("Single", "Someone", "/m/single.mp3"))
+            .unwrap();
 
         let artists = db.artists().unwrap();
         assert_eq!(artists[0].album_count, 1);
@@ -684,7 +741,10 @@ mod compilation_tests {
     #[test]
     fn a_compilation_with_no_album_artist_tag_stays_one_album() {
         let db = Db::open_in_memory().unwrap();
-        for (i, artist) in ["Mike Shinoda", "Freya Ridings", "Marcus King"].iter().enumerate() {
+        for (i, artist) in ["Mike Shinoda", "Freya Ridings", "Marcus King"]
+            .iter()
+            .enumerate()
+        {
             db.upsert_track(&comp_track(
                 &format!("Track {i}"),
                 artist,
@@ -704,13 +764,29 @@ mod compilation_tests {
     #[test]
     fn a_real_album_artist_tag_still_separates_same_titled_albums() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&comp_track("A", "Band One", "Greatest Hits", "Band One", "/m/1.flac"))
-            .unwrap();
-        db.upsert_track(&comp_track("B", "Band Two", "Greatest Hits", "Band Two", "/m/2.flac"))
-            .unwrap();
+        db.upsert_track(&comp_track(
+            "A",
+            "Band One",
+            "Greatest Hits",
+            "Band One",
+            "/m/1.flac",
+        ))
+        .unwrap();
+        db.upsert_track(&comp_track(
+            "B",
+            "Band Two",
+            "Greatest Hits",
+            "Band Two",
+            "/m/2.flac",
+        ))
+        .unwrap();
 
         let albums = db.albums().unwrap();
-        assert_eq!(albums.len(), 2, "tagged album artists must keep albums apart");
+        assert_eq!(
+            albums.len(),
+            2,
+            "tagged album artists must keep albums apart"
+        );
     }
 
     #[test]
@@ -729,7 +805,10 @@ mod compilation_tests {
 
         let albums = db.albums().unwrap();
         assert_eq!(albums.len(), 1);
-        assert_eq!(albums[0].artist, "One Band", "not a compilation, so not Various Artists");
+        assert_eq!(
+            albums[0].artist, "One Band",
+            "not a compilation, so not Various Artists"
+        );
     }
 
     #[test]
@@ -753,8 +832,14 @@ mod compilation_tests {
     fn a_guest_feature_does_not_fragment_an_album() {
         let db = Db::open_in_memory().unwrap();
         // Same album artist, different performing artists: one album.
-        db.upsert_track(&comp_track("Solo", "TWRP", "A Human's Touch", "TWRP", "/m/t1.flac"))
-            .unwrap();
+        db.upsert_track(&comp_track(
+            "Solo",
+            "TWRP",
+            "A Human's Touch",
+            "TWRP",
+            "/m/t1.flac",
+        ))
+        .unwrap();
         db.upsert_track(&comp_track(
             "Duet",
             "TWRP feat. McKenna Rae",

@@ -12,8 +12,10 @@
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition,
-               PlatformConfig, SeekDirection};
+use souvlaki::{
+    MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
+    SeekDirection,
+};
 use tauri::{AppHandle, Manager};
 
 use crate::library::model::Track;
@@ -38,7 +40,10 @@ pub struct MediaBridge {
 
 impl MediaBridge {
     pub fn new() -> Self {
-        MediaBridge { controls: Mutex::new(None), last: Mutex::new(Published::default()) }
+        MediaBridge {
+            controls: Mutex::new(None),
+            last: Mutex::new(Published::default()),
+        }
     }
 }
 
@@ -99,9 +104,7 @@ fn handle_event(app: &AppHandle, event: MediaControlEvent) {
             crate::commands::toggle_play(app.clone(), state.clone()).map(|_| ())
         }
         MediaControlEvent::Next => crate::commands::next_track(app.clone(), state.clone()),
-        MediaControlEvent::Previous => {
-            crate::commands::previous_track(app.clone(), state.clone())
-        }
+        MediaControlEvent::Previous => crate::commands::previous_track(app.clone(), state.clone()),
         MediaControlEvent::Stop => {
             state.engine.pause();
             let _ = app.emit_playing(false);
@@ -217,7 +220,9 @@ pub fn publish(app: &AppHandle, track: Option<&Track>, playing: bool, position_s
             }
         }
 
-        let progress = Some(MediaPosition(Duration::from_secs_f64(position_secs.max(0.0))));
+        let progress = Some(MediaPosition(Duration::from_secs_f64(
+            position_secs.max(0.0),
+        )));
         let playback = match (payload.is_some(), playing) {
             (false, _) => MediaPlayback::Stopped,
             (true, true) => MediaPlayback::Playing { progress },

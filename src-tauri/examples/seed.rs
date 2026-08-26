@@ -14,8 +14,8 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("usage: seed <music folder>"))?;
 
     // Matches Tauri's app_data_dir on macOS.
-    let data_dir = PathBuf::from(std::env::var("HOME")?)
-        .join("Library/Application Support/com.picknmix.app");
+    let data_dir =
+        PathBuf::from(std::env::var("HOME")?).join("Library/Application Support/com.picknmix.app");
     let artwork = data_dir.join("artwork");
     let playlists = data_dir.join("playlists");
     for dir in [&data_dir, &artwork, &playlists] {

@@ -7,13 +7,52 @@
 
 import type { CrossfadeCurve, CrossfadeSettings } from "./types";
 
+export const MIN_FADE_SHAPE = 0.15;
+export const MAX_FADE_SHAPE = 6;
+const DEFAULT_FADE_SHAPE = 1;
+
 export function symmetricCurve(lengthSecs: number): CrossfadeCurve {
   const length = Math.max(0, lengthSecs);
-  return { fadeOutStart: -length, fadeOutEnd: 0, fadeInStart: -length, fadeInEnd: 0 };
+  return {
+    fadeOutStart: -length,
+    fadeOutEnd: 0,
+    fadeInStart: -length,
+    fadeInEnd: 0,
+    fadeOutShape: DEFAULT_FADE_SHAPE,
+    fadeInShape: DEFAULT_FADE_SHAPE,
+  };
 }
 
 export function defaultCrossfade(): CrossfadeSettings {
   return { lengthSecs: 0, curve: symmetricCurve(0) };
+}
+
+/** Mirror `CrossfadeSettings::with_length` in the backend. */
+export function withCrossfadeLength(
+  settings: CrossfadeSettings,
+  lengthSecs: number,
+): CrossfadeSettings {
+  const length = Math.max(0, lengthSecs);
+  const symmetric = symmetricCurve(settings.lengthSecs);
+  if (JSON.stringify(settings.curve) === JSON.stringify(symmetric)) {
+    return { lengthSecs: length, curve: symmetricCurve(length) };
+  }
+
+  const scale = length / Math.max(settings.lengthSecs, 1e-6);
+  return {
+    lengthSecs: length,
+    curve: clampCurve(
+      {
+        fadeOutStart: settings.curve.fadeOutStart * scale,
+        fadeOutEnd: settings.curve.fadeOutEnd * scale,
+        fadeInStart: settings.curve.fadeInStart * scale,
+        fadeInEnd: settings.curve.fadeInEnd * scale,
+        fadeOutShape: settings.curve.fadeOutShape,
+        fadeInShape: settings.curve.fadeInShape,
+      },
+      length,
+    ),
+  };
 }
 
 /**
@@ -32,11 +71,22 @@ export function clampCurve(curve: CrossfadeCurve, lengthSecs: number): Crossfade
   const fadeInStart = clamp(curve.fadeInStart, floor, 0);
   const fadeInEnd = clamp(curve.fadeInEnd, fadeInStart, length);
 
-  return { fadeOutStart, fadeOutEnd, fadeInStart, fadeInEnd };
+  return {
+    fadeOutStart,
+    fadeOutEnd,
+    fadeInStart,
+    fadeInEnd,
+    fadeOutShape: clampShape(curve.fadeOutShape),
+    fadeInShape: clampShape(curve.fadeInShape),
+  };
 }
 
-function clamp(value: number, min: number, max: number): number {
+function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function clampShape(shape: number | undefined): number {
+  return Number.isFinite(shape) ? clamp(shape as number, MIN_FADE_SHAPE, MAX_FADE_SHAPE) : DEFAULT_FADE_SHAPE;
 }
 
 /** 0 before `start`, 1 after `end`, clamped. A degenerate window (start ==
@@ -58,12 +108,14 @@ function easeUp(t: number): number {
 
 /** Equal-power gain for the outgoing song at time `x` (seconds). */
 export function gainOut(curve: CrossfadeCurve, x: number): number {
-  return easeDown(inverseLerp(curve.fadeOutStart, curve.fadeOutEnd, x));
+  const time = inverseLerp(curve.fadeOutStart, curve.fadeOutEnd, x);
+  return easeDown(time ** clampShape(curve.fadeOutShape));
 }
 
 /** Equal-power gain for the incoming song at time `x` (seconds). */
 export function gainIn(curve: CrossfadeCurve, x: number): number {
-  return easeUp(inverseLerp(curve.fadeInStart, curve.fadeInEnd, x));
+  const time = inverseLerp(curve.fadeInStart, curve.fadeInEnd, x);
+  return easeUp(time ** clampShape(curve.fadeInShape));
 }
 
 /** Percentage change in tempo has no bearing here; this is a straight

@@ -156,6 +156,8 @@ export interface MixerSettings {
   delay?: Delay | null;
   normalisation?: Normalisation | null;
   lofi?: Lofi | null;
+  /** Global default or playlist override; entry layers are ignored by the backend. */
+  crossfade?: CrossfadeSettings | null;
   filters?: FilterSetting[] | null;
   [extra: string]: unknown;
 }
@@ -169,6 +171,7 @@ export interface ResolvedMixer {
   delay: Delay;
   normalisation: Normalisation;
   lofi: Lofi;
+  crossfade: CrossfadeSettings;
   filters: FilterSetting[];
 }
 
@@ -197,10 +200,9 @@ export interface MixerState {
 
 // -- crossfade -----------------------------------------------------------
 //
-// Global only: never layered through the mixer cascade above. See the
-// backend's `audio::crossfade` module for why (a crossfade happens between
-// two tracks that may belong to different playlists, so there is no single
-// track layer it could attach to).
+// A global mixer section with an optional playlist override. Entry-level
+// mixer settings deliberately cannot override it because a crossfade spans
+// two playlist entries.
 
 /**
  * Four points sharing one time axis anchored at the outgoing song's own
@@ -217,6 +219,10 @@ export interface CrossfadeCurve {
   fadeInStart: number;
   /** When the incoming song reaches full volume. May be positive. */
   fadeInEnd: number;
+  /** Time-shape exponent for the outgoing envelope; 1 preserves equal-power timing. */
+  fadeOutShape: number;
+  /** Time-shape exponent for the incoming envelope; 1 preserves equal-power timing. */
+  fadeInShape: number;
 }
 
 export interface CrossfadeSettings {
