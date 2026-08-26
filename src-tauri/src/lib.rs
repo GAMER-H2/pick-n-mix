@@ -172,18 +172,20 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                                              {}: {e}",
                                             path.display()
                                         );
-                                        // Balance the worker's outstanding
-                                        // wait-token so it can ask again later
-                                        // rather than being wedged silent.
-                                        state.engine.cancel_next();
+                                        // Decline rather than cancel: the file
+                                        // will not open on a retry either, and
+                                        // cancelling would have the worker ask
+                                        // again on the very next block.
+                                        state.engine.decline_next(token);
                                     }
                                 }
                             }
                             // End of the queue, or a shuffled repeat-all wrap
                             // that cannot be predicted: this transition simply
                             // does not crossfade, exactly as if the feature
-                            // were off.
-                            None => state.engine.cancel_next(),
+                            // were off. Declined, not cancelled, so the worker
+                            // stops asking for the rest of this track.
+                            None => state.engine.decline_next(token),
                         }
                     }
                     EngineEvent::TrackAdvanced {

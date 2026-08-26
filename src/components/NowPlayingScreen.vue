@@ -48,7 +48,10 @@ function openMenu(index: number, event: MouseEvent) {
 </script>
 
 <template>
-  <section class="screen" :class="{ 'has-art': !!backdrop }">
+  <!-- `pnm-rises` is the hook the route transition uses to tell this apart
+       from an ordinary page: it is the element that slides, while whatever is
+       behind it stays still. Unscoped on purpose so global CSS can see it. -->
+  <section class="screen pnm-rises" :class="{ 'has-art': !!backdrop }">
     <!-- Backdrop: the cover, blown up and blurred. -->
     <div v-if="backdrop" class="screen__backdrop" aria-hidden="true">
       <img :src="backdrop" alt="" draggable="false" />
@@ -120,6 +123,9 @@ function openMenu(index: number, event: MouseEvent) {
   position: absolute;
   inset: 0;
   overflow: hidden;
+  /* Forces its own compositor layer, so the 64px blur below is rasterised
+     once rather than on every frame of the slide. */
+  transform: translateZ(0);
 }
 
 .screen__backdrop img {

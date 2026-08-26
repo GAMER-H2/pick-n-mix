@@ -145,6 +145,11 @@ struct QueueRef {
 /// of a crossfade).
 struct Voice {
     decoder: TrackDecoder,
+    /// This voice's resolved mixer cascade. Note that its `crossfade` field is
+    /// *not* what governs the transition — a crossfade belongs to the join
+    /// between two tracks, not to either one, so the worker always reads
+    /// `Shared::crossfade` instead. Reading it from here would silently use a
+    /// per-voice value that may not be the one in force.
     settings: Arc<Resolved>,
     track_gain_db: f32,
     /// Which of the worker's two persistent [`Chain`]s processes this voice.
@@ -176,7 +181,15 @@ enum Cmd {
     /// Abandon any pending or already-prepared next voice. Sent whenever the
     /// queue changes in a way that could make a prepared voice stale, and on
     /// every manual load/seek, which are instant cuts rather than fades.
+    /// Leaves the worker free to ask again, since the queue may now have a
+    /// different — and perfectly usable — next track.
     CancelNext,
+    /// There is nothing to crossfade into for this request: the queue has
+    /// ended, or the next track could not be opened. Distinct from
+    /// `CancelNext` because the worker must *stop asking* until something
+    /// changes, rather than re-firing the request on the very next block for
+    /// the rest of the track.
+    DeclineNext { token: u64 },
     Shutdown,
 }
 
@@ -339,6 +352,12 @@ impl AudioEngine {
 
     pub fn cancel_next(&self) {
         let _ = self.cmd_tx.send(Cmd::CancelNext);
+    }
+
+    /// Tell the engine there is no next track to crossfade into, so it stops
+    /// asking until the situation changes.
+    pub fn decline_next(&self, token: u64) {
+        let _ = self.cmd_tx.send(Cmd::DeclineNext { token });
     }
 
     pub fn device_sample_rate(&self) -> u32 {
@@ -545,6 +564,11 @@ fn worker(
     // Set once `NeedNext` has been asked and not yet answered (or cancelled),
     // so the trigger does not fire again on every subsequent block.
     let mut next_wait_token: Option<u64> = None;
+    // Set once the app has said there is nothing to crossfade into. Without
+    // it, a declined request would simply clear the token and the trigger
+    // would fire again immediately, spraying events for the rest of the
+    // track. Cleared whenever the situation could have changed.
+    let mut next_declined = false;
     let mut next_token_gen: u64 = 0;
 
     let mut finished_reported = false;
@@ -587,11 +611,19 @@ fn worker(
                                 chain_ix: 0,
                                 queue_ref: None,
                             });
+                            // Both chains, not just the unused one: a manual
+                            // load is an instant cut, so nothing from the
+                            // previous track should carry over. Resetting only
+                            // the spare left the outgoing track's reverb and
+                            // delay tails sitting in the very chain the new
+                            // track was about to be handed.
+                            chains[0].prepare(device_rate as f32);
                             chains[1].prepare(device_rate as f32);
-                            // A manual load is an instant cut: whatever was
-                            // being prepared for a crossfade no longer applies.
+                            // Whatever was being prepared for a crossfade no
+                            // longer applies either.
                             next = None;
                             next_wait_token = None;
+                            next_declined = false;
                             finished_reported = false;
                             drain(&shared);
                             let _ = reply.send(Ok(info));
@@ -617,6 +649,7 @@ fn worker(
                         // scheduling against it.
                         next = None;
                         next_wait_token = None;
+                        next_declined = false;
                         drain(&shared);
                         finished_reported = false;
                         shared.position_ms.store(
@@ -629,6 +662,7 @@ fn worker(
                     current = None;
                     next = None;
                     next_wait_token = None;
+                    next_declined = false;
                     shared.stream_info.store(Arc::new(None));
                     shared.position_ms.store(0, Ordering::Relaxed);
                     shared.duration_ms.store(0, Ordering::Relaxed);
@@ -662,6 +696,15 @@ fn worker(
                 Cmd::CancelNext => {
                     next = None;
                     next_wait_token = None;
+                    // The queue changed, so a previous "nothing to play next"
+                    // answer may no longer be true.
+                    next_declined = false;
+                }
+                Cmd::DeclineNext { token } => {
+                    if next_wait_token == Some(token) {
+                        next_wait_token = None;
+                        next_declined = true;
+                    }
                 }
                 Cmd::Shutdown => shutdown = true,
             }
@@ -716,7 +759,7 @@ fn worker(
         }
 
         // --- crossfade: ask for the next track once close enough ----------
-        if crossfade.enabled() && next.is_none() && next_wait_token.is_none() {
+        if crossfade.enabled() && next.is_none() && next_wait_token.is_none() && !next_declined {
             let cur = current.as_ref().expect("checked by `idle` above");
             let remaining_track =
                 (cur.decoder.info.duration_secs - cur.decoder.decoded_secs()).max(0.0);
@@ -767,6 +810,8 @@ fn worker(
                 let queue_ref = promoted.queue_ref.clone();
                 current = Some(promoted);
                 next_wait_token = None;
+                // A new track is playing, so ask again for whatever follows it.
+                next_declined = false;
                 finished_reported = false;
 
                 if let Some(qref) = queue_ref {
@@ -825,6 +870,15 @@ fn worker(
                 }
             }
 
+            // Push this voice's parameters into its chain before using it.
+            // Without this the DSP nodes keep whatever state they were
+            // constructed with — which means EQ, reverb, delay, lo-fi and the
+            // normalisation gain all silently do nothing, while pitch (which
+            // goes through the decoder, not the chain) still works. Cheap to
+            // call every block: `update` diffs internally and only recomputes
+            // coefficients when a value has actually changed.
+            chains[cur.chain_ix].update(&cur.settings, cur.track_gain_db);
+
             if cur.settings.enabled {
                 chains[cur.chain_ix].process_music(&mut mix, frames);
             }
@@ -846,6 +900,13 @@ fn worker(
                 }
             }
 
+            // The next voice is prepared early — deliberately, so a slow
+            // decoder open cannot stall the transition — but it must not be
+            // *read* until its fade actually begins. Reading it sooner would
+            // advance its decoder while its gain was still zero, and the
+            // incoming track would start several seconds in, having silently
+            // thrown away its own opening.
+            if x >= crossfade.curve.fade_in_start as f64 {
             let nx = next.as_mut().expect("checked by outer `if`");
             let nx_speed = if nx.settings.enabled {
                 nx.settings.pitch.ratio()
@@ -891,6 +952,7 @@ fn worker(
                 for f in 0..frames {
                     mix[ch][f] += scratch_b[ch][f] * gain_b;
                 }
+            }
             }
         }
 

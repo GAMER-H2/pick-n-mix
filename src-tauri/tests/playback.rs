@@ -324,10 +324,7 @@ mod crossfade_tests {
         let info = engine
             .load(fixture("cf-a", 6.0), 0.0, 0.0)
             .expect("loading the first track");
-        engine.set_crossfade(CrossfadeSettings {
-            length_secs: 1.5,
-            ..Default::default()
-        });
+        engine.set_crossfade(CrossfadeSettings::new(1.5));
         engine.play();
 
         let token = wait_for_need_next(&rx, Duration::from_secs(6))
@@ -391,6 +388,85 @@ mod crossfade_tests {
         );
     }
 
+    /// Declining a request must stop the engine asking again. Answering
+    /// "there is nothing to play next" by merely clearing the pending token
+    /// let the trigger re-fire on the very next block, spraying hundreds of
+    /// events a second for the rest of the track.
+    #[test]
+    fn declining_stops_the_engine_asking_again() {
+        let Some((engine, rx)) = engine() else { return };
+
+        engine
+            .load(fixture("cf-decline", 8.0), 0.0, 0.0)
+            .expect("loading");
+        engine.set_crossfade(CrossfadeSettings::new(2.0));
+        engine.play();
+
+        let token = wait_for_need_next(&rx, Duration::from_secs(8))
+            .expect("the engine never asked to prepare a crossfade");
+        engine.decline_next(token);
+
+        // Well over a hundred worker blocks pass in this window.
+        let events = collect_events(&rx, Duration::from_secs(2));
+        let asks = events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::NeedNext { .. }))
+            .count();
+        assert_eq!(
+            asks, 0,
+            "a declined request should not be repeated; got {asks} more in two seconds"
+        );
+    }
+
+    /// The next voice is prepared early on purpose, so that a slow decoder
+    /// open cannot stall the transition. But it must not start *playing*
+    /// early: reading from it while its gain is still zero would advance its
+    /// decoder silently, and the incoming track would begin partway in with
+    /// its opening thrown away.
+    #[test]
+    fn the_incoming_track_does_not_lose_its_opening() {
+        let Some((engine, rx)) = engine() else { return };
+
+        const LENGTH: f32 = 1.0;
+        engine
+            .load(fixture("cf-opening-a", 6.0), 0.0, 0.0)
+            .expect("loading the first track");
+        engine.set_crossfade(CrossfadeSettings::new(LENGTH));
+        engine.play();
+
+        let token = wait_for_need_next(&rx, Duration::from_secs(8))
+            .expect("the engine never asked to prepare a crossfade");
+        let decoder =
+            TrackDecoder::open(&fixture("cf-opening-b", 6.0), engine.device_sample_rate())
+                .expect("opening voice B");
+        engine.prepare_next(decoder, Resolved::default(), 0.0, token, 0, "b".into());
+
+        // Wait for the handover, then look at how far into the incoming track
+        // playback actually is.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut promoted = false;
+        while Instant::now() < deadline {
+            if let Ok(EngineEvent::TrackAdvanced { .. }) =
+                rx.recv_timeout(Duration::from_millis(100))
+            {
+                promoted = true;
+                break;
+            }
+        }
+        assert!(promoted, "the prepared voice was never promoted");
+
+        // Overlapping by LENGTH means the incoming track is legitimately
+        // LENGTH seconds in at the handover. The trigger fires a further
+        // TRIGGER_HEADROOM (2 s) earlier than that, so a voice being read too
+        // soon would land at roughly LENGTH + 2 instead.
+        let position = engine.snapshot().position_secs;
+        assert!(
+            position < (LENGTH as f64) + 1.0,
+            "the incoming track was already {position:.2}s in at the handover, so it \
+             was being read before its fade began and lost its opening"
+        );
+    }
+
     /// `CancelNext` must leave the engine able to fall back to the ordinary,
     /// un-crossfaded ending — it must not get stuck waiting for a reply that
     /// will never come.
@@ -401,10 +477,7 @@ mod crossfade_tests {
         engine
             .load(fixture("cf-cancel", 2.0), 0.0, 0.0)
             .expect("loading");
-        engine.set_crossfade(CrossfadeSettings {
-            length_secs: 1.5,
-            ..Default::default()
-        });
+        engine.set_crossfade(CrossfadeSettings::new(1.5));
         engine.play();
 
         wait_for_need_next(&rx, Duration::from_secs(4))
@@ -430,10 +503,7 @@ mod crossfade_tests {
         engine
             .load(fixture("cf-stale", 2.0), 0.0, 0.0)
             .expect("loading");
-        engine.set_crossfade(CrossfadeSettings {
-            length_secs: 1.5,
-            ..Default::default()
-        });
+        engine.set_crossfade(CrossfadeSettings::new(1.5));
         engine.play();
 
         let real_token = wait_for_need_next(&rx, Duration::from_secs(4))
@@ -491,6 +561,147 @@ mod crossfade_tests {
                 .iter()
                 .any(|e| matches!(e, EngineEvent::TrackFinished)),
             "should still reach an ordinary finish: {events:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mixer settings reaching the audio
+// ---------------------------------------------------------------------------
+
+/// The DJ Mixer's controls all funnel through `Chain`, which only picks up new
+/// values when `Chain::update` is called. A refactor once dropped that call
+/// for the playing voice, and the result was subtle in exactly the worst way:
+/// pitch kept working (it goes through the decoder, not the chain) and so did
+/// crossfading (it reads its curve directly), while EQ, reverb, delay, lo-fi
+/// and the normalisation gain all silently did nothing.
+///
+/// Nothing here inspects DSP internals — these drive the real engine and
+/// observe the master limiter's gain-reduction meter, which only moves if a
+/// setting genuinely reached the audio.
+mod mixer_reaches_audio {
+    use super::*;
+    use pick_n_mix_lib::audio::params::{Eq, Normalisation};
+
+    fn boosted(settings: MixerSettings) -> pick_n_mix_lib::audio::params::Resolved {
+        MixerSettings::resolve(&[&settings])
+    }
+
+    /// Waits for the limiter to report it is pulling the signal down, which
+    /// can only happen if something upstream made the signal louder.
+    fn limiter_engages(engine: &AudioEngine) -> bool {
+        wait_for(Duration::from_secs(4), || {
+            engine.snapshot().limiter_reduction_db > 1.0
+        })
+    }
+
+    #[test]
+    fn normalisation_gain_reaches_the_audio() {
+        let Some((engine, _rx)) = engine() else { return };
+        engine.load(fixture("mixer-gain", 8.0), 0.0, 0.0).expect("loading");
+
+        // +24 dB against a 0.4-amplitude tone is far past the ceiling, so the
+        // limiter must respond. Left at unity, it has nothing to do.
+        engine.set_settings(boosted(MixerSettings {
+            enabled: Some(true),
+            normalisation: Some(Normalisation {
+                enabled: true,
+                gain_db: 24.0,
+                limiter_enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        engine.play();
+
+        assert!(
+            limiter_engages(&engine),
+            "a +24 dB normalisation gain never reached the audio; reduction stayed at {}",
+            engine.snapshot().limiter_reduction_db
+        );
+    }
+
+    #[test]
+    fn eq_gain_reaches_the_audio() {
+        let Some((engine, _rx)) = engine() else { return };
+        engine.load(fixture("mixer-eq", 8.0), 0.0, 0.0).expect("loading");
+
+        let mut eq = Eq::default();
+        for band in eq.bands.iter_mut() {
+            band.gain_db = 12.0;
+        }
+        engine.set_settings(boosted(MixerSettings {
+            enabled: Some(true),
+            eq: Some(eq),
+            normalisation: Some(Normalisation {
+                limiter_enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        engine.play();
+
+        assert!(
+            limiter_engages(&engine),
+            "a +12 dB boost on every EQ band never reached the audio; reduction stayed at {}",
+            engine.snapshot().limiter_reduction_db
+        );
+    }
+
+    /// The mirror image: with everything flat, the limiter should stay idle.
+    /// Guards against the test above passing for the wrong reason.
+    #[test]
+    fn a_flat_chain_leaves_the_limiter_idle() {
+        let Some((engine, _rx)) = engine() else { return };
+        engine.load(fixture("mixer-flat", 4.0), 0.0, 0.0).expect("loading");
+        engine.set_settings(boosted(MixerSettings {
+            enabled: Some(true),
+            ..Default::default()
+        }));
+        engine.play();
+
+        assert!(
+            wait_for(Duration::from_secs(2), || engine.snapshot().position_secs > 0.5),
+            "playback never started"
+        );
+        assert!(
+            engine.snapshot().limiter_reduction_db < 0.5,
+            "an untouched mixer should not be driving the limiter"
+        );
+    }
+
+    /// Settings changed mid-playback must take effect, not just those present
+    /// when the track was loaded.
+    #[test]
+    fn a_setting_changed_during_playback_takes_effect() {
+        let Some((engine, _rx)) = engine() else { return };
+        engine.load(fixture("mixer-live", 10.0), 0.0, 0.0).expect("loading");
+        engine.set_settings(boosted(MixerSettings {
+            enabled: Some(true),
+            ..Default::default()
+        }));
+        engine.play();
+
+        assert!(
+            wait_for(Duration::from_secs(3), || engine.snapshot().position_secs > 0.4),
+            "playback never started"
+        );
+        assert!(engine.snapshot().limiter_reduction_db < 0.5, "should start idle");
+
+        engine.set_settings(boosted(MixerSettings {
+            enabled: Some(true),
+            normalisation: Some(Normalisation {
+                enabled: true,
+                gain_db: 24.0,
+                limiter_enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+
+        assert!(
+            limiter_engages(&engine),
+            "turning a control up mid-track had no effect on the audio"
         );
     }
 }

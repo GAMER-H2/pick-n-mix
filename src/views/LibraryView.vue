@@ -4,7 +4,7 @@
  * nothing has been imported yet.
  */
 import { computed, onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
 import Artwork from "@/components/Artwork.vue";
@@ -19,9 +19,27 @@ const library = useLibraryStore();
 const player = usePlayerStore();
 const ui = useUiStore();
 const router = useRouter();
+const route = useRoute();
 
-type Tab = "songs" | "albums" | "artists";
-const tab = ref<Tab>("songs");
+const TABS = ["songs", "albums", "artists"] as const;
+type Tab = (typeof TABS)[number];
+
+/**
+ * The selected tab lives in the URL rather than in local state, so that
+ * switching tabs is a navigation: the sidebar's back and forward buttons then
+ * step through them like any other page.
+ */
+const tab = computed<Tab>(() => {
+  const requested = route.query.tab;
+  return TABS.includes(requested as Tab) ? (requested as Tab) : "songs";
+});
+
+function selectTab(next: Tab) {
+  // Guard against pushing a duplicate entry, which would make Back appear to
+  // do nothing the first time it is pressed.
+  if (next === tab.value) return;
+  router.push({ name: "library", query: { ...route.query, tab: next } });
+}
 const query = ref("");
 
 const filtered = computed<Track[]>(() => {
@@ -113,11 +131,11 @@ onMounted(() => {
 
       <nav class="tabs">
         <button
-          v-for="option in (['songs', 'albums', 'artists'] as Tab[])"
+          v-for="option in TABS"
           :key="option"
           class="tabs__tab"
           :class="{ 'is-active': tab === option }"
-          @click="tab = option"
+          @click="selectTab(option)"
         >
           {{ option[0].toUpperCase() + option.slice(1) }}
         </button>

@@ -193,6 +193,20 @@ impl Default for CrossfadeSettings {
 }
 
 impl CrossfadeSettings {
+    /// A plain crossfade of `length_secs`, using the symmetric curve the
+    /// simple length slider produces.
+    ///
+    /// Prefer this over a struct literal: `length_secs` and `curve` have to
+    /// agree, and `CrossfadeSettings { length_secs: 4.0, ..Default::default() }`
+    /// silently pairs a four-second length with the *zero-length* default
+    /// curve, which behaves as no crossfade at all.
+    pub fn new(length_secs: f32) -> Self {
+        CrossfadeSettings {
+            length_secs: length_secs.max(0.0),
+            curve: CrossfadeCurve::symmetric(length_secs),
+        }
+    }
+
     pub fn enabled(&self) -> bool {
         self.length_secs > 0.01
     }
@@ -463,6 +477,23 @@ mod tests {
             fade_in_shape: 1.0,
         };
         assert_eq!(curve.lead_secs(), 6.0);
+    }
+
+    #[test]
+    fn the_constructor_keeps_length_and_curve_in_step() {
+        // The trap this exists to avoid: a struct literal with
+        // `..Default::default()` pairs a real length with a zero-length curve,
+        // which reads as "crossfade enabled" but fades nothing.
+        let trap = CrossfadeSettings {
+            length_secs: 4.0,
+            ..Default::default()
+        };
+        assert!(trap.enabled(), "it does look enabled...");
+        assert_eq!(trap.lead_secs(), 0.0, "...but nothing would actually fade");
+
+        let good = CrossfadeSettings::new(4.0);
+        assert_eq!(good.curve, CrossfadeCurve::symmetric(4.0));
+        assert_eq!(good.lead_secs(), 4.0);
     }
 
     #[test]
