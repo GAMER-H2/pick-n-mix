@@ -195,6 +195,36 @@ export interface MixerState {
   filters: FilterInfo[];
 }
 
+// -- crossfade -----------------------------------------------------------
+//
+// Global only: never layered through the mixer cascade above. See the
+// backend's `audio::crossfade` module for why (a crossfade happens between
+// two tracks that may belong to different playlists, so there is no single
+// track layer it could attach to).
+
+/**
+ * Four points sharing one time axis anchored at the outgoing song's own
+ * natural end (`x = 0`, seconds). Negative is "before that song ends";
+ * positive only ever applies to the incoming song, which is free to keep
+ * rising after the outgoing one is gone.
+ */
+export interface CrossfadeCurve {
+  /** When the outgoing song starts fading out. Always <= fadeOutEnd. */
+  fadeOutStart: number;
+  /** When the outgoing song reaches silence. Always <= 0. */
+  fadeOutEnd: number;
+  /** When the incoming song starts becoming audible. Always <= 0. */
+  fadeInStart: number;
+  /** When the incoming song reaches full volume. May be positive. */
+  fadeInEnd: number;
+}
+
+export interface CrossfadeSettings {
+  /** 0 disables crossfading: tracks change with an instant cut. */
+  lengthSecs: number;
+  curve: CrossfadeCurve;
+}
+
 // -- playlists ---------------------------------------------------------------
 
 export interface PlaylistSummary {

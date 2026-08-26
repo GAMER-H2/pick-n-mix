@@ -133,6 +133,77 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                     EngineEvent::Error { message } => {
                         let _ = app.emit("engine-error", message);
                     }
+                    EngineEvent::NeedNext { token } => {
+                        // Resolved under the lock (cheap: no I/O), then acted
+                        // on after dropping it — opening a decoder can take
+                        // tens to hundreds of milliseconds, and holding the
+                        // player lock across that would stall every command
+                        // the UI sends in the meantime.
+                        let prepared = {
+                            let player = state.player.lock();
+                            player.peek_next().map(|(order_index, item)| {
+                                (
+                                    order_index,
+                                    item.track.id.clone(),
+                                    std::path::PathBuf::from(&item.track.location),
+                                    item.track.gain_db.unwrap_or(0.0),
+                                    player.effective_mixer_for(item),
+                                )
+                            })
+                        };
+                        match prepared {
+                            Some((order_index, track_id, path, gain_db, settings)) => {
+                                let rate = state.engine.device_sample_rate();
+                                match crate::audio::decode::TrackDecoder::open(&path, rate) {
+                                    Ok(decoder) => state.engine.prepare_next(
+                                        decoder, settings, gain_db, token, order_index, track_id,
+                                    ),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "audio: could not prepare a crossfade into \
+                                             {}: {e}",
+                                            path.display()
+                                        );
+                                        // Balance the worker's outstanding
+                                        // wait-token so it can ask again later
+                                        // rather than being wedged silent.
+                                        state.engine.cancel_next();
+                                    }
+                                }
+                            }
+                            // End of the queue, or a shuffled repeat-all wrap
+                            // that cannot be predicted: this transition simply
+                            // does not crossfade, exactly as if the feature
+                            // were off.
+                            None => state.engine.cancel_next(),
+                        }
+                    }
+                    EngineEvent::TrackAdvanced { order_index, track_id } => {
+                        {
+                            let mut player = state.player.lock();
+                            match player.jump_to(order_index) {
+                                Some(track) if track.id != track_id => {
+                                    // Should not happen: every queue mutation
+                                    // also cancels a pending crossfade. Play on
+                                    // regardless — the audio has already
+                                    // switched — but this is worth knowing
+                                    // about if it ever fires.
+                                    eprintln!(
+                                        "audio: crossfade landed on queue index {order_index} \
+                                         but found a different track there than expected"
+                                    );
+                                }
+                                Some(_) => {}
+                                None => {
+                                    player.advance(true);
+                                }
+                            }
+                        }
+                        state.sync_mixer();
+                        let current = state.player.lock().current().cloned();
+                        let _ = app.emit("track-changed", &current);
+                        let _ = app.emit("queue-changed", state.player.lock().view());
+                    }
                 }
             }
         })
@@ -250,6 +321,9 @@ pub fn run() {
             commands::delete_preset,
             commands::list_filters,
             commands::filters_directory,
+            commands::crossfade_settings,
+            commands::set_crossfade_length,
+            commands::set_crossfade_curve,
             // playlists
             commands::list_playlists,
             commands::get_playlist,

@@ -13,6 +13,12 @@
   --accent-tint: rgba(245, 99, 0, 0.12);
   --accent-tint-strong: rgba(245, 99, 0, 0.2);
 
+  /* A cool complement to the orange accent, used only where two things need
+     telling apart at a glance — namely the two songs in a crossfade curve.
+     Never used as a second "brand" colour. */
+  --accent-secondary: #3e9bff;
+  --accent-secondary-tint: rgba(62, 155, 255, 0.14);
+
   --radius-sm: 6px;
   --radius: 10px;
   --radius-lg: 14px;

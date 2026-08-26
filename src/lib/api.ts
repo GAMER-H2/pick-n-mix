@@ -4,6 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Album,
   Artist,
+  CrossfadeCurve,
+  CrossfadeSettings,
   FilterInfo,
   MixerSettings,
   MixerState,
@@ -77,6 +79,14 @@ export const savePreset = (name: string, settings: MixerSettings) =>
 export const deletePreset = (id: string) => invoke<Preset[]>("delete_preset", { id });
 export const listFilters = () => invoke<FilterInfo[]>("list_filters");
 export const filtersDirectory = () => invoke<string>("filters_directory");
+
+// -- crossfade ---------------------------------------------------------------
+// Global only, never part of the mixer cascade above.
+export const crossfadeSettings = () => invoke<CrossfadeSettings>("crossfade_settings");
+export const setCrossfadeLength = (lengthSecs: number) =>
+  invoke<CrossfadeSettings>("set_crossfade_length", { lengthSecs });
+export const setCrossfadeCurve = (curve: CrossfadeCurve) =>
+  invoke<CrossfadeSettings>("set_crossfade_curve", { curve });
 
 // -- playlists -------------------------------------------------------------
 export const listPlaylists = () => invoke<PlaylistSummary[]>("list_playlists");

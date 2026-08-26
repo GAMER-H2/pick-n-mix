@@ -7,6 +7,7 @@ use anyhow::Result;
 use crossbeam_channel::Receiver;
 use parking_lot::Mutex;
 
+use crate::audio::crossfade::CrossfadeSettings;
 use crate::audio::{AudioEngine, EngineEvent};
 use crate::library::Db;
 use crate::player::Player;
@@ -61,6 +62,9 @@ pub const SETTING_GLOBAL_MIXER: &str = "mixer.global";
 pub const SETTING_VOLUME: &str = "player.volume";
 pub const SETTING_REPEAT: &str = "player.repeat";
 pub const SETTING_SHUFFLE: &str = "player.shuffle";
+/// Global only — see `audio::crossfade` for why this is not layered through
+/// the mixer cascade with the rest of the saved settings.
+pub const SETTING_CROSSFADE: &str = "crossfade.global";
 
 impl AppState {
     pub fn new(data_dir: &Path) -> Result<Self> {
@@ -95,6 +99,13 @@ impl AppState {
         }
 
         engine.set_settings(player.effective_mixer());
+
+        if let Ok(Some(raw)) = db.get_setting(SETTING_CROSSFADE) {
+            match serde_json::from_str::<CrossfadeSettings>(&raw) {
+                Ok(crossfade) => engine.set_crossfade(crossfade),
+                Err(e) => eprintln!("state: ignoring unreadable saved crossfade settings: {e}"),
+            }
+        }
 
         Ok(AppState {
             db,

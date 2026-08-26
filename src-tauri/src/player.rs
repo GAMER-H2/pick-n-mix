@@ -285,6 +285,38 @@ impl Player {
         self.current()
     }
 
+    /// The item that `advance(true)` would land on, without moving the
+    /// cursor. Used to prepare a crossfade ahead of a track actually ending.
+    ///
+    /// Returns `None` at points where the real destination cannot be known in
+    /// advance: the end of a non-repeating queue, and the wrap point of a
+    /// *shuffled* `Repeat::All` queue, since wrapping there reshuffles
+    /// (`rebuild_order`) and a plain peek cannot predict what a fresh shuffle
+    /// will produce. The caller falls back to an instant cut in both cases,
+    /// exactly as it always has at the end of the queue.
+    pub fn peek_next(&self) -> Option<(usize, &QueueItem)> {
+        if self.order.is_empty() {
+            return None;
+        }
+        if self.repeat == Repeat::One {
+            // Loops back into itself; a second, independent decode of the
+            // same file starting from zero, which is what a seamless loop
+            // via crossfade should be.
+            return self.item_at(self.cursor);
+        }
+        if self.cursor + 1 < self.order.len() {
+            return self.item_at(self.cursor + 1);
+        }
+        if self.repeat == Repeat::All && !self.shuffle {
+            return self.item_at(0);
+        }
+        None
+    }
+
+    fn item_at(&self, order_index: usize) -> Option<(usize, &QueueItem)> {
+        self.order.get(order_index).and_then(|&i| self.queue.get(i)).map(|item| (order_index, item))
+    }
+
     pub fn view(&self) -> QueueView {
         let items: Vec<Track> = self
             .order
@@ -306,13 +338,24 @@ impl Player {
     /// playlist's override, then the playlist entry's own.
     pub fn effective_mixer(&self) -> crate::audio::params::Resolved {
         let empty = MixerSettings::default();
-        let context = self.context_mixer.as_ref().unwrap_or(&empty);
         // The innermost layer belongs to the queue entry, not the track, so the
         // same song played from the library carries no override at all.
-        let entry = self
-            .current_item()
-            .and_then(|item| item.mixer.as_ref())
-            .unwrap_or(&empty);
+        let entry = self.current_item().and_then(|item| item.mixer.as_ref()).unwrap_or(&empty);
+        self.resolve_mixer(entry)
+    }
+
+    /// The cascade as it would apply to `item`, using the same global and
+    /// playlist layers as [`Player::effective_mixer`]. Lets the crossfade
+    /// engine resolve the next voice's effects before that item becomes
+    /// current, i.e. before `current_item` would return it.
+    pub fn effective_mixer_for(&self, item: &QueueItem) -> crate::audio::params::Resolved {
+        let empty = MixerSettings::default();
+        self.resolve_mixer(item.mixer.as_ref().unwrap_or(&empty))
+    }
+
+    fn resolve_mixer(&self, entry: &MixerSettings) -> crate::audio::params::Resolved {
+        let empty = MixerSettings::default();
+        let context = self.context_mixer.as_ref().unwrap_or(&empty);
         MixerSettings::resolve(&[&self.global_mixer, context, entry])
     }
 
@@ -594,5 +637,91 @@ mod scope_tests {
         assert!(!p.move_item(0, 0));
         assert!(!p.move_item(5, 0));
         assert!(!p.move_item(0, 9));
+    }
+
+    #[test]
+    fn peek_next_matches_what_advance_would_do() {
+        let mut p = Player::new();
+        p.set_queue(vec![track("a"), track("b"), track("c")], 0);
+
+        let (idx, item) = p.peek_next().expect("a middle track has a successor");
+        assert_eq!(item.track.id, "b");
+        assert_eq!(p.advance(true).unwrap().id, "b");
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn peek_next_is_none_at_the_end_of_a_non_repeating_queue() {
+        let mut p = Player::new();
+        p.set_queue(vec![track("a")], 0);
+        assert!(p.peek_next().is_none());
+        assert!(p.advance(true).is_none(), "peek must agree with advance");
+    }
+
+    #[test]
+    fn peek_next_wraps_for_an_unshuffled_repeating_queue() {
+        let mut p = Player::new();
+        p.set_queue(vec![track("a"), track("b")], 1);
+        p.set_repeat(Repeat::All);
+
+        let (idx, item) = p.peek_next().expect("repeat-all wraps");
+        assert_eq!(item.track.id, "a");
+        assert_eq!(idx, 0);
+        assert_eq!(p.advance(true).unwrap().id, "a");
+    }
+
+    #[test]
+    fn peek_next_gives_up_at_a_shuffled_wrap_since_it_would_reshuffle() {
+        let mut p = Player::new();
+        p.set_queue(vec![track("a"), track("b"), track("c")], 0);
+        p.set_shuffle(true);
+        p.set_repeat(Repeat::All);
+
+        // Walk to the last position without wrapping. Bounded deliberately:
+        // under `Repeat::All`, `advance` never returns `None` (wrapping just
+        // reshuffles and keeps going), so a `while ... is_some()` loop here
+        // would spin forever rather than reaching "the end".
+        let len = p.view().items.len();
+        for _ in 0..len - 1 {
+            p.advance(false);
+        }
+        assert_eq!(p.view().current_index, Some(len - 1), "should be at the last position");
+        assert!(
+            p.peek_next().is_none(),
+            "a shuffled repeat-all wrap reshuffles and cannot be predicted"
+        );
+    }
+
+    #[test]
+    fn peek_next_loops_a_track_into_itself_under_repeat_one() {
+        let mut p = Player::new();
+        p.set_queue(vec![track("a"), track("b")], 0);
+        p.set_repeat(Repeat::One);
+
+        let (idx, item) = p.peek_next().expect("repeat-one loops");
+        assert_eq!(item.track.id, "a");
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn effective_mixer_for_a_peeked_item_uses_its_own_override_not_the_currents() {
+        let mut p = Player::new();
+        p.global_mixer = wet(0.1);
+        p.set_queue_items(
+            vec![
+                QueueItem { track: track("a"), mixer: Some(wet(0.9)) },
+                QueueItem { track: track("b"), mixer: Some(wet(0.4)) },
+            ],
+            0,
+        );
+
+        assert_eq!(p.effective_mixer().reverb.mix, 0.9, "current track's own override");
+        let (_, next) = p.peek_next().unwrap();
+        let next = next.clone();
+        assert_eq!(
+            p.effective_mixer_for(&next).reverb.mix,
+            0.4,
+            "the peeked track's own override, not the current track's"
+        );
     }
 }

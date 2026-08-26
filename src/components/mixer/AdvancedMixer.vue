@@ -15,18 +15,28 @@ import EqSliders from "./EqSliders.vue";
 import PresetSelect from "./PresetSelect.vue";
 import FilterGrid from "./FilterGrid.vue";
 import SectionHeader from "./SectionHeader.vue";
+import CrossfadeGraph from "./CrossfadeGraph.vue";
 import { audibleMix, DEFAULT_EQ_FREQS, tempoPercent } from "@/lib/mixer";
 import { formatHz, semitonesLabel } from "@/lib/format";
+import { formatSeconds } from "@/lib/crossfadeCurve";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
-import type { BandKind, Eq } from "@/lib/types";
+import { useCrossfadeStore } from "@/stores/crossfade";
+import type { BandKind, CrossfadeCurve, Eq } from "@/lib/types";
 
 const mixer = useMixerStore();
 const player = usePlayerStore();
+const crossfade = useCrossfadeStore();
 
 const eqExpanded = ref(false);
 const fx = computed(() => mixer.effective);
 const canOverride = computed(() => mixer.target.kind !== "global");
+
+const MAX_CROSSFADE_SECS = 12;
+
+function onCrossfadeCurve(curve: CrossfadeCurve) {
+  crossfade.setCurve(curve);
+}
 
 function overridden(section: string) {
   return mixer.overriddenSections.includes(section as never);
@@ -431,6 +441,39 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         </p>
       </section>
 
+      <!-- Crossfade ----------------------------------------------------------->
+      <section class="panel__section">
+        <SectionHeader title="Crossfade">
+          <div class="panel__spacer" />
+          <span v-if="canOverride" class="panel__global-note">Applies to all playback</span>
+        </SectionHeader>
+
+        <div class="row">
+          <label>Length</label>
+          <AppSlider
+            :model-value="crossfade.settings.lengthSecs"
+            :min="0"
+            :max="MAX_CROSSFADE_SECS"
+            :step="0.5"
+            @update:model-value="crossfade.setLength($event)"
+          />
+          <span class="row__value">{{ formatSeconds(crossfade.settings.lengthSecs) }}</span>
+        </div>
+
+        <CrossfadeGraph
+          class="panel__crossfade-graph"
+          :curve="crossfade.settings.curve"
+          :length-secs="crossfade.settings.lengthSecs"
+          :disabled="crossfade.settings.lengthSecs <= 0"
+          @change="onCrossfadeCurve"
+        />
+
+        <p class="panel__hint">
+          Drag a point to change when each song starts or finishes fading. Orange is the song
+          ending, blue is the one starting. Double-click a point to reset it.
+        </p>
+      </section>
+
       <!-- Filters ----------------------------------------------------------->
       <section class="panel__section">
         <SectionHeader
@@ -588,6 +631,16 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   font-size: 10.5px;
   line-height: 1.5;
   color: var(--text-tertiary);
+}
+
+.panel__global-note {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.panel__crossfade-graph {
+  margin-top: 10px;
 }
 
 .row {

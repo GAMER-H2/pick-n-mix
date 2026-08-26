@@ -154,6 +154,10 @@ fn reaching_the_end_reports_the_track_as_finished() {
                 break;
             }
             Ok(EngineEvent::Error { message }) => seen.push(message),
+            // Crossfading is off by default (`length_secs: 0`) for every
+            // test in this file, so neither should ever fire here.
+            Ok(EngineEvent::NeedNext { .. }) => seen.push("unexpected NeedNext".into()),
+            Ok(EngineEvent::TrackAdvanced { .. }) => seen.push("unexpected TrackAdvanced".into()),
             Err(_) => {}
         }
     }
@@ -219,4 +223,190 @@ fn the_effect_chain_runs_without_starving_playback() {
         wait_for(Duration::from_secs(4), || engine.snapshot().position_secs > 0.5),
         "playback stalled with the full effect chain engaged"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Crossfading
+// ---------------------------------------------------------------------------
+
+mod crossfade_tests {
+    use super::*;
+    use pick_n_mix_lib::audio::crossfade::CrossfadeSettings;
+    use pick_n_mix_lib::audio::decode::TrackDecoder;
+    use pick_n_mix_lib::audio::params::Resolved;
+
+    /// Drain events for `window`, returning everything that arrived.
+    fn collect_events(
+        rx: &crossbeam_channel::Receiver<EngineEvent>,
+        window: Duration,
+    ) -> Vec<EngineEvent> {
+        let deadline = Instant::now() + window;
+        let mut events = Vec::new();
+        while Instant::now() < deadline {
+            if let Ok(event) = rx.recv_timeout(Duration::from_millis(100)) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    fn wait_for_need_next(
+        rx: &crossbeam_channel::Receiver<EngineEvent>,
+        timeout: Duration,
+    ) -> Option<u64> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(EngineEvent::NeedNext { token }) => return Some(token),
+                Ok(_) | Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// The full handshake, start to finish: enabling a crossfade makes the
+    /// engine ask for the next track ahead of time, accept a prepared voice,
+    /// and hand control over to it — all without ever reporting the outgoing
+    /// track as merely "finished", which would mean the transition skipped a
+    /// track from the queue's point of view.
+    #[test]
+    fn a_prepared_voice_is_promoted_instead_of_the_track_just_ending() {
+        let Some((engine, rx)) = engine() else { return };
+
+        // A 6 s track with a short crossfade: the trigger (lead + 2 s
+        // headroom) fires with 3.5 s of it still to play, giving the test
+        // ample time to answer before the boundary arrives.
+        let info = engine.load(fixture("cf-a", 6.0), 0.0, 0.0).expect("loading the first track");
+        engine.set_crossfade(CrossfadeSettings { length_secs: 1.5, ..Default::default() });
+        engine.play();
+
+        let token = wait_for_need_next(&rx, Duration::from_secs(6))
+            .expect("the engine never asked to prepare a crossfade");
+
+        let next_path = fixture("cf-b", 6.0);
+        let decoder =
+            TrackDecoder::open(&next_path, engine.device_sample_rate()).expect("opening voice B");
+        engine.prepare_next(
+            decoder,
+            Resolved::default(),
+            0.0,
+            token,
+            7, // an arbitrary queue position, just echoed back
+            "track-b".into(),
+        );
+
+        // Collect everything from here to well past the boundary. `1.5 s`
+        // crossfade length plus slack for scheduling jitter. Track B is also
+        // 6 s long and crossfading is still enabled, so once B itself gets
+        // close to its own end the whole cycle repeats: B's own `NeedNext`
+        // fires, goes unanswered by this test, and B eventually reaches an
+        // entirely ordinary `TrackFinished` of its own. That is correct
+        // behaviour, not a second copy of the bug being tested for — so only
+        // the events up to and including the promotion are examined below.
+        let events = collect_events(&rx, Duration::from_secs(6));
+
+        let promotion_at = events
+            .iter()
+            .position(|e| matches!(e, EngineEvent::TrackAdvanced { .. }))
+            .expect(&format!("expected a TrackAdvanced somewhere in {events:?}"));
+        let before_promotion = &events[..promotion_at];
+
+        assert!(
+            !before_promotion.iter().any(|e| matches!(e, EngineEvent::TrackFinished)),
+            "the outgoing track must not be reported finished before the prepared \
+             voice is promoted, or the queue would skip a track: {events:?}"
+        );
+        let advanced = match &events[promotion_at] {
+            EngineEvent::TrackAdvanced { order_index, track_id } => (*order_index, track_id.clone()),
+            _ => unreachable!("checked by `position` above"),
+        };
+        assert_eq!(
+            advanced,
+            (7, "track-b".to_string()),
+            "expected a TrackAdvanced echoing back what was prepared; got {events:?}"
+        );
+
+        // Audio kept flowing through the handover: the engine's own duration
+        // now describes track B, not the (shorter, by design) remainder of A.
+        assert!(
+            wait_for(Duration::from_secs(3), || {
+                (engine.snapshot().duration_secs - info.duration_secs).abs() < 0.3
+            }),
+            "the engine should be reporting track B's duration after promotion"
+        );
+    }
+
+    /// `CancelNext` must leave the engine able to fall back to the ordinary,
+    /// un-crossfaded ending — it must not get stuck waiting for a reply that
+    /// will never come.
+    #[test]
+    fn cancelling_a_pending_next_falls_back_to_a_normal_finish() {
+        let Some((engine, rx)) = engine() else { return };
+
+        engine.load(fixture("cf-cancel", 2.0), 0.0, 0.0).expect("loading");
+        engine.set_crossfade(CrossfadeSettings { length_secs: 1.5, ..Default::default() });
+        engine.play();
+
+        wait_for_need_next(&rx, Duration::from_secs(4))
+            .expect("the engine never asked to prepare a crossfade");
+        engine.cancel_next();
+
+        let finished = (0..50).any(|_| match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(EngineEvent::TrackFinished) => true,
+            _ => false,
+        });
+        assert!(finished, "cancelling a pending crossfade should not prevent a normal finish");
+    }
+
+    /// A stale reply — answering a request that has already been superseded
+    /// or cancelled — must be ignored rather than corrupting playback.
+    #[test]
+    fn a_reply_with_the_wrong_token_is_ignored() {
+        let Some((engine, rx)) = engine() else { return };
+
+        engine.load(fixture("cf-stale", 2.0), 0.0, 0.0).expect("loading");
+        engine.set_crossfade(CrossfadeSettings { length_secs: 1.5, ..Default::default() });
+        engine.play();
+
+        let real_token = wait_for_need_next(&rx, Duration::from_secs(4))
+            .expect("the engine never asked to prepare a crossfade");
+
+        let path = fixture("cf-stale-b", 2.0);
+        let decoder =
+            TrackDecoder::open(&path, engine.device_sample_rate()).expect("opening a decoder");
+        // Answer with a token that cannot possibly be the one just issued.
+        engine.prepare_next(decoder, Resolved::default(), 0.0, real_token.wrapping_add(1), 0, "x".into());
+
+        // Playback must still reach an ordinary, un-promoted finish: the
+        // bogus reply must not have been accepted as the pending voice.
+        let finished = (0..50).any(|_| match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(EngineEvent::TrackFinished) => true,
+            Ok(EngineEvent::TrackAdvanced { .. }) => {
+                panic!("a stale-token reply must never be promoted")
+            }
+            _ => false,
+        });
+        assert!(finished, "a stale reply should leave the track free to finish normally");
+    }
+
+    /// With crossfading off (the default), behaviour is byte-for-byte the
+    /// same as before this feature existed: no `NeedNext`, straight to
+    /// `TrackFinished`. This is the regression the whole design leans on.
+    #[test]
+    fn crossfading_off_never_asks_for_a_next_track() {
+        let Some((engine, rx)) = engine() else { return };
+        engine.load(fixture("cf-off", 1.0), 0.0, 0.0).expect("loading");
+        // Default settings: length_secs == 0, i.e. disabled.
+        engine.play();
+
+        let events = collect_events(&rx, Duration::from_secs(4));
+        assert!(
+            !events.iter().any(|e| matches!(e, EngineEvent::NeedNext { .. })),
+            "crossfading must stay off unless explicitly enabled: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, EngineEvent::TrackFinished)),
+            "should still reach an ordinary finish: {events:?}"
+        );
+    }
 }

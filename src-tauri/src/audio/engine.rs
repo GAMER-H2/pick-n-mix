@@ -3,6 +3,21 @@
 //!
 //! Keeping the callback trivial is deliberate. All the interesting work happens
 //! on the worker, where allocation and the occasional slow path are harmless.
+//!
+//! ## Crossfading
+//!
+//! Normally the worker holds a single playing [`Voice`]. When crossfading is
+//! enabled and the current voice is nearing its own natural end, the worker
+//! asks the app layer to prepare the next one ([`EngineEvent::NeedNext`]) and
+//! holds it as `next` once it arrives ([`Cmd::PrepareNext`]). Both voices are
+//! then decoded, run through their own effect [`Chain`], and summed — each
+//! scaled by the crossfade curve's gain for the outgoing and incoming song —
+//! before a single master limiter. See `audio::crossfade` for the curve.
+//!
+//! The boundary between the two songs (`x = 0` on that curve) is defined as
+//! the *outgoing* song's own natural end, so promotion happens the instant
+//! `x` reaches zero or the outgoing decoder runs out of audio, whichever is
+//! first — there is never an orphaned fading-out voice to manage afterwards.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -17,8 +32,9 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use serde::Serialize;
 
 use crate::audio::ambience::{AmbienceMixer, Bank};
+use crate::audio::crossfade::CrossfadeSettings;
 use crate::audio::decode::{StreamInfo, TrackDecoder};
-use crate::audio::dsp::{Chain, CHANNELS};
+use crate::audio::dsp::{Chain, Limiter, CHANNELS};
 use crate::audio::params::Resolved;
 
 /// Frames processed per DSP block.
@@ -26,12 +42,25 @@ const BLOCK: usize = 512;
 /// How much processed audio to keep queued. Short enough that a knob twist is
 /// heard almost immediately, long enough to ride out scheduling hiccups.
 const RING_MILLIS: usize = 120;
+/// Extra lead time added on top of the crossfade curve's own lead, so a slow
+/// decoder-open (a cold disk, a large file) still finishes before it's needed.
+const TRIGGER_HEADROOM_SECS: f64 = 2.0;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum EngineEvent {
-    /// The current track played through to its end.
+    /// The current track played through to its end with no crossfade partner
+    /// ready to take over from it.
     TrackFinished,
+    /// The current track is close enough to its own end that, if crossfading
+    /// is enabled, the next one should be prepared now. `token` must be
+    /// echoed back in the matching [`AudioEngine::prepare_next`] call; a
+    /// mismatched or late reply is ignored.
+    NeedNext { token: u64 },
+    /// A prepared voice has taken over from the current one on the worker's
+    /// own schedule. The app should move its queue cursor to match — it must
+    /// *not* also call `engine.load()`, since the audio never stopped.
+    TrackAdvanced { order_index: usize, track_id: String },
     /// Something went wrong; the message is safe to show to the user.
     Error { message: String },
 }
@@ -62,6 +91,7 @@ struct Shared {
     reduction_millidb: AtomicU32,
     device_rate: AtomicU32,
     settings: ArcSwap<Resolved>,
+    crossfade: ArcSwap<CrossfadeSettings>,
     bank: ArcSwap<Bank>,
     /// Normalisation gain for the current track, worked out from its tags.
     track_gain_db: AtomicU32,
@@ -83,6 +113,7 @@ impl Shared {
             reduction_millidb: AtomicU32::new(0),
             device_rate: AtomicU32::new(48000),
             settings: ArcSwap::from_pointee(Resolved::default()),
+            crossfade: ArcSwap::from_pointee(CrossfadeSettings::default()),
             bank: ArcSwap::from_pointee(Bank::new()),
             track_gain_db: AtomicU32::new(0.0f32.to_bits()),
             stream_info: ArcSwap::from_pointee(None),
@@ -96,10 +127,48 @@ impl Shared {
     }
 }
 
+/// Which queue entry a voice prepared via [`Cmd::PrepareNext`] corresponds
+/// to, so the app can be told exactly what to move its cursor to once this
+/// voice is promoted. `None` for a voice that arrived via `Cmd::Load` instead
+/// (a fresh user-initiated load, not part of a crossfade handshake).
+#[derive(Debug, Clone)]
+struct QueueRef {
+    order_index: usize,
+    track_id: String,
+}
+
+/// One decoded, effects-processed audio source. The worker holds at most two
+/// at once: `current` (always playing) and `next` (being pre-mixed in ahead
+/// of a crossfade).
+struct Voice {
+    decoder: TrackDecoder,
+    settings: Arc<Resolved>,
+    track_gain_db: f32,
+    /// Which of the worker's two persistent [`Chain`]s processes this voice.
+    chain_ix: usize,
+    queue_ref: Option<QueueRef>,
+}
+
 enum Cmd {
     Load { path: PathBuf, start_secs: f64, gain_db: f32, reply: Sender<Result<StreamInfo>> },
     Seek(f64),
     Clear,
+    /// A decoder opened and ready on the app side, in reply to `NeedNext`.
+    /// Opening happens off the worker thread deliberately: `TrackDecoder::open`
+    /// can take tens to hundreds of milliseconds (a cold disk, a large file),
+    /// which the 120 ms ring cannot absorb if it happened here instead.
+    PrepareNext {
+        decoder: Box<TrackDecoder>,
+        settings: Arc<Resolved>,
+        gain_db: f32,
+        token: u64,
+        order_index: usize,
+        track_id: String,
+    },
+    /// Abandon any pending or already-prepared next voice. Sent whenever the
+    /// queue changes in a way that could make a prepared voice stale, and on
+    /// every manual load/seek, which are instant cuts rather than fades.
+    CancelNext,
     Shutdown,
 }
 
@@ -203,6 +272,41 @@ impl AudioEngine {
 
     pub fn set_track_gain_db(&self, db: f32) {
         self.shared.track_gain_db.store(db.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_crossfade(&self, settings: CrossfadeSettings) {
+        self.shared.crossfade.store(Arc::new(settings));
+    }
+
+    pub fn crossfade(&self) -> Arc<CrossfadeSettings> {
+        self.shared.crossfade.load_full()
+    }
+
+    /// Hand over a decoder opened and ready on the app side, in reply to
+    /// [`EngineEvent::NeedNext`]. `token` must match the one the request
+    /// carried; a stale reply (the queue changed in the meantime, or a newer
+    /// request has already superseded this one) is silently dropped.
+    pub fn prepare_next(
+        &self,
+        decoder: TrackDecoder,
+        settings: Resolved,
+        gain_db: f32,
+        token: u64,
+        order_index: usize,
+        track_id: String,
+    ) {
+        let _ = self.cmd_tx.send(Cmd::PrepareNext {
+            decoder: Box::new(decoder),
+            settings: Arc::new(settings),
+            gain_db,
+            token,
+            order_index,
+            track_id,
+        });
+    }
+
+    pub fn cancel_next(&self) {
+        let _ = self.cmd_tx.send(Cmd::CancelNext);
     }
 
     pub fn device_sample_rate(&self) -> u32 {
@@ -373,14 +477,40 @@ fn worker(
     bed_requests: Sender<String>,
     device_rate: u32,
 ) {
-    let mut chain = Chain::new();
-    chain.prepare(device_rate as f32);
+    // Two persistent chains, ping-ponged between voices across a crossfade,
+    // rather than one built fresh per track: a `Chain` owns the delay lines,
+    // Freeverb combs and limiter lookahead buffer, which is real allocation
+    // worth keeping. Whichever chain a retiring voice was using is re-prepared
+    // (state zeroed) before it can be reused, so one track's reverb tail can
+    // never bleed into the next track that happens to land on the same chain.
+    let mut chains: [Chain; 2] = [Chain::new(), Chain::new()];
+    chains[0].prepare(device_rate as f32);
+    chains[1].prepare(device_rate as f32);
+
+    // The limiter lives on the master bus, after voices are summed, not one
+    // per chain: two chains each limiting to the ceiling independently and
+    // then being added together could still clip by several dB.
+    let mut master_limiter = Limiter::new();
+    master_limiter.prepare(device_rate as f32);
+
     let mut ambience = AmbienceMixer::new();
     ambience.prepare(device_rate as f32);
 
-    let mut planar: Vec<Vec<f32>> = vec![vec![0.0; BLOCK]; CHANNELS];
-    let mut interleaved = vec![0.0f32; BLOCK * CHANNELS];
-    let mut decoder: Option<TrackDecoder> = None;
+    // Scratch buffers, sized once. `mix` doubles as voice A's buffer: voice B
+    // (when present) is decoded into `scratch_b` and added into `mix` in
+    // place, rather than allocating a third buffer.
+    let mut mix: Vec<Vec<f32>> = vec![vec![0.0; BLOCK]; CHANNELS];
+    let mut scratch_b: Vec<Vec<f32>> = vec![vec![0.0; BLOCK]; CHANNELS];
+    let mut interleaved_a = vec![0.0f32; BLOCK * CHANNELS];
+    let mut interleaved_b = vec![0.0f32; BLOCK * CHANNELS];
+
+    let mut current: Option<Voice> = None;
+    let mut next: Option<Voice> = None;
+    // Set once `NeedNext` has been asked and not yet answered (or cancelled),
+    // so the trigger does not fire again on every subsequent block.
+    let mut next_wait_token: Option<u64> = None;
+    let mut next_token_gen: u64 = 0;
+
     let mut finished_reported = false;
     let mut requested_beds: Vec<String> = Vec::new();
     let mut meter_countdown = 0u32;
@@ -408,36 +538,75 @@ fn worker(
                                 Ordering::Relaxed,
                             );
                             shared.stream_info.store(Arc::new(Some(info.clone())));
-                            decoder = Some(d);
+                            current = Some(Voice {
+                                decoder: d,
+                                settings: shared.settings.load_full(),
+                                track_gain_db: gain_db,
+                                chain_ix: 0,
+                                queue_ref: None,
+                            });
+                            chains[1].prepare(device_rate as f32);
+                            // A manual load is an instant cut: whatever was
+                            // being prepared for a crossfade no longer applies.
+                            next = None;
+                            next_wait_token = None;
                             finished_reported = false;
                             drain(&shared);
                             let _ = reply.send(Ok(info));
                         }
                         Err(e) => {
-                            decoder = None;
+                            current = None;
+                            next = None;
+                            next_wait_token = None;
                             shared.stream_info.store(Arc::new(None));
                             let _ = reply.send(Err(e));
                         }
                     }
                 }
                 Cmd::Seek(secs) => {
-                    if let Some(d) = decoder.as_mut() {
-                        if let Err(e) = d.seek(secs) {
+                    if let Some(cur) = current.as_mut() {
+                        if let Err(e) = cur.decoder.seek(secs) {
                             let _ = events.send(EngineEvent::Error { message: e.to_string() });
                         }
+                        // A seek can move arbitrarily far from the track's own
+                        // end, which invalidates any in-flight crossfade
+                        // scheduling against it.
+                        next = None;
+                        next_wait_token = None;
                         drain(&shared);
                         finished_reported = false;
                         shared
                             .position_ms
-                            .store((d.decoded_secs() * 1000.0) as u64, Ordering::Relaxed);
+                            .store((cur.decoder.decoded_secs() * 1000.0) as u64, Ordering::Relaxed);
                     }
                 }
                 Cmd::Clear => {
-                    decoder = None;
+                    current = None;
+                    next = None;
+                    next_wait_token = None;
                     shared.stream_info.store(Arc::new(None));
                     shared.position_ms.store(0, Ordering::Relaxed);
                     shared.duration_ms.store(0, Ordering::Relaxed);
                     drain(&shared);
+                }
+                Cmd::PrepareNext { decoder, settings, gain_db, token, order_index, track_id } => {
+                    // Only accepted if it answers the request currently
+                    // outstanding; anything else is stale.
+                    if next_wait_token == Some(token) {
+                        let chain_ix = current.as_ref().map(|c| 1 - c.chain_ix).unwrap_or(1);
+                        next = Some(Voice {
+                            decoder: *decoder,
+                            settings,
+                            track_gain_db: gain_db,
+                            chain_ix,
+                            queue_ref: Some(QueueRef { order_index, track_id }),
+                        });
+                        next_wait_token = None;
+                    }
+                }
+                Cmd::CancelNext => {
+                    next = None;
+                    next_wait_token = None;
                 }
                 Cmd::Shutdown => shutdown = true,
             }
@@ -446,91 +615,225 @@ fn worker(
             return;
         }
 
-        // --- parameters -------------------------------------------------
-        let settings = shared.settings.load_full();
-        let bank = shared.bank.load_full();
-        chain.update(&settings, f32::from_bits(shared.track_gain_db.load(Ordering::Relaxed)));
-
-        let filters: &[crate::audio::params::Filter] =
-            if settings.enabled { &settings.filters } else { &[] };
-        ambience.sync(filters, &bank);
-        for id in ambience.missing(filters, &bank) {
-            if !requested_beds.iter().any(|r| r == id) {
-                requested_beds.push(id.to_string());
-                let _ = bed_requests.send(id.to_string());
-            }
+        // --- current voice's live parameters -----------------------------
+        // Only the current voice tracks `Shared` live, so tweaking the mixer
+        // while a crossfade is pending affects what is actually playing, not
+        // the queued-up next track. The next voice keeps the settings it was
+        // resolved with at prepare time until it is promoted.
+        if let Some(cur) = current.as_mut() {
+            cur.settings = shared.settings.load_full();
+            cur.track_gain_db = f32::from_bits(shared.track_gain_db.load(Ordering::Relaxed));
         }
 
-        let speed = if settings.enabled { settings.pitch.ratio() } else { 1.0 };
-        shared.speed_millis.store((speed * 1000.0) as u64, Ordering::Relaxed);
+        let crossfade = shared.crossfade.load_full();
+        let bank = shared.bank.load_full();
 
-        // --- produce ----------------------------------------------------
-        let idle = !shared.playing.load(Ordering::Relaxed) || decoder.is_none();
+        if let Some(cur) = current.as_ref() {
+            let filters: &[crate::audio::params::Filter] =
+                if cur.settings.enabled { &cur.settings.filters } else { &[] };
+            ambience.sync(filters, &bank);
+            for id in ambience.missing(filters, &bank) {
+                if !requested_beds.iter().any(|r| r == id) {
+                    requested_beds.push(id.to_string());
+                    let _ = bed_requests.send(id.to_string());
+                }
+            }
+
+            let speed = if cur.settings.enabled { cur.settings.pitch.ratio() } else { 1.0 };
+            shared.speed_millis.store((speed * 1000.0) as u64, Ordering::Relaxed);
+        }
+
+        // --- idle / backpressure ------------------------------------------
+        let idle = !shared.playing.load(Ordering::Relaxed) || current.is_none();
         let room = producer.slots() >= BLOCK * CHANNELS;
         if idle || !room {
             std::thread::sleep(Duration::from_millis(3));
             continue;
         }
 
-        let d = decoder.as_mut().expect("checked above");
-        if let Err(e) = d.set_speed(speed) {
-            let _ = events.send(EngineEvent::Error { message: e.to_string() });
+        // --- crossfade: ask for the next track once close enough ----------
+        if crossfade.enabled() && next.is_none() && next_wait_token.is_none() {
+            let cur = current.as_ref().expect("checked by `idle` above");
+            let remaining_track =
+                (cur.decoder.info.duration_secs - cur.decoder.decoded_secs()).max(0.0);
+            let speed = if cur.settings.enabled { cur.settings.pitch.ratio() } else { 1.0 };
+            let remaining_wall = remaining_track / speed.max(0.05);
+            let lead = crossfade.lead_secs() as f64 + TRIGGER_HEADROOM_SECS;
+            if remaining_wall <= lead {
+                let token = next_token_gen;
+                next_token_gen += 1;
+                next_wait_token = Some(token);
+                let _ = events.send(EngineEvent::NeedNext { token });
+            }
         }
 
-        let got = match d.read(&mut interleaved) {
-            Ok(n) => n,
-            Err(e) => {
+        // --- crossfade: promote once the boundary is reached --------------
+        // Checked *before* attempting another read from the current voice, so
+        // a voice that is about to be promoted never has the chance to reach
+        // "EOF with an empty ring" and fire `TrackFinished` on its way out —
+        // that would otherwise skip the very track being promoted to.
+        if next.is_some() {
+            let cur = current.as_ref().expect("checked by `idle` above");
+            let x = cur.decoder.decoded_secs() - cur.decoder.info.duration_secs;
+            if x >= 0.0 || cur.decoder.is_eof() {
+                let retiring_ix = cur.chain_ix;
+                let promoted = next.take().expect("checked by outer `if`");
+                chains[retiring_ix].prepare(device_rate as f32);
+
+                shared.settings.store(Arc::clone(&promoted.settings));
+                shared.track_gain_db.store(promoted.track_gain_db.to_bits(), Ordering::Relaxed);
+                shared.duration_ms.store(
+                    (promoted.decoder.info.duration_secs * 1000.0) as u64,
+                    Ordering::Relaxed,
+                );
+                shared.position_ms.store(
+                    (promoted.decoder.decoded_secs() * 1000.0) as u64,
+                    Ordering::Relaxed,
+                );
+                shared.stream_info.store(Arc::new(Some(promoted.decoder.info.clone())));
+
+                let queue_ref = promoted.queue_ref.clone();
+                current = Some(promoted);
+                next_wait_token = None;
+                finished_reported = false;
+
+                if let Some(qref) = queue_ref {
+                    let _ = events.send(EngineEvent::TrackAdvanced {
+                        order_index: qref.order_index,
+                        track_id: qref.track_id,
+                    });
+                }
+                continue;
+            }
+        }
+
+        // --- produce: current voice ----------------------------------------
+        // Scoped tightly to the decode calls, which are the only part that
+        // needs `current` mutably: everything after this block only ever
+        // reads it, and holding a `&mut` across the next-voice section too
+        // would fight the immutable borrow that section needs.
+        let (frames, speed) = {
+            let cur = current.as_mut().expect("checked by `idle` above");
+            let speed = if cur.settings.enabled { cur.settings.pitch.ratio() } else { 1.0 };
+            if let Err(e) = cur.decoder.set_speed(speed) {
                 let _ = events.send(EngineEvent::Error { message: e.to_string() });
-                0
             }
+
+            let got_a = match cur.decoder.read(&mut interleaved_a) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = events.send(EngineEvent::Error { message: e.to_string() });
+                    0
+                }
+            };
+            let frames = got_a / CHANNELS;
+
+            if frames == 0 {
+                // Wait for the ring to empty so the tail is actually heard.
+                let queued = BLOCK * CHANNELS - producer.slots().min(BLOCK * CHANNELS);
+                if cur.decoder.is_eof() && queued == 0 && !finished_reported {
+                    finished_reported = true;
+                    let _ = events.send(EngineEvent::TrackFinished);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+
+            for f in 0..frames {
+                for ch in 0..CHANNELS {
+                    mix[ch][f] = interleaved_a[f * CHANNELS + ch];
+                }
+            }
+
+            if cur.settings.enabled {
+                chains[cur.chain_ix].process_music(&mut mix, frames);
+            }
+            chains[cur.chain_ix].apply_gain(&mut mix, frames);
+
+            (frames, speed)
         };
-        let frames = got / CHANNELS;
 
-        if frames == 0 {
-            // Wait for the ring to empty so the tail is actually heard.
-            let queued = BLOCK * CHANNELS - producer.slots().min(BLOCK * CHANNELS);
-            if d.is_eof() && queued == 0 && !finished_reported {
-                finished_reported = true;
-                let _ = events.send(EngineEvent::TrackFinished);
-            }
-            std::thread::sleep(Duration::from_millis(5));
-            continue;
-        }
-
-        for f in 0..frames {
+        // --- produce: next voice, mixed in under the crossfade curve -------
+        if next.is_some() {
+            let x = {
+                let cur = current.as_ref().expect("checked by `idle` above");
+                cur.decoder.decoded_secs() - cur.decoder.info.duration_secs
+            };
+            let gain_a = crossfade.curve.gain_out(x as f32);
             for ch in 0..CHANNELS {
-                planar[ch][f] = interleaved[f * CHANNELS + ch];
+                for f in 0..frames {
+                    mix[ch][f] *= gain_a;
+                }
+            }
+
+            let nx = next.as_mut().expect("checked by outer `if`");
+            let nx_speed = if nx.settings.enabled { nx.settings.pitch.ratio() } else { 1.0 };
+            if let Err(e) = nx.decoder.set_speed(nx_speed) {
+                let _ = events.send(EngineEvent::Error { message: e.to_string() });
+            }
+
+            let want_b = frames * CHANNELS;
+            let got_b = match nx.decoder.read(&mut interleaved_b[..want_b]) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = events.send(EngineEvent::Error { message: e.to_string() });
+                    0
+                }
+            };
+            let frames_b = got_b / CHANNELS;
+
+            for ch in 0..CHANNELS {
+                for f in 0..frames {
+                    scratch_b[ch][f] = if f < frames_b { interleaved_b[f * CHANNELS + ch] } else { 0.0 };
+                }
+            }
+
+            chains[nx.chain_ix].update(&nx.settings, nx.track_gain_db);
+            if nx.settings.enabled {
+                chains[nx.chain_ix].process_music(&mut scratch_b, frames);
+            }
+            chains[nx.chain_ix].apply_gain(&mut scratch_b, frames);
+
+            let gain_b = crossfade.curve.gain_in(x as f32);
+            for ch in 0..CHANNELS {
+                for f in 0..frames {
+                    mix[ch][f] += scratch_b[ch][f] * gain_b;
+                }
             }
         }
 
-        if settings.enabled {
-            chain.process_music(&mut planar, frames);
-            if !ambience.is_silent() {
-                ambience.process(&mut planar, frames);
-            }
+        // --- master bus: ambience, then the one limiter --------------------
+        // A single fresh immutable borrow, used through both this and the
+        // reporting step below: nothing mutates `current` in between.
+        let cur = current.as_ref().expect("checked by `idle` above");
+        if cur.settings.enabled && !ambience.is_silent() {
+            ambience.process(&mut mix, frames);
         }
-        chain.finish(&mut planar, frames);
+        master_limiter.update(&cur.settings.normalisation, device_rate as f32);
+        master_limiter.process(&mut mix, frames);
 
         for f in 0..frames {
             for ch in 0..CHANNELS {
                 // The room check above guarantees these pushes succeed.
-                let _ = producer.push(planar[ch][f]);
+                let _ = producer.push(mix[ch][f]);
             }
         }
 
         // --- reporting --------------------------------------------------
         // What is decoded, less what is still queued, converted back into
-        // track time so varispeed does not skew the progress bar.
+        // track time so varispeed does not skew the progress bar. Reports
+        // against whichever voice is `current`, which is always the one the
+        // callback is (about to be) audibly dominated by.
         let capacity = producer.buffer().capacity();
         let queued_frames = (capacity - producer.slots()) / CHANNELS;
         let queued_secs = queued_frames as f64 / device_rate as f64 * speed;
-        let position = (d.decoded_secs() - queued_secs).max(0.0);
+        let position = (cur.decoder.decoded_secs() - queued_secs).max(0.0);
         shared.position_ms.store((position * 1000.0) as u64, Ordering::Relaxed);
 
         meter_countdown += 1;
         if meter_countdown >= 4 {
             meter_countdown = 0;
-            let red = chain.limiter.take_reduction_db();
+            let red = master_limiter.take_reduction_db();
             shared.reduction_millidb.store((red * 1000.0) as u32, Ordering::Relaxed);
         }
     }

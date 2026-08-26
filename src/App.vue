@@ -16,6 +16,7 @@ import { usePlayerStore } from "./stores/player";
 import { useLibraryStore } from "./stores/library";
 import { usePlaylistStore } from "./stores/playlists";
 import { useMixerStore } from "./stores/mixer";
+import { useCrossfadeStore } from "./stores/crossfade";
 import { useUiStore } from "./stores/ui";
 import { installShortcuts } from "./lib/keyboard";
 import type { PlaybackSnapshot, QueueView, ResolvedMixer, Track } from "./lib/types";
@@ -24,6 +25,7 @@ const player = usePlayerStore();
 const library = useLibraryStore();
 const playlists = usePlaylistStore();
 const mixer = useMixerStore();
+const crossfade = useCrossfadeStore();
 const ui = useUiStore();
 const route = useRoute();
 const router = useRouter();
@@ -67,7 +69,13 @@ onMounted(async () => {
   // Listeners first, then the initial fetch: an event emitted between the two
   // would otherwise be missed, leaving the UI showing nothing while the engine
   // is already playing.
-  await Promise.all([library.refresh(), playlists.refresh(), player.refresh(), mixer.refresh()]);
+  await Promise.all([
+    library.refresh(),
+    playlists.refresh(),
+    player.refresh(),
+    mixer.refresh(),
+    crossfade.refresh(),
+  ]);
 });
 
 onBeforeUnmount(() => {

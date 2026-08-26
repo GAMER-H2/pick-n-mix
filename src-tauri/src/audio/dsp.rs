@@ -695,15 +695,18 @@ impl Limiter {
 // Chain
 // ---------------------------------------------------------------------------
 
-/// The ordered effect chain applied to the music bus.
+/// The ordered effect chain applied to one voice's music signal.
+///
+/// The limiter is deliberately not a member of `Chain`: during a crossfade two
+/// `Chain`s run at once, and a limiter on each side would let the sum of two
+/// already-ceilinged signals clip. There is exactly one limiter, owned by the
+/// engine as the last stage of the master bus, after voices are summed.
 pub struct Chain {
     pub eq: EqChain,
     pub delay: DelayFx,
     pub reverb: ReverbFx,
     pub lofi: LofiFx,
-    pub limiter: Limiter,
     gain: Smoothed,
-    sample_rate: f32,
     bypassed: bool,
 }
 
@@ -714,20 +717,16 @@ impl Chain {
             delay: DelayFx::new(),
             reverb: ReverbFx::new(),
             lofi: LofiFx::new(),
-            limiter: Limiter::new(),
             gain: Smoothed::new(1.0),
-            sample_rate: 48000.0,
             bypassed: false,
         }
     }
 
     pub fn prepare(&mut self, sample_rate: f32) {
-        self.sample_rate = sample_rate;
         self.eq.prepare(sample_rate);
         self.delay.prepare(sample_rate);
         self.reverb.prepare(sample_rate);
         self.lofi.prepare(sample_rate);
-        self.limiter.prepare(sample_rate);
         self.gain.prepare(sample_rate, 25.0);
     }
 
@@ -737,7 +736,6 @@ impl Chain {
         self.bypassed = !settings.enabled;
         if self.bypassed {
             self.gain.set_target(1.0);
-            self.limiter.update(&settings.normalisation, self.sample_rate);
             return;
         }
 
@@ -745,7 +743,6 @@ impl Chain {
         self.delay.update(&settings.delay);
         self.reverb.update(&settings.reverb);
         self.lofi.update(&settings.lofi);
-        self.limiter.update(&settings.normalisation, self.sample_rate);
 
         let norm_db = if settings.normalisation.enabled {
             track_gain_db + settings.normalisation.gain_db
@@ -756,7 +753,7 @@ impl Chain {
     }
 
     /// Music effects. The ambience bed is mixed in by the caller between this
-    /// and [`Chain::finish`], so beds are not coloured by the track's EQ.
+    /// and [`Chain::apply_gain`], so beds are not coloured by the track's EQ.
     pub fn process_music(&mut self, buf: &mut [Vec<f32>], frames: usize) {
         if self.bypassed {
             return;
@@ -767,15 +764,18 @@ impl Chain {
         self.lofi.process(buf, frames);
     }
 
-    /// Master gain then limiting, applied to the full mix.
-    pub fn finish(&mut self, buf: &mut [Vec<f32>], frames: usize) {
+    /// This voice's own gain ramp (normalisation plus any manual trim).
+    ///
+    /// Not the limiter: that runs once, on the master bus, after every voice
+    /// has been summed. A caller mixing a single voice with nothing else on
+    /// the bus still needs to run the master limiter afterwards.
+    pub fn apply_gain(&mut self, buf: &mut [Vec<f32>], frames: usize) {
         for i in 0..frames {
             let g = self.gain.next();
             for ch in 0..CHANNELS {
                 buf[ch][i] *= g;
             }
         }
-        self.limiter.process(buf, frames);
     }
 }
 

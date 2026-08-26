@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::audio::ambience::{self, FilterInfo};
+use crate::audio::crossfade::CrossfadeSettings;
 use crate::audio::decode::StreamInfo;
 use crate::audio::params::{MixerSettings, Resolved};
 use crate::audio::PlaybackSnapshot;
@@ -18,7 +19,8 @@ use crate::player::{Context, QueueItem, QueueView, Repeat};
 use crate::playlist::{self, Playlist};
 use crate::presets::{self, Preset};
 use crate::state::{
-    AppState, SETTING_GLOBAL_MIXER, SETTING_REPEAT, SETTING_SHUFFLE, SETTING_VOLUME,
+    AppState, SETTING_CROSSFADE, SETTING_GLOBAL_MIXER, SETTING_REPEAT, SETTING_SHUFFLE,
+    SETTING_VOLUME,
 };
 
 type Cmd<T> = Result<T, String>;
@@ -298,6 +300,10 @@ pub fn play_next(app: AppHandle, state: State<'_, AppState>, track_ids: Vec<Stri
     if was_empty {
         return start_current(&app, &state);
     }
+    // Inserting right after the current track can change what a pending
+    // crossfade was prepared into; safest to drop it and let the engine ask
+    // again once it is actually needed.
+    state.engine.cancel_next();
     let _ = app.emit("queue-changed", state.player.lock().view());
     Ok(())
 }
@@ -314,6 +320,7 @@ pub fn add_to_queue(app: AppHandle, state: State<'_, AppState>, track_ids: Vec<S
     if was_empty {
         return start_current(&app, &state);
     }
+    state.engine.cancel_next();
     let _ = app.emit("queue-changed", state.player.lock().view());
     Ok(())
 }
@@ -321,6 +328,9 @@ pub fn add_to_queue(app: AppHandle, state: State<'_, AppState>, track_ids: Vec<S
 #[tauri::command]
 pub fn remove_from_queue(app: AppHandle, state: State<'_, AppState>, index: usize) -> Cmd<()> {
     state.player.lock().remove_at(index);
+    // The removed entry might be exactly what a pending crossfade was
+    // prepared into.
+    state.engine.cancel_next();
     let _ = app.emit("queue-changed", state.player.lock().view());
     Ok(())
 }
@@ -338,6 +348,8 @@ pub fn clear_queue(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
 pub fn set_shuffle(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Cmd<()> {
     state.player.lock().set_shuffle(enabled);
     let _ = state.db.set_setting(SETTING_SHUFFLE, if enabled { "true" } else { "false" });
+    // What comes after the current track can change completely.
+    state.engine.cancel_next();
     let _ = app.emit("queue-changed", state.player.lock().view());
     Ok(())
 }
@@ -348,6 +360,8 @@ pub fn set_repeat(app: AppHandle, state: State<'_, AppState>, mode: Repeat) -> C
     if let Ok(raw) = serde_json::to_string(&mode) {
         let _ = state.db.set_setting(SETTING_REPEAT, &raw);
     }
+    // `peek_next` under the old mode may no longer be what comes next.
+    state.engine.cancel_next();
     let _ = app.emit("queue-changed", state.player.lock().view());
     Ok(())
 }
@@ -480,6 +494,51 @@ pub fn save_preset(
 #[tauri::command]
 pub fn delete_preset(state: State<'_, AppState>, id: String) -> Cmd<Vec<Preset>> {
     presets::delete(&state.paths.presets, &id).map_err(err)
+}
+
+// ---------------------------------------------------------------------------
+// Crossfade
+//
+// Global only, and deliberately not part of the mixer cascade above — see the
+// doc comment on `audio::crossfade::CrossfadeSettings` for why.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn crossfade_settings(state: State<'_, AppState>) -> Cmd<CrossfadeSettings> {
+    Ok((*state.engine.crossfade()).clone())
+}
+
+/// Set the crossfade length from the simple slider. Keeps the curve's shape
+/// (symmetric, or whatever the advanced graph left it as) and rescales it to
+/// the new length.
+#[tauri::command]
+pub fn set_crossfade_length(state: State<'_, AppState>, length_secs: f32) -> Cmd<CrossfadeSettings> {
+    let next = state.engine.crossfade().with_length(length_secs);
+    state.engine.set_crossfade(next.clone());
+    persist_crossfade(&state, &next);
+    Ok(next)
+}
+
+/// Set the crossfade curve directly, from the advanced graph. `length_secs`
+/// is derived from the curve's own extent so the two stay in step regardless
+/// of which control was used last.
+#[tauri::command]
+pub fn set_crossfade_curve(
+    state: State<'_, AppState>,
+    curve: crate::audio::crossfade::CrossfadeCurve,
+) -> Cmd<CrossfadeSettings> {
+    let length = state.engine.crossfade().length_secs;
+    let clamped = curve.clamp(length);
+    let next = CrossfadeSettings { length_secs: length, curve: clamped };
+    state.engine.set_crossfade(next.clone());
+    persist_crossfade(&state, &next);
+    Ok(next)
+}
+
+fn persist_crossfade(state: &AppState, settings: &CrossfadeSettings) {
+    if let Ok(raw) = serde_json::to_string(settings) {
+        let _ = state.db.set_setting(SETTING_CROSSFADE, &raw);
+    }
 }
 
 #[tauri::command]
@@ -704,6 +763,8 @@ pub fn set_playlist_entry_mixer(
 #[tauri::command]
 pub fn move_in_queue(app: AppHandle, state: State<'_, AppState>, from: usize, to: usize) -> Cmd<()> {
     if state.player.lock().move_item(from, to) {
+        // Reordering can change what immediately follows the current track.
+        state.engine.cancel_next();
         let _ = app.emit("queue-changed", state.player.lock().view());
     }
     Ok(())
