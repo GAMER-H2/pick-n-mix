@@ -64,6 +64,9 @@ export const setRepeat = (mode: Repeat) => invoke<void>("set_repeat", { mode });
 
 // -- mixer -----------------------------------------------------------------
 export const mixerState = () => invoke<MixerState>("mixer_state");
+/** Just the cascade; no disk access, safe to call on every track change. */
+export const mixerLayers = () =>
+  invoke<Pick<MixerState, "global" | "context" | "track" | "effective">>("mixer_layers");
 export const setGlobalMixer = (settings: MixerSettings) =>
   invoke<ResolvedMixer>("set_global_mixer", { settings });
 export const setPlaylistMixer = (playlistId: string, settings: MixerSettings | null) =>

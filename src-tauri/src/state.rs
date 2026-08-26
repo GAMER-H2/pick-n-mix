@@ -52,6 +52,8 @@ pub struct AppState {
     pub engine_events: Mutex<Option<Receiver<EngineEvent>>>,
     /// Guards MusicBrainz lookups so only one runs at a time.
     pub metadata: Mutex<Option<Arc<crate::library::metadata::MusicBrainz>>>,
+    /// System transport controls (MPRIS / macOS Now Playing).
+    pub media: crate::media::MediaBridge,
 }
 
 /// Key under which the global mixer is persisted.
@@ -101,6 +103,7 @@ impl AppState {
             paths,
             engine_events: Mutex::new(Some(rx)),
             metadata: Mutex::new(None),
+            media: crate::media::MediaBridge::new(),
         })
     }
 

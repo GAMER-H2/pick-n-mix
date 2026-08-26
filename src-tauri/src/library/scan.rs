@@ -135,9 +135,9 @@ pub fn read_track(path: &Path, artwork_dir: &Path) -> Result<Track> {
         }
     }
 
-    if track.album_artist.trim().is_empty() {
-        track.album_artist = track.artist.clone();
-    }
+    // Deliberately not filled in from `artist`: an album-artist we invented is
+    // indistinguishable from a real one, and guessing it splits every
+    // compilation into one album per track.
     Ok(track)
 }
 

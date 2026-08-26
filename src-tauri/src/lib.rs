@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod commands;
 pub mod library;
+pub mod media;
 pub mod player;
 pub mod playlist;
 pub mod presets;
@@ -149,7 +150,13 @@ fn spawn_ticker(app: tauri::AppHandle) {
                 return;
             };
 
-            let _ = app.emit("playback", state.engine.snapshot());
+            let snapshot = state.engine.snapshot();
+            let _ = app.emit("playback", &snapshot);
+
+            // Keep the OS transport in step. `publish` skips the call when
+            // nothing has changed, so this is cheap at tick rate.
+            let current = state.player.lock().current().cloned();
+            media::publish(&app, current.as_ref(), snapshot.playing, snapshot.position_secs);
 
             for id in state.engine.take_bed_requests() {
                 if state.engine.has_bed(&id) {
@@ -192,6 +199,9 @@ pub fn run() {
             let state = AppState::new(&data_dir)?;
             app.manage(state);
 
+            // Needs the managed state, so it goes after `manage`.
+            media::init(app.handle());
+
             spawn_event_pump(app.handle().clone());
             spawn_ticker(app.handle().clone());
             Ok(())
@@ -232,6 +242,7 @@ pub fn run() {
             commands::set_repeat,
             // mixer
             commands::mixer_state,
+            commands::mixer_layers,
             commands::set_global_mixer,
             commands::set_playlist_mixer,
             commands::list_presets,

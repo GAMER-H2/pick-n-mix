@@ -146,13 +146,22 @@ fn start_current(app: &AppHandle, state: &AppState) -> Cmd<()> {
         }
     };
 
-    state.sync_mixer();
-    state.engine.load(path, 0.0, gain).map_err(err)?;
-    state.engine.play();
-
+    // Announce the new track before loading it. Opening the file and refilling
+    // the ring takes a few tens of milliseconds; there is no reason for the
+    // title and artwork to wait for that.
     let current = state.player.lock().current().cloned();
     let _ = app.emit("track-changed", &current);
     let _ = app.emit("queue-changed", state.player.lock().view());
+
+    state.sync_mixer();
+    match state.engine.load(path, 0.0, gain) {
+        Ok(_) => state.engine.play(),
+        Err(e) => {
+            // The UI has already moved on, so say why the audio did not.
+            let _ = app.emit("engine-error", format!("could not play that track: {e}"));
+            return Err(err(e));
+        }
+    }
     Ok(())
 }
 
@@ -348,6 +357,16 @@ pub fn set_repeat(app: AppHandle, state: State<'_, AppState>, mode: Repeat) -> C
 // ---------------------------------------------------------------------------
 
 /// Everything the mixer panels need in one call.
+/// The cascade on its own, cheap enough to fetch on every track change.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixerLayers {
+    pub global: MixerSettings,
+    pub context: Option<MixerSettings>,
+    pub track: Option<MixerSettings>,
+    pub effective: Resolved,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MixerState {
@@ -365,14 +384,30 @@ pub struct MixerState {
 
 #[tauri::command]
 pub fn mixer_state(state: State<'_, AppState>) -> Cmd<MixerState> {
-    let player = state.player.lock();
+    let layers = mixer_layers(state.clone())?;
+    // Read from disk only after the player lock has been released: holding it
+    // across file I/O stalls every other command, which made pressing next
+    // feel laggy while the previous track change was still settling.
     Ok(MixerState {
+        global: layers.global,
+        context: layers.context,
+        track: layers.track,
+        effective: layers.effective,
+        presets: presets::load_all(&state.paths.presets),
+        filters: ambience::catalogue(&state.paths.filters),
+    })
+}
+
+/// Just the cascade, with no disk access. Used on every track change, where
+/// the preset list and the filter catalogue cannot have changed.
+#[tauri::command]
+pub fn mixer_layers(state: State<'_, AppState>) -> Cmd<MixerLayers> {
+    let player = state.player.lock();
+    Ok(MixerLayers {
         global: player.global_mixer.clone(),
         context: player.context_mixer.clone(),
         track: player.current_item().and_then(|i| i.mixer.clone()),
         effective: player.effective_mixer(),
-        presets: presets::load_all(&state.paths.presets),
-        filters: ambience::catalogue(&state.paths.filters),
     })
 }
 

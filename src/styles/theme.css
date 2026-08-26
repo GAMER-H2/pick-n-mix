@@ -217,6 +217,28 @@ textarea {
   white-space: nowrap;
 }
 
+/*
+ * Wraps onto more lines rather than cutting a long title off at one, up to a
+ * limit, after which it ellipsises. Pair with a `title` attribute so the full
+ * text is still available on hover.
+ */
+.clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--clamp-lines, 2);
+  line-clamp: var(--clamp-lines, 2);
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.clamp-1 {
+  --clamp-lines: 1;
+}
+
+.clamp-3 {
+  --clamp-lines: 3;
+}
+
 /* Scrollbars: present when scrolling, invisible otherwise. */
 .scroll-area {
   overflow-y: auto;
@@ -237,6 +259,33 @@ textarea {
 .scroll-area:hover::-webkit-scrollbar-thumb {
   background: var(--separator-strong);
   background-clip: content-box;
+}
+
+/* -- popovers -------------------------------------------------------------- */
+
+/*
+ * Teleported to <body> so they always sit above panels and overlays. Anchoring
+ * them inside the player bar put them underneath the queue widget, because the
+ * bar's backdrop-filter creates its own stacking context.
+ */
+.pnm-popover {
+  position: fixed;
+  z-index: 600;
+  bottom: calc(var(--player-height) + 12px);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  border: 0.5px solid var(--separator);
+  box-shadow: var(--shadow-popover);
+}
+
+.pnm-popover--mixer {
+  right: 14px;
+  transform-origin: bottom right;
+}
+
+.pnm-popover--info {
+  left: 14px;
+  transform-origin: bottom left;
 }
 
 /* -- transitions ---------------------------------------------------------- */
@@ -260,6 +309,18 @@ textarea {
 .pop-leave-to {
   opacity: 0;
   transform: translateY(6px) scale(0.98);
+}
+
+/* The full-screen player rises from the bottom rather than cross-fading. */
+.rise-enter-active,
+.rise-leave-active {
+  transition: transform 0.28s var(--ease), opacity 0.2s var(--ease);
+}
+
+.rise-enter-from,
+.rise-leave-to {
+  transform: translateY(100%);
+  opacity: 0.6;
 }
 
 .slide-panel-enter-active,

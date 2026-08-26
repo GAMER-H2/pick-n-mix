@@ -29,6 +29,9 @@ export const usePlayerStore = defineStore("player", () => {
   const scrubbing = ref(false);
   const scrubPosition = ref(0);
 
+  /** Level to restore on unmute. Null when not muted. */
+  const mutedFrom = ref<number | null>(null);
+
   const playing = computed(() => snapshot.value.playing);
   const position = computed(() =>
     scrubbing.value ? scrubPosition.value : snapshot.value.positionSecs,
@@ -87,9 +90,32 @@ export const usePlayerStore = defineStore("player", () => {
     await api.seek(seconds);
   }
 
+  const muted = computed(() => snapshot.value.volume === 0);
+
   async function setVolume(volume: number) {
+    // Dragging the slider is an explicit choice, so it cancels a mute.
+    mutedFrom.value = null;
     snapshot.value = { ...snapshot.value, volume };
     await api.setVolume(volume);
+  }
+
+  /**
+   * Mute, remembering where the level was. Unmuting restores it; unmuting
+   * something that was already silent goes to full, since restoring silence
+   * would look like the button had done nothing.
+   */
+  async function toggleMute() {
+    if (snapshot.value.volume > 0) {
+      const previous = snapshot.value.volume;
+      snapshot.value = { ...snapshot.value, volume: 0 };
+      await api.setVolume(0);
+      mutedFrom.value = previous;
+      return;
+    }
+    const restored = mutedFrom.value && mutedFrom.value > 0 ? mutedFrom.value : 1;
+    mutedFrom.value = null;
+    snapshot.value = { ...snapshot.value, volume: restored };
+    await api.setVolume(restored);
   }
 
   async function setShuffle(enabled: boolean) {
@@ -108,6 +134,8 @@ export const usePlayerStore = defineStore("player", () => {
     queue,
     scrubbing,
     scrubPosition,
+    mutedFrom,
+    muted,
     playing,
     position,
     duration,
@@ -121,6 +149,7 @@ export const usePlayerStore = defineStore("player", () => {
     previous,
     seek,
     setVolume,
+    toggleMute,
     setShuffle,
     cycleRepeat,
   };

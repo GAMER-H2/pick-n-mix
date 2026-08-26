@@ -20,8 +20,6 @@ const router = useRouter();
 const el = ref<HTMLElement | null>(null);
 const menu = computed(() => ui.contextMenu);
 const track = computed(() => menu.value?.tracks[0] ?? null);
-const trackIds = computed(() => menu.value?.tracks.map((t) => t.id) ?? []);
-
 /** Keep the menu inside the window. */
 const position = computed(() => {
   const m = menu.value;
@@ -50,13 +48,18 @@ const items = computed<Item[]>(() => {
 
   const count = m.tracks.length;
   const what = count === 1 ? `"${t.title}"` : `${count} songs`;
+  // Captured now, not read from `menu` later: `run` closes the menu before it
+  // awaits the action, which would leave these reading an empty list.
+  const ids = m.tracks.map((track) => track.id);
+
+  const tracks = [...m.tracks];
 
   const list: Item[] = [
     {
       label: "Play Next",
       icon: "playNext",
       action: async () => {
-        await api.playNext(trackIds.value);
+        await api.playNext(ids);
         // Refresh explicitly as well as listening for the event, so the panel
         // is right even if the event is missed, and say so either way.
         await player.refreshQueue();
@@ -67,7 +70,7 @@ const items = computed<Item[]>(() => {
       label: "Add to Queue",
       icon: "addToQueue",
       action: async () => {
-        await api.addToQueue(trackIds.value);
+        await api.addToQueue(ids);
         await player.refreshQueue();
         ui.notify(`Added ${what} to the queue`);
       },
@@ -75,7 +78,7 @@ const items = computed<Item[]>(() => {
     {
       label: "Add to Playlist",
       icon: "addToPlaylist",
-      action: () => (ui.addToPlaylistFor = m.tracks),
+      action: () => (ui.addToPlaylistFor = tracks),
     },
     {
       label: "Go to Artist",

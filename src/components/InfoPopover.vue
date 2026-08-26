@@ -31,8 +31,8 @@ const effectiveRate = computed(() => {
       <header class="info__head">
         <Artwork :artwork-id="track.artworkId" :size="56" :radius="6" />
         <div class="info__title">
-          <div class="info__name">{{ track.title }}</div>
-          <div class="info__artist truncate">{{ track.artist }}</div>
+          <div class="info__name clamp" :title="track.title">{{ track.title }}</div>
+          <div class="info__artist clamp clamp-1" :title="track.artist">{{ track.artist }}</div>
         </div>
         <button class="icon-button" aria-label="Close" @click="ui.infoTrack = null">
           <PnmIcon name="close" :size="16" />
@@ -40,13 +40,13 @@ const effectiveRate = computed(() => {
       </header>
 
       <dl class="info__list">
-        <div><dt>Artist</dt><dd class="truncate">{{ track.artist }}</dd></div>
-        <div><dt>Album</dt><dd class="truncate">{{ track.album }}</dd></div>
+        <div><dt>Artist</dt><dd class="clamp" :title="track.artist">{{ track.artist }}</dd></div>
+        <div v-if="track.album"><dt>Album</dt><dd class="clamp" :title="track.album">{{ track.album }}</dd></div>
         <div><dt>Release</dt><dd>{{ track.year ?? "Unknown" }}</dd></div>
-        <div v-if="track.genre"><dt>Genre</dt><dd class="truncate">{{ track.genre }}</dd></div>
+        <div v-if="track.genre"><dt>Genre</dt><dd class="clamp clamp-1">{{ track.genre }}</dd></div>
         <div>
           <dt>ID</dt>
-          <dd class="info__mono truncate">{{ track.musicbrainzRecordingId ?? track.id }}</dd>
+          <dd class="info__mono clamp clamp-1">{{ track.musicbrainzRecordingId ?? track.id }}</dd>
         </div>
       </dl>
 
@@ -78,7 +78,7 @@ const effectiveRate = computed(() => {
         <dl class="info__list">
           <div>
             <dt>Device</dt>
-            <dd class="truncate">{{ player.snapshot.deviceName || "Unknown" }}</dd>
+            <dd class="clamp clamp-1">{{ player.snapshot.deviceName || "Unknown" }}</dd>
           </div>
           <div><dt>Device Rate</dt><dd>{{ formatHz(player.snapshot.deviceSampleRate) }}</dd></div>
           <div v-if="effectiveRate">

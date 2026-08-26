@@ -39,6 +39,10 @@ thiserror = "2"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4", "serde"] }
 urlencoding = "2"
+# Media controls. zbus rather than the default dbus binding, so a Linux build
+# stays pure Rust and self-contained; irrelevant on macOS, which uses
+# MPNowPlayingInfoCenter.
+souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
 
 [profile.release]
 codegen-units = 1

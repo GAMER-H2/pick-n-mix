@@ -15,8 +15,6 @@ export const useUiStore = defineStore("ui", () => {
   const contextMenu = ref<ContextMenuState | null>(null);
   const infoTrack = ref<Track | null>(null);
   const queueOpen = ref(false);
-  /** The full-screen now-playing takeover. */
-  const nowPlayingOpen = ref(false);
   const addToPlaylistFor = ref<Track[] | null>(null);
   const toast = ref<{ message: string; kind: "info" | "error" } | null>(null);
   let toastTimer: number | undefined;
@@ -39,7 +37,6 @@ export const useUiStore = defineStore("ui", () => {
     contextMenu,
     infoTrack,
     queueOpen,
-    nowPlayingOpen,
     addToPlaylistFor,
     toast,
     openContextMenu,

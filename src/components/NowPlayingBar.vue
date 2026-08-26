@@ -5,12 +5,15 @@
  * and queue toggles on the right.
  */
 import { computed, ref } from "vue";
+import { useRoute, useRouter } from "vue-router";
+import { useDismiss } from "@/lib/dismiss";
 import PnmIcon from "./icons/PnmIcon.vue";
 import Artwork from "./Artwork.vue";
 import AppSlider from "./AppSlider.vue";
 import MixerPopover from "./mixer/MixerPopover.vue";
 import InfoPopover from "./InfoPopover.vue";
-import { formatDuration, subtitleFor } from "@/lib/format";
+import { formatDuration } from "@/lib/format";
+import { stableAlbumId, stableArtistId } from "@/lib/ids";
 import { usePlayerStore } from "@/stores/player";
 import { useMixerStore } from "@/stores/mixer";
 import { useUiStore } from "@/stores/ui";
@@ -18,13 +21,27 @@ import { useUiStore } from "@/stores/ui";
 const player = usePlayerStore();
 const mixer = useMixerStore();
 const ui = useUiStore();
+const route = useRoute();
+const router = useRouter();
 
 const SKIP_SECONDS = 10;
+/** Quarters, so the level can be set exactly without fighting the pointer. */
+const VOLUME_DETENTS = [0, 0.25, 0.5, 0.75, 1];
 
 const track = computed(() => player.track);
-const subtitle = computed(() =>
-  track.value ? subtitleFor([track.value.album, track.value.artist, track.value.year]) : "",
-);
+
+const volumeIcon = computed(() => {
+  const level = player.snapshot.volume;
+  if (level === 0) return "volumeOff";
+  return level < 0.5 ? "volumeLow" : "volume";
+});
+function goToArtist() {
+  if (track.value) router.push({ name: "artist", params: { id: stableArtistId(track.value) } });
+}
+
+function goToAlbum() {
+  if (track.value) router.push({ name: "album", params: { id: stableAlbumId(track.value) } });
+}
 
 /** Any effect audibly engaged, which lights up the mixer button. */
 const mixerActive = computed(() => {
@@ -42,6 +59,26 @@ const mixerActive = computed(() => {
 });
 
 const scrubValue = ref(0);
+
+const mixerPopover = ref<HTMLElement | null>(null);
+const mixerButton = ref<HTMLElement | null>(null);
+const infoPopover = ref<HTMLElement | null>(null);
+const infoButton = ref<HTMLElement | null>(null);
+
+// Clicking anywhere else dismisses either popover. The trigger is ignored so
+// its own click still toggles rather than closing and immediately reopening.
+useDismiss(
+  () => mixer.popoverOpen,
+  () => (mixer.popoverOpen = false),
+  mixerPopover,
+  { ignore: [mixerButton] },
+);
+useDismiss(
+  () => ui.infoTrack !== null,
+  () => (ui.infoTrack = null),
+  infoPopover,
+  { ignore: [infoButton] },
+);
 
 function onScrubStart() {
   player.scrubbing = true;
@@ -64,19 +101,29 @@ function skip(seconds: number) {
   player.seek(next);
 }
 
+const onNowPlaying = computed(() => route.name === "nowPlaying");
+
 /** Shift keeps the compact side panel; a plain click opens the takeover. */
 function onQueueButton(event: MouseEvent) {
   if (event.shiftKey) {
-    ui.nowPlayingOpen = false;
+    if (onNowPlaying.value) router.back();
     ui.queueOpen = !ui.queueOpen;
     return;
   }
   ui.queueOpen = false;
-  ui.nowPlayingOpen = !ui.nowPlayingOpen;
+  // Navigation, so back and forward close and reopen it like any page.
+  if (onNowPlaying.value) router.back();
+  else router.push({ name: "nowPlaying" });
 }
 
-async function openMixer() {
-  if (!mixer.popoverOpen) await mixer.editGlobal();
+/** Shift skips the compact bubble and opens the full panel. */
+async function openMixer(event: MouseEvent) {
+  await mixer.editGlobal();
+  if (event.shiftKey) {
+    mixer.popoverOpen = false;
+    mixer.panelOpen = true;
+    return;
+  }
   mixer.popoverOpen = !mixer.popoverOpen;
 }
 </script>
@@ -87,11 +134,33 @@ async function openMixer() {
     <div class="bar__now">
       <Artwork :artwork-id="track?.artworkId" :size="46" :radius="5" shadow />
       <div class="bar__text">
-        <div class="bar__title truncate">{{ track?.title ?? "Nothing Playing" }}</div>
-        <div class="bar__subtitle truncate">{{ subtitle }}</div>
+        <div class="bar__title truncate" :title="track?.title ?? ''">
+          {{ track?.title ?? "Nothing Playing" }}
+        </div>
+        <div class="bar__subtitle truncate">
+          <button
+            v-if="track"
+            class="bar__link"
+            :title="`Go to ${track.artist}`"
+            @click="goToArtist"
+          >
+            {{ track.artist }}
+          </button>
+          <template v-if="track?.album">
+            <span class="bar__sep">·</span>
+            <button class="bar__link" :title="`Go to ${track.album}`" @click="goToAlbum">
+              {{ track.album }}
+            </button>
+          </template>
+          <template v-if="track?.year">
+            <span class="bar__sep">·</span>
+            <span>{{ track.year }}</span>
+          </template>
+        </div>
       </div>
       <div class="bar__info">
         <button
+          ref="infoButton"
           class="icon-button"
           :disabled="!track"
           aria-label="Track information"
@@ -100,7 +169,7 @@ async function openMixer() {
           <PnmIcon name="info" :size="17" />
         </button>
         <Teleport to="body">
-          <div v-if="ui.infoTrack" class="bar__popover bar__popover--info">
+          <div v-if="ui.infoTrack" ref="infoPopover" class="pnm-popover pnm-popover--info">
             <InfoPopover />
           </div>
         </Teleport>
@@ -177,29 +246,40 @@ async function openMixer() {
     <!-- Right: mixer and playback modes -->
     <div class="bar__right">
       <div class="bar__volume">
-        <PnmIcon :name="player.snapshot.volume === 0 ? 'volumeMute' : 'volume'" :size="15" />
+        <button
+          class="bar__mute"
+          :title="player.muted ? 'Unmute' : 'Mute'"
+          :aria-label="player.muted ? 'Unmute' : 'Mute'"
+          :aria-pressed="player.muted"
+          @click="player.toggleMute()"
+        >
+          <PnmIcon :name="volumeIcon" :size="15" />
+        </button>
         <AppSlider
           :model-value="player.snapshot.volume"
+          :detents="VOLUME_DETENTS"
           @update:model-value="player.setVolume($event)"
         />
       </div>
 
       <div class="bar__mixer">
         <button
+          ref="mixerButton"
           class="icon-button"
-          :class="{ 'is-active': mixerActive || mixer.popoverOpen }"
-          title="DJ Mixer"
+          :class="{ 'is-active': mixerActive || mixer.popoverOpen || mixer.panelOpen }"
+          title="DJ Mixer (hold Shift for the advanced panel)"
           aria-label="DJ Mixer"
           @click="openMixer"
         >
           <PnmIcon name="mixer" :size="19" />
         </button>
-        <Transition name="pop">
-          <div v-if="mixer.popoverOpen" class="bar__popover">
-            <MixerPopover />
-          </div>
-        </Transition>
-        <div v-if="mixer.popoverOpen" class="bar__scrim" @click="mixer.popoverOpen = false" />
+        <Teleport to="body">
+          <Transition name="pop">
+            <div v-if="mixer.popoverOpen" ref="mixerPopover" class="pnm-popover pnm-popover--mixer">
+              <MixerPopover />
+            </div>
+          </Transition>
+        </Teleport>
       </div>
 
       <button
@@ -224,7 +304,7 @@ async function openMixer() {
 
       <button
         class="icon-button"
-        :class="{ 'is-active': ui.nowPlayingOpen || ui.queueOpen }"
+        :class="{ 'is-active': onNowPlaying || ui.queueOpen }"
         title="Playing Next (hold Shift for the side panel)"
         aria-label="Playing next"
         @click="onQueueButton"
@@ -266,8 +346,30 @@ async function openMixer() {
 }
 
 .bar__subtitle {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
   font-size: 11.5px;
   color: var(--text-secondary);
+}
+
+.bar__link {
+  font: inherit;
+  color: inherit;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bar__link:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+.bar__sep {
+  flex: none;
+  opacity: 0.6;
 }
 
 .bar__info {
@@ -350,34 +452,25 @@ async function openMixer() {
   min-width: 0;
 }
 
+.bar__mute {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  color: inherit;
+  border-radius: var(--radius-sm);
+  padding: 3px;
+  transition: color 0.15s var(--ease);
+}
+
+.bar__mute:hover {
+  color: var(--text);
+}
+
 .bar__mixer {
   position: relative;
 }
 
-.bar__popover {
-  position: absolute;
-  bottom: calc(100% + 12px);
-  right: -6px;
-  z-index: 300;
-  border-radius: var(--radius-lg);
-  background: var(--bg-elevated);
-  border: 0.5px solid var(--separator);
-  box-shadow: var(--shadow-popover);
-  transform-origin: bottom right;
-}
 
-/* The info bubble is teleported, so it positions against the window. */
-.bar__popover--info {
-  position: fixed;
-  bottom: calc(var(--player-height) + 12px);
-  left: 14px;
-  right: auto;
-  transform-origin: bottom left;
-}
 
-.bar__scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 290;
-}
 </style>

@@ -85,6 +85,14 @@ Rain, TV static, fireplace and the rest need audio files. Drop them into:
 named after the filter (`rain.wav`, `tv-static.flac`, …). Any extra file you add
 becomes a filter of its own. Ones with no file are shown greyed out.
 
+## System integration
+
+Transport keys and the desktop media widget work through
+[souvlaki](https://crates.io/crates/souvlaki): MPRIS on Linux (KDE's panel and
+media keys) and `MPNowPlayingInfoCenter` on macOS. On macOS this needs the
+bundled `.app`, not the bare binary, for the system to recognise the process as
+a media app.
+
 ## Keyboard
 
 | Key | Action |
@@ -98,6 +106,11 @@ becomes a filter of its own. Ones with no file are shown greyed out.
 
 The queue button opens the full-screen now-playing view; hold <kbd>Shift</kbd>
 for the compact side panel instead. In either, drag a row by its handle to
-reorder and click its artwork to jump to it.
+reorder and click its artwork to jump to it. The full-screen view is a route,
+so back and forward close and reopen it like any other page.
+
+Hold <kbd>Shift</kbd> on the mixer button to skip the bubble and open the
+advanced panel. Hold <kbd>Shift</kbd> while dragging the volume slider to
+bypass the quarter detents.
 
 Shortcuts are ignored while a text field has focus.

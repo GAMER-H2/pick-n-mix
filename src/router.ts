@@ -11,6 +11,11 @@ export const router = createRouter({
     { path: "/", name: "home", component: () => import("./views/HomeView.vue") },
     { path: "/library", name: "library", component: () => import("./views/LibraryView.vue") },
     {
+      path: "/now-playing",
+      name: "nowPlaying",
+      component: () => import("./views/NowPlayingView.vue"),
+    },
+    {
       path: "/playlist/:id",
       name: "playlist",
       component: () => import("./views/PlaylistView.vue"),

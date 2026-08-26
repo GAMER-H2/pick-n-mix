@@ -8,6 +8,7 @@
  * correct for every image, and costs one already-cached decode.
  */
 import { computed } from "vue";
+import { useRouter } from "vue-router";
 import PnmIcon from "./icons/PnmIcon.vue";
 import Artwork from "./Artwork.vue";
 import QueueList from "./QueueList.vue";
@@ -18,9 +19,11 @@ import { useUiStore } from "@/stores/ui";
 
 const player = usePlayerStore();
 const ui = useUiStore();
+const router = useRouter();
 
 const track = computed(() => player.track);
 const backdrop = computed(() => artUrl(track.value?.artworkId));
+const subtitle = computed(() => subtitleFor([track.value?.artist, track.value?.album]));
 const items = computed(() => player.queue.items);
 const current = computed(() => player.queue.currentIndex);
 
@@ -53,7 +56,7 @@ function openMenu(index: number, event: MouseEvent) {
     <div class="screen__veil" aria-hidden="true" />
 
     <header class="screen__bar">
-      <div class="screen__from truncate">
+      <div class="screen__from clamp clamp-1" :title="player.queue.context?.name ?? 'your library'">
         <span class="screen__from-label">Playing from</span>
         <strong>{{ player.queue.context?.name ?? "your library" }}</strong>
       </div>
@@ -61,7 +64,7 @@ function openMenu(index: number, event: MouseEvent) {
         class="icon-button screen__close"
         aria-label="Close now playing"
         title="Close"
-        @click="ui.nowPlayingOpen = false"
+        @click="router.back()"
       >
         <PnmIcon name="collapse" :size="19" />
       </button>
@@ -71,8 +74,10 @@ function openMenu(index: number, event: MouseEvent) {
       <div class="screen__art">
         <Artwork :artwork-id="track?.artworkId" :size="380" :radius="12" shadow />
         <div class="screen__meta">
-          <h1 class="truncate">{{ track?.title ?? "Nothing Playing" }}</h1>
-          <p class="truncate">{{ subtitleFor([track?.artist, track?.album]) }}</p>
+          <h1 class="clamp" :title="track?.title ?? ''">
+            {{ track?.title ?? "Nothing Playing" }}
+          </h1>
+          <p class="clamp" :title="subtitle">{{ subtitle }}</p>
           <p v-if="player.duration > 0" class="screen__time">
             {{ formatDuration(player.position) }} / {{ formatDuration(player.duration) }}
           </p>
@@ -222,6 +227,7 @@ function openMenu(index: number, event: MouseEvent) {
 
 .screen__meta h1 {
   margin: 0;
+  --clamp-lines: 3;
   font-size: 27px;
   font-weight: 700;
   letter-spacing: -0.02em;

@@ -3,12 +3,12 @@
  * Application shell: sidebar, the routed view, optional right-hand panels,
  * and the player bar along the bottom.
  */
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import Sidebar from "./components/Sidebar.vue";
 import NowPlayingBar from "./components/NowPlayingBar.vue";
 import QueuePanel from "./components/QueuePanel.vue";
-import NowPlayingScreen from "./components/NowPlayingScreen.vue";
 import AdvancedMixer from "./components/mixer/AdvancedMixer.vue";
 import ContextMenu from "./components/ContextMenu.vue";
 import AddToPlaylistDialog from "./components/AddToPlaylistDialog.vue";
@@ -25,6 +25,10 @@ const library = useLibraryStore();
 const playlists = usePlaylistStore();
 const mixer = useMixerStore();
 const ui = useUiStore();
+const route = useRoute();
+const router = useRouter();
+
+const isNowPlaying = computed(() => route.name === "nowPlaying");
 
 const unlisteners = ref<UnlistenFn[]>([]);
 let removeShortcuts: (() => void) | null = null;
@@ -37,16 +41,15 @@ onMounted(async () => {
   applyTheme();
   media.addEventListener("change", applyTheme);
 
-  removeShortcuts = installShortcuts(player, ui);
-
-  await Promise.all([library.refresh(), playlists.refresh(), player.refresh(), mixer.refresh()]);
+  removeShortcuts = installShortcuts(player, ui, router);
 
   unlisteners.value = await Promise.all([
     listen<PlaybackSnapshot>("playback", (e) => player.applySnapshot(e.payload)),
     listen<Track | null>("track-changed", (e) => {
       player.track = e.payload;
-      // The track layer of the cascade changed with it.
-      mixer.refresh();
+      // The track layer of the cascade changed with it, but the preset list
+      // and filter catalogue did not, so avoid the disk-reading variant.
+      mixer.refreshLayers();
     }),
     listen<QueueView>("queue-changed", (e) => (player.queue = e.payload)),
     listen<boolean>("playing-changed", () => player.refresh()),
@@ -60,6 +63,11 @@ onMounted(async () => {
     ),
     listen<string>("engine-error", (e) => ui.notify(e.payload, "error")),
   ]);
+
+  // Listeners first, then the initial fetch: an event emitted between the two
+  // would otherwise be missed, leaving the UI showing nothing while the engine
+  // is already playing.
+  await Promise.all([library.refresh(), playlists.refresh(), player.refresh(), mixer.refresh()]);
 });
 
 onBeforeUnmount(() => {
@@ -73,22 +81,18 @@ onBeforeUnmount(() => {
     <div class="app__body">
       <Sidebar />
 
-      <main v-if="ui.nowPlayingOpen" class="app__screen">
-        <NowPlayingScreen />
-      </main>
-
-      <main v-else class="app__main scroll-area">
+      <main class="app__main" :class="{ 'is-screen': isNowPlaying }">
         <!-- Draggable strip beneath the overlay title bar. -->
-        <div class="app__titlebar" data-tauri-drag-region />
+        <div v-if="!isNowPlaying" class="app__titlebar" data-tauri-drag-region />
         <RouterView v-slot="{ Component }">
-          <Transition name="fade" mode="out-in">
+          <Transition :name="isNowPlaying ? 'rise' : 'fade'" mode="out-in">
             <component :is="Component" />
           </Transition>
         </RouterView>
       </main>
 
       <Transition name="slide-panel">
-        <QueuePanel v-if="ui.queueOpen && !ui.nowPlayingOpen" />
+        <QueuePanel v-if="ui.queueOpen && !isNowPlaying" />
       </Transition>
 
       <Transition name="slide-panel">
@@ -131,13 +135,15 @@ onBeforeUnmount(() => {
 .app__main {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   position: relative;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
-.app__screen {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
+/* The full-screen player manages its own layout and must not scroll. */
+.app__main.is-screen {
+  overflow: hidden;
 }
 
 .app__titlebar {

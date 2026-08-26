@@ -118,8 +118,13 @@ function onHandleCancel() {
         </button>
 
         <div class="row__text">
-          <div class="row__title truncate">{{ track.title }}</div>
-          <div class="row__subtitle truncate">
+          <div class="row__title clamp" :class="{ 'clamp-1': !roomy }" :title="track.title">
+            {{ track.title }}
+          </div>
+          <div
+            class="row__subtitle clamp clamp-1"
+            :title="subtitleFor([track.artist, track.album])"
+          >
             {{ subtitleFor([track.artist, track.album]) }}
           </div>
         </div>

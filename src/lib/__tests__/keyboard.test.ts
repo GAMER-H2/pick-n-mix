@@ -124,22 +124,23 @@ describe("keyboard shortcuts", () => {
 });
 
 describe("escape closes overlays", () => {
-  function makeUi() {
-    return { nowPlayingOpen: false, queueOpen: false };
+  function makeRouter(routeName: string) {
+    return { back: vi.fn(), currentRoute: { value: { name: routeName } } };
   }
 
-  it("closes the full-screen view before the side panel", () => {
+  it("leaves the full-screen view before closing the side panel", () => {
     const player = makePlayer();
-    const ui = makeUi();
-    ui.nowPlayingOpen = true;
-    ui.queueOpen = true;
+    const ui = { queueOpen: true };
+    const router = makeRouter("nowPlaying");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const off = installShortcuts(player as any, ui as any);
+    const off = installShortcuts(player as any, ui as any, router as any);
 
+    // The full-screen player is a route, so leaving it is a navigation.
     press("Escape");
-    expect(ui.nowPlayingOpen).toBe(false);
+    expect(router.back).toHaveBeenCalledTimes(1);
     expect(ui.queueOpen).toBe(true);
 
+    router.currentRoute.value.name = "library";
     press("Escape");
     expect(ui.queueOpen).toBe(false);
     off();
@@ -147,11 +148,13 @@ describe("escape closes overlays", () => {
 
   it("does nothing when no overlay is open", () => {
     const player = makePlayer();
-    const ui = makeUi();
+    const ui = { queueOpen: false };
+    const router = makeRouter("library");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const off = installShortcuts(player as any, ui as any);
+    const off = installShortcuts(player as any, ui as any, router as any);
     const event = press("Escape");
     expect(event.defaultPrevented).toBe(false);
+    expect(router.back).not.toHaveBeenCalled();
     expect(player.toggle).not.toHaveBeenCalled();
     off();
   });

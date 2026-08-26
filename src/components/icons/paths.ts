@@ -62,12 +62,12 @@ const DEFS = {
   back10: {
     mode: "stroke",
     // The arc ends exactly where the arrowhead's corner sits, so they join.
-    d: ["M3.8 12a8.2 8.2 0 1 0 2.7-6.1", "M6.5 2.2v3.7H2.8"],
+    d: ["M3.8 12a8.2 8.2 0 1 0 2.7-6.1", "M6.5 2.2v4.7h3.7"],
     text: { x: 12, y: 12, value: "10", size: 7 },
   },
   forward10: {
     mode: "stroke",
-    d: ["M20.2 12a8.2 8.2 0 1 1-2.7-6.1", "M17.5 2.2v3.7h3.7"],
+    d: ["M20.2 12a8.2 8.2 0 1 1-2.7-6.1", "M17.5 2.2v4.7H13.8"],
     text: { x: 12, y: 12, value: "10", size: 7 },
   },
   shuffle: {
@@ -176,6 +176,15 @@ const DEFS = {
   importFile: { mode: "stroke", d: ["M12 3.8v11.6", "M8.4 11.8 12 15.4l3.6-3.6", "M5.4 12.6v6a1.8 1.8 0 0 0 1.8 1.8h9.6a1.8 1.8 0 0 0 1.8-1.8v-6"] },
   sparkle: { mode: "stroke", d: ["M12 3.6 13.7 9 19.1 10.7 13.7 12.4 12 17.8 10.3 12.4 4.9 10.7 10.3 9z", "M18.4 16.2l.7 2.1 2.1.7-2.1.7-.7 2.1-.7-2.1-2.1-.7 2.1-.7z"] },
   volume: { mode: "stroke", d: ["M4.6 9.4h3.2L12.6 5v14L7.8 14.6H4.6z", "M16.2 9.2a4 4 0 0 1 0 5.6", "M18.9 6.5a7.8 7.8 0 0 1 0 11"] },
+  volumeLow: {
+    mode: "stroke",
+    d: ["M4.6 9.4h3.2L12.6 5v14L7.8 14.6H4.6z", "M16.2 9.2a4 4 0 0 1 0 5.6"],
+  },
+  volumeOff: {
+    mode: "stroke",
+    // A struck-through speaker: unmistakably "no sound", not just "quiet".
+    d: ["M4.6 9.4h3.2L12.6 5v14L7.8 14.6H4.6z", "M3.4 3.4 20.6 20.6"],
+  },
   volumeMute: { mode: "stroke", d: ["M4.6 9.4h3.2L12.6 5v14L7.8 14.6H4.6z", "M16.4 9.8 21 14.4", "M21 9.8 16.4 14.4"] },
   music: { mode: "stroke", d: ["M9.4 18V6.2l10-2v11.4"], circles: [{ cx: 6.6, cy: 18, r: 2.8 }, { cx: 16.6, cy: 15.6, r: 2.8 }] },
   clock: { mode: "stroke", d: ["M12 7.4V12l3 1.8"], circles: [{ cx: 12, cy: 12, r: 8.6 }] },

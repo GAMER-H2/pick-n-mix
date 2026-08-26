@@ -275,12 +275,28 @@ impl Db {
     /// tag can never leave a stale album behind.
     pub fn albums(&self) -> Result<Vec<Album>> {
         let mut out: Vec<Album> = Vec::new();
+        // Album id -> the distinct artists seen on its tracks.
+        let mut contributors: Vec<(String, Vec<String>)> = Vec::new();
+
         for track in self.all_tracks()? {
             // A track with no album tag is a single, not a member of an album.
             if track.album.trim().is_empty() {
                 continue;
             }
             let id = album_id_for(&track);
+            let who = album_artist_of(&track).to_string();
+            // Compared by lead artist, so a differently written guest credit
+            // does not turn a single-artist album into a compilation.
+            let lead = crate::library::model::lead_artist(&who);
+            match contributors.iter_mut().find(|(k, _)| *k == id) {
+                Some((_, leads)) => {
+                    if !leads.contains(&lead) {
+                        leads.push(lead);
+                    }
+                }
+                None => contributors.push((id.clone(), vec![lead])),
+            }
+
             match out.iter_mut().find(|a| a.id == id) {
                 Some(album) => {
                     album.track_count += 1;
@@ -295,7 +311,7 @@ impl Db {
                 None => out.push(Album {
                     id,
                     name: track.album.clone(),
-                    artist: album_artist_of(&track).to_string(),
+                    artist: who,
                     year: track.year,
                     track_count: 1,
                     duration_secs: track.duration_secs,
@@ -303,6 +319,15 @@ impl Db {
                 }),
             }
         }
+        // An album whose tracks are by several artists is a compilation.
+        for album in out.iter_mut() {
+            if let Some((_, leads)) = contributors.iter().find(|(k, _)| *k == album.id) {
+                if leads.len() > 1 {
+                    album.artist = VARIOUS_ARTISTS.to_string();
+                }
+            }
+        }
+
         out.sort_by(|a, b| {
             a.artist.to_lowercase().cmp(&b.artist.to_lowercase()).then(
                 a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -409,6 +434,7 @@ impl Db {
     }
 }
 
+/// Who to show for a track, falling back to the performing artist.
 pub fn album_artist_of(track: &Track) -> &str {
     if track.album_artist.trim().is_empty() {
         &track.artist
@@ -417,16 +443,27 @@ pub fn album_artist_of(track: &Track) -> &str {
     }
 }
 
+/// Identity of the album a track belongs to.
+///
+/// When the file carries a real album-artist tag, that plus the album name
+/// identifies it. When it does not, the album name alone does: a compilation
+/// has a different artist on every track, and keying on the performing artist
+/// would split it into one album per song.
+///
+/// The trade-off is that two untagged albums that share a title would merge.
+/// That is far rarer than the split it prevents.
 pub fn album_id_for(track: &Track) -> String {
-    stable_id(
-        "al",
-        &format!(
-            "{}|{}",
-            crate::library::model::normalise(album_artist_of(track)),
-            crate::library::model::normalise(&track.album)
-        ),
-    )
+    let album = crate::library::model::normalise(&track.album);
+    let tagged_artist = track.album_artist.trim();
+    if tagged_artist.is_empty() {
+        stable_id("al", &album)
+    } else {
+        stable_id("al", &format!("{}|{}", crate::library::model::normalise(tagged_artist), album))
+    }
 }
+
+/// Shown when an album's tracks are by more than one artist.
+pub const VARIOUS_ARTISTS: &str = "Various Artists";
 
 const TRACK_SELECT: &str = r#"
 SELECT id, source_id, location, title, artist, album_artist, album, track_number,
@@ -621,5 +658,114 @@ mod albumless_tests {
         assert_eq!(artists[0].album_count, 1);
         assert_eq!(artists[0].track_count, 2);
         assert_eq!(db.albums().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod compilation_tests {
+    use super::*;
+
+    fn comp_track(title: &str, artist: &str, album: &str, album_artist: &str, path: &str) -> Track {
+        Track {
+            id: stable_id("t", path),
+            source_id: "local".into(),
+            location: path.into(),
+            title: title.into(),
+            artist: artist.into(),
+            album_artist: album_artist.into(),
+            album: album.into(),
+            duration_secs: 200.0,
+            ..Default::default()
+        }
+    }
+
+    /// A soundtrack with a different artist on every track and no album-artist
+    /// tag used to become one album per song.
+    #[test]
+    fn a_compilation_with_no_album_artist_tag_stays_one_album() {
+        let db = Db::open_in_memory().unwrap();
+        for (i, artist) in ["Mike Shinoda", "Freya Ridings", "Marcus King"].iter().enumerate() {
+            db.upsert_track(&comp_track(
+                &format!("Track {i}"),
+                artist,
+                "Arcane Season Two",
+                "",
+                &format!("/m/arcane/{i}.flac"),
+            ))
+            .unwrap();
+        }
+
+        let albums = db.albums().unwrap();
+        assert_eq!(albums.len(), 1, "the soundtrack split into separate albums");
+        assert_eq!(albums[0].track_count, 3);
+        assert_eq!(albums[0].artist, VARIOUS_ARTISTS);
+    }
+
+    #[test]
+    fn a_real_album_artist_tag_still_separates_same_titled_albums() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&comp_track("A", "Band One", "Greatest Hits", "Band One", "/m/1.flac"))
+            .unwrap();
+        db.upsert_track(&comp_track("B", "Band Two", "Greatest Hits", "Band Two", "/m/2.flac"))
+            .unwrap();
+
+        let albums = db.albums().unwrap();
+        assert_eq!(albums.len(), 2, "tagged album artists must keep albums apart");
+    }
+
+    #[test]
+    fn an_album_by_one_artist_keeps_that_artists_name() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..3 {
+            db.upsert_track(&comp_track(
+                &format!("Track {i}"),
+                "One Band",
+                "Their Album",
+                "",
+                &format!("/m/one/{i}.flac"),
+            ))
+            .unwrap();
+        }
+
+        let albums = db.albums().unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "One Band", "not a compilation, so not Various Artists");
+    }
+
+    #[test]
+    fn every_track_of_a_compilation_resolves_to_the_same_album_page() {
+        let db = Db::open_in_memory().unwrap();
+        for (i, artist) in ["A", "B", "C"].iter().enumerate() {
+            db.upsert_track(&comp_track(
+                &format!("T{i}"),
+                artist,
+                "Comp",
+                "",
+                &format!("/m/comp/{i}.flac"),
+            ))
+            .unwrap();
+        }
+        let album_id = db.albums().unwrap()[0].id.clone();
+        assert_eq!(db.tracks_by_album(&album_id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_guest_feature_does_not_fragment_an_album() {
+        let db = Db::open_in_memory().unwrap();
+        // Same album artist, different performing artists: one album.
+        db.upsert_track(&comp_track("Solo", "TWRP", "A Human's Touch", "TWRP", "/m/t1.flac"))
+            .unwrap();
+        db.upsert_track(&comp_track(
+            "Duet",
+            "TWRP feat. McKenna Rae",
+            "A Human's Touch",
+            "TWRP",
+            "/m/t2.flac",
+        ))
+        .unwrap();
+
+        let albums = db.albums().unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "TWRP");
     }
 }

@@ -17,8 +17,24 @@ const props = withDefaults(
     disabled?: boolean;
     /** Slimmer styling for the player bar. */
     subtle?: boolean;
+    /**
+     * Values the handle sticks to, in the slider's own units. Holding Shift
+     * while dragging bypasses them for fine adjustment.
+     */
+    detents?: number[];
+    /** How close, as a fraction of the range, a detent grabs from. */
+    detentRadius?: number;
   }>(),
-  { min: 0, max: 1, step: 0.001, origin: null, disabled: false, subtle: false },
+  {
+    min: 0,
+    max: 1,
+    step: 0.001,
+    origin: null,
+    disabled: false,
+    subtle: false,
+    detents: () => [],
+    detentRadius: 0.035,
+  },
 );
 
 const emit = defineEmits<{
@@ -45,11 +61,25 @@ const originFraction = computed(() =>
 const fillLeft = computed(() => Math.min(fraction.value, originFraction.value));
 const fillWidth = computed(() => Math.abs(fraction.value - originFraction.value));
 
-function valueAt(clientX: number): number {
+/** Snap to the nearest detent when one is within reach. */
+function snap(value: number, bypass: boolean): number {
+  if (bypass || props.detents.length === 0) return value;
+  const reach = range.value * props.detentRadius;
+  let best: number | null = null;
+  for (const detent of props.detents) {
+    const distance = Math.abs(detent - value);
+    if (distance <= reach && (best === null || distance < Math.abs(best - value))) {
+      best = detent;
+    }
+  }
+  return best ?? value;
+}
+
+function valueAt(clientX: number, bypassDetents = false): number {
   const rect = el.value?.getBoundingClientRect();
   if (!rect || rect.width === 0) return props.modelValue;
   const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-  const raw = props.min + ratio * range.value;
+  const raw = snap(props.min + ratio * range.value, bypassDetents);
   const stepped = Math.round(raw / props.step) * props.step;
   // Rounding by step can drift outside the range at the extremes.
   return Math.min(props.max, Math.max(props.min, Number(stepped.toFixed(6))));
@@ -60,12 +90,12 @@ function onPointerDown(event: PointerEvent) {
   dragging.value = true;
   el.value?.setPointerCapture(event.pointerId);
   emit("start");
-  emit("update:modelValue", valueAt(event.clientX));
+  emit("update:modelValue", valueAt(event.clientX, event.shiftKey));
 }
 
 function onPointerMove(event: PointerEvent) {
   if (!dragging.value) return;
-  emit("update:modelValue", valueAt(event.clientX));
+  emit("update:modelValue", valueAt(event.clientX, event.shiftKey));
 }
 
 function onPointerUp(event: PointerEvent) {
@@ -115,6 +145,12 @@ function onKeydown(event: KeyboardEvent) {
         :style="{ left: `${fillLeft * 100}%`, width: `${fillWidth * 100}%` }"
       />
     </div>
+    <span
+      v-for="detent in detents"
+      :key="detent"
+      class="slider__detent"
+      :style="{ left: `${((detent - min) / range) * 100}%` }"
+    />
     <div class="slider__thumb" :style="{ left: `${fraction * 100}%` }" />
   </div>
 </template>
@@ -158,6 +194,25 @@ function onKeydown(event: KeyboardEvent) {
   bottom: 0;
   background: var(--accent);
   border-radius: 999px;
+}
+
+.slider__detent {
+  position: absolute;
+  top: 50%;
+  width: 2px;
+  height: 2px;
+  margin-left: -1px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  transform: translateY(-50%);
+  opacity: 0;
+  transition: opacity 0.12s var(--ease);
+  pointer-events: none;
+}
+
+.slider:hover .slider__detent,
+.slider.is-dragging .slider__detent {
+  opacity: 0.75;
 }
 
 .slider__thumb {

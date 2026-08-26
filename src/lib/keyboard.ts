@@ -6,6 +6,7 @@
  * music, and modifier combinations are left to the OS.
  */
 
+import type { Router } from "vue-router";
 import type { usePlayerStore } from "@/stores/player";
 import type { useUiStore } from "@/stores/ui";
 
@@ -24,7 +25,7 @@ function isTyping(target: EventTarget | null): boolean {
   );
 }
 
-export function installShortcuts(player: Player, ui?: Ui): () => void {
+export function installShortcuts(player: Player, ui?: Ui, router?: Router): () => void {
   async function onKeydown(event: KeyboardEvent) {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     if (isTyping(event.target)) return;
@@ -32,9 +33,9 @@ export function installShortcuts(player: Player, ui?: Ui): () => void {
     switch (event.key) {
       case "Escape":
         // Back out of the full-screen view first, then any open panel.
-        if (ui?.nowPlayingOpen) {
+        if (router && router.currentRoute.value.name === "nowPlaying") {
           event.preventDefault();
-          ui.nowPlayingOpen = false;
+          router.back();
         } else if (ui?.queueOpen) {
           event.preventDefault();
           ui.queueOpen = false;

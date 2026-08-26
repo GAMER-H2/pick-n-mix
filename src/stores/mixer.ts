@@ -52,6 +52,19 @@ export const useMixerStore = defineStore("mixer", () => {
     ),
   );
 
+  /**
+   * Re-read only the cascade. Presets and the filter catalogue come from disk
+   * and cannot have changed just because the track did.
+   */
+  async function refreshLayers() {
+    const layers = await api.mixerLayers();
+    global.value = layers.global;
+    if (target.value.kind === "global") {
+      targetLayer.value = clone(layers.global);
+      underlyingLayers.value = [];
+    }
+  }
+
   async function refresh() {
     const state = await api.mixerState();
     global.value = state.global;
@@ -194,6 +207,7 @@ export const useMixerStore = defineStore("mixer", () => {
     targetLabel,
     overriddenSections,
     refresh,
+    refreshLayers,
     editGlobal,
     editPlaylist,
     editPlaylistEntry,

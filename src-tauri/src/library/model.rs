@@ -56,6 +56,32 @@ pub fn normalise(s: &str) -> String {
         .join(" ")
 }
 
+/// The lead artist of a credit, with any featured guests removed.
+///
+/// "Lemaitre, Jennie A." and "Lemaitre feat. Jennie A." are the same act
+/// credited two ways. Comparing the lead alone stops an album being called a
+/// compilation just because its tracks spell the guest credit differently.
+///
+/// Only explicit feature markers and a comma split the string. "&" is left
+/// alone on purpose, so "Earth, Wind & Fire" is not mangled into "Earth" for
+/// one track and something else for another; every track of theirs reduces to
+/// the same lead, which is all this is used for.
+pub fn lead_artist(credit: &str) -> String {
+    const MARKERS: [&str; 6] = [" feat. ", " feat ", " ft. ", " ft ", " featuring ", " with "];
+    let lower = credit.to_lowercase();
+
+    let mut cut = lower.len();
+    for marker in MARKERS {
+        if let Some(at) = lower.find(marker) {
+            cut = cut.min(at);
+        }
+    }
+    if let Some(at) = lower.find(", ") {
+        cut = cut.min(at);
+    }
+    normalise(&lower[..cut])
+}
+
 pub fn match_key(artist: &str, title: &str, album: &str) -> String {
     format!("{}|{}|{}", normalise(artist), normalise(title), normalise(album))
 }
@@ -125,5 +151,40 @@ mod tests {
         assert_eq!(stable_id("t", "/music/a.flac"), stable_id("t", "/music/a.flac"));
         assert_ne!(stable_id("t", "/music/a.flac"), stable_id("t", "/music/b.flac"));
         assert!(stable_id("t", "x").starts_with("t_"));
+    }
+}
+
+#[cfg(test)]
+mod lead_artist_tests {
+    use super::*;
+
+    #[test]
+    fn feature_credits_reduce_to_the_lead() {
+        assert_eq!(lead_artist("Lemaitre, Jennie A."), "lemaitre");
+        assert_eq!(lead_artist("Lemaitre feat. Jennie A."), "lemaitre");
+        assert_eq!(lead_artist("TWRP, McKenna Rae"), "twrp");
+        assert_eq!(lead_artist("TWRP feat. McKenna Rae"), "twrp");
+        assert_eq!(lead_artist("Artist ft. Someone"), "artist");
+        assert_eq!(lead_artist("Artist featuring Someone"), "artist");
+    }
+
+    #[test]
+    fn an_ampersand_in_a_band_name_is_left_alone() {
+        // Splitting on "&" would break these; every track still agrees.
+        assert_eq!(lead_artist("Earth, Wind & Fire"), "earth");
+        assert_eq!(lead_artist("Earth, Wind & Fire"), lead_artist("Earth, Wind & Fire"));
+        assert_eq!(lead_artist("Simon & Garfunkel"), "simon garfunkel");
+    }
+
+    #[test]
+    fn genuinely_different_artists_stay_different() {
+        assert_ne!(lead_artist("Mike Shinoda"), lead_artist("Freya Ridings"));
+        assert_ne!(lead_artist("Marcus King"), lead_artist("Fever 333"));
+    }
+
+    #[test]
+    fn a_plain_name_is_just_normalised() {
+        assert_eq!(lead_artist("The Beatles"), "the beatles");
+        assert_eq!(lead_artist("  The   Beatles  "), "the beatles");
     }
 }
