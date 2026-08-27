@@ -1,8 +1,5 @@
 Small Tasks:
-- Playing a new track seems to make an audible clip briefly just and moment the track is played. Not entirely sure if this is the program or my audio device but I only notice it on this program so my suspicion is the former.
-- Full-screen queue view slide in is faster now but still quite choppy, a simple quick fade in and out over the current main page would probably be better now
-- Search on library page is non-functional. It should search the current view (songs, albums, artists)
-- Loaded over 1100+ songs into the library now to test scale capabilities of the application. Found scrolling through the queue, song list, album list, and artist list to be a bit laggy now. Figure out some changes with loading the content (I imagine the images are the main culprit) in a different dynamic way to cut down on resource usage to make the interface smooth as possible regardless of the number of tracks in the program
+
 
 Medium Tasks:
 - Duplicate song handling - same song gets collapsed into one, combining metadata in the program's database, file that is played back is the one with the highest quality (bitrate, sample rate, file type)

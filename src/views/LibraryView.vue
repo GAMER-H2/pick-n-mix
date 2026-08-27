@@ -13,7 +13,7 @@ import { formatTotal } from "@/lib/format";
 import { useLibraryStore } from "@/stores/library";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";
-import type { Track } from "@/lib/types";
+import type { Album, Artist, Track } from "@/lib/types";
 
 const library = useLibraryStore();
 const player = usePlayerStore();
@@ -42,16 +42,25 @@ function selectTab(next: Tab) {
 }
 const query = ref("");
 
-const filtered = computed<Track[]>(() => {
-  const q = query.value.trim().toLowerCase();
-  if (!q) return library.tracks;
-  return library.tracks.filter(
-    (t) =>
-      t.title.toLowerCase().includes(q) ||
-      t.artist.toLowerCase().includes(q) ||
-      t.album.toLowerCase().includes(q),
-  );
-});
+const normalizedQuery = computed(() => query.value.trim().toLocaleLowerCase());
+const matches = (...fields: Array<string | number | null | undefined>) => {
+  const q = normalizedQuery.value;
+  return !q || fields.some((field) => String(field ?? "").toLocaleLowerCase().includes(q));
+};
+
+const filteredTracks = computed<Track[]>(() =>
+  library.tracks.filter((track) =>
+    matches(track.title, track.artist, track.album, track.albumArtist, track.genre, track.year),
+  ),
+);
+const filteredAlbums = computed<Album[]>(() =>
+  library.albums.filter((album) => matches(album.name, album.artist, album.year)),
+);
+const filteredArtists = computed<Artist[]>(() =>
+  library.artists.filter((artist) => matches(artist.name)),
+);
+
+const searchPlaceholder = computed(() => `Search ${tab.value}`);
 
 const totalDuration = computed(() =>
   library.tracks.reduce((sum, t) => sum + t.durationSecs, 0),
@@ -70,7 +79,7 @@ async function chooseFolder() {
 }
 
 async function playFrom(index: number) {
-  await player.playTracks(filtered.value, index, {
+  await player.playTracks(filteredTracks.value, index, {
     kind: "library",
     id: "library",
     name: "Library",
@@ -113,7 +122,13 @@ onMounted(() => {
         <div class="library__tools">
           <div class="library__search">
             <PnmIcon name="search" :size="15" />
-            <input v-model="query" class="library__input" placeholder="Search" type="search" />
+            <input
+              v-model="query"
+              class="library__input"
+              :placeholder="searchPlaceholder"
+              :aria-label="searchPlaceholder"
+              type="search"
+            />
           </div>
           <button
             class="pill-button is-plain"
@@ -144,7 +159,7 @@ onMounted(() => {
       <!-- Songs -->
       <div v-if="tab === 'songs'" class="list">
         <TrackRow
-          v-for="(track, index) in filtered"
+          v-for="(track, index) in filteredTracks"
           :key="track.id"
           :track="track"
           show-artwork
@@ -153,13 +168,15 @@ onMounted(() => {
           @play="playFrom(index)"
           @menu="ui.openContextMenu({ x: $event.clientX, y: $event.clientY, tracks: [track] })"
         />
-        <p v-if="filtered.length === 0" class="list__empty">No songs match "{{ query }}".</p>
+        <p v-if="filteredTracks.length === 0" class="list__empty">
+          No songs match "{{ query }}".
+        </p>
       </div>
 
       <!-- Albums -->
       <div v-else-if="tab === 'albums'" class="grid">
         <button
-          v-for="album in library.albums"
+          v-for="album in filteredAlbums"
           :key="album.id"
           class="card"
           @click="router.push({ name: 'album', params: { id: album.id } })"
@@ -168,12 +185,15 @@ onMounted(() => {
           <div class="card__title truncate">{{ album.name }}</div>
           <div class="card__subtitle truncate">{{ album.artist }}</div>
         </button>
+        <p v-if="filteredAlbums.length === 0" class="grid__empty">
+          No albums match "{{ query }}".
+        </p>
       </div>
 
       <!-- Artists -->
       <div v-else class="grid grid--artists">
         <button
-          v-for="artist in library.artists"
+          v-for="artist in filteredArtists"
           :key="artist.id"
           class="card"
           @click="router.push({ name: 'artist', params: { id: artist.id } })"
@@ -184,6 +204,9 @@ onMounted(() => {
             {{ artist.albumCount }} {{ artist.albumCount === 1 ? "album" : "albums" }}
           </div>
         </button>
+        <p v-if="filteredArtists.length === 0" class="grid__empty">
+          No artists match "{{ query }}".
+        </p>
       </div>
     </template>
   </div>
@@ -330,6 +353,21 @@ onMounted(() => {
   gap: 2px;
   text-align: left;
   min-width: 0;
+  content-visibility: auto;
+  contain-intrinsic-block-size: 196px;
+}
+
+.grid--artists .card {
+  contain-intrinsic-block-size: 178px;
+}
+
+.grid__empty {
+  grid-column: 1 / -1;
+  padding: 40px 0;
+  margin: 0;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-tertiary);
 }
 
 .card :deep(.artwork) {

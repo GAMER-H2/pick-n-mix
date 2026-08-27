@@ -32,22 +32,6 @@ const router = useRouter();
 
 const isNowPlaying = computed(() => route.name === "nowPlaying");
 
-// The full-screen player slides; every other page cross-fades. Both
-// directions of a now-playing navigation use the slide, so it leaves the same
-// way it arrived.
-const previousRoute = ref<string | null>(null);
-router.afterEach((to, from) => {
-  previousRoute.value = (from.name as string | undefined) ?? null;
-  void to;
-});
-
-const transitionName = computed(() =>
-  isNowPlaying.value || previousRoute.value === "nowPlaying" ? "rise" : "fade",
-);
-const transitionMode = computed(() =>
-  transitionName.value === "rise" ? undefined : ("out-in" as const),
-);
-
 const unlisteners = ref<UnlistenFn[]>([]);
 let removeShortcuts: (() => void) | null = null;
 
@@ -108,15 +92,10 @@ onBeforeUnmount(() => {
       <main class="app__main" :class="{ 'is-screen': isNowPlaying }">
         <!-- Draggable strip beneath the overlay title bar. -->
         <div v-if="!isNowPlaying" class="app__titlebar" data-tauri-drag-region />
-        <RouterView v-slot="{ Component }">
-          <!-- No `out-in` for the rise: the whole point is that the player
-               slides *over* the page, which means both have to be mounted at
-               once. Ordinary page changes keep `out-in`, where overlapping
-               two in-flow pages would just shove the layout around. -->
-          <Transition :name="transitionName" :mode="transitionMode">
-            <component :is="Component" />
-          </Transition>
-        </RouterView>
+        <!-- The full-screen player owns its lightweight curtain fade. Keeping
+             the blurred view outside a route-level opacity transition avoids
+             re-compositing its filters on every animation frame. -->
+        <RouterView />
       </main>
 
       <Transition name="slide-panel">

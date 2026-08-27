@@ -170,6 +170,8 @@ function onHandleCancel() {
   align-items: center;
   gap: 9px;
   padding: 5px 6px;
+  content-visibility: auto;
+  contain-intrinsic-block-size: 54px;
   border-radius: var(--radius-sm);
 }
 

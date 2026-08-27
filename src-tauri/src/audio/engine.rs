@@ -189,7 +189,9 @@ enum Cmd {
     /// `CancelNext` because the worker must *stop asking* until something
     /// changes, rather than re-firing the request on the very next block for
     /// the rest of the track.
-    DeclineNext { token: u64 },
+    DeclineNext {
+        token: u64,
+    },
     Shutdown,
 }
 
@@ -460,8 +462,8 @@ where
 {
     let shared = Arc::clone(shared);
     let rate = config.sample_rate as f32;
-    // ~8 ms of fade, enough to make pause and resume click-free.
-    let fade_step = 1.0 / (rate * 0.008);
+    // A short ramp makes pauses, track changes and underrun recovery click-free.
+    let fade_step = 1.0 / (rate * 0.012);
     let mut fade = 0.0f32;
     let mut volume = shared.volume();
 
@@ -474,24 +476,34 @@ where
                     if let Ok(chunk) = consumer.read_chunk(queued) {
                         chunk.commit_all();
                     }
+                    // A load or seek can jump between unrelated waveform
+                    // values. Restart the short output ramp at silence so that
+                    // discontinuity cannot become an audible click.
+                    fade = 0.0;
                 }
 
-                let want_fade = if shared.playing.load(Ordering::Relaxed) {
-                    1.0
-                } else {
-                    0.0
-                };
+                let playing = shared.playing.load(Ordering::Relaxed);
                 let target_volume = shared.volume();
 
                 for frame in data.chunks_mut(channels) {
-                    // Glide both fade and volume so neither ever steps.
-                    fade += (want_fade - fade).clamp(-fade_step, fade_step);
+                    // The ring can be empty briefly while a decoder opens or
+                    // after a scheduling hiccup. Silence the envelope state on
+                    // underrun, otherwise it can reach full gain before the
+                    // first new sample arrives and recreate the discontinuity
+                    // that the load flush was intended to remove.
+                    let has_audio = consumer.slots() >= CHANNELS;
+                    if playing && !has_audio {
+                        fade = 0.0;
+                    } else {
+                        let want_fade = if playing { 1.0 } else { 0.0 };
+                        fade += (want_fade - fade).clamp(-fade_step, fade_step);
+                    }
                     volume += (target_volume - volume).clamp(-0.001, 0.001);
 
                     let (mut l, mut r) = (0.0f32, 0.0f32);
-                    // Once fully faded out, stop draining the ring so playback
-                    // resumes from exactly where it stopped.
-                    if fade > 1e-4 {
+                    // During a pause, keep consuming only for the brief fade-out.
+                    // Once silent, leave the ring untouched so resume is exact.
+                    if fade > 1e-4 && has_audio {
                         l = consumer.pop().unwrap_or(0.0);
                         r = consumer.pop().unwrap_or(0.0);
                     }
@@ -907,52 +919,52 @@ fn worker(
             // incoming track would start several seconds in, having silently
             // thrown away its own opening.
             if x >= crossfade.curve.fade_in_start as f64 {
-            let nx = next.as_mut().expect("checked by outer `if`");
-            let nx_speed = if nx.settings.enabled {
-                nx.settings.pitch.ratio()
-            } else {
-                1.0
-            };
-            if let Err(e) = nx.decoder.set_speed(nx_speed) {
-                let _ = events.send(EngineEvent::Error {
-                    message: e.to_string(),
-                });
-            }
-
-            let want_b = frames * CHANNELS;
-            let got_b = match nx.decoder.read(&mut interleaved_b[..want_b]) {
-                Ok(n) => n,
-                Err(e) => {
+                let nx = next.as_mut().expect("checked by outer `if`");
+                let nx_speed = if nx.settings.enabled {
+                    nx.settings.pitch.ratio()
+                } else {
+                    1.0
+                };
+                if let Err(e) = nx.decoder.set_speed(nx_speed) {
                     let _ = events.send(EngineEvent::Error {
                         message: e.to_string(),
                     });
-                    0
                 }
-            };
-            let frames_b = got_b / CHANNELS;
 
-            for ch in 0..CHANNELS {
-                for f in 0..frames {
-                    scratch_b[ch][f] = if f < frames_b {
-                        interleaved_b[f * CHANNELS + ch]
-                    } else {
-                        0.0
-                    };
+                let want_b = frames * CHANNELS;
+                let got_b = match nx.decoder.read(&mut interleaved_b[..want_b]) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = events.send(EngineEvent::Error {
+                            message: e.to_string(),
+                        });
+                        0
+                    }
+                };
+                let frames_b = got_b / CHANNELS;
+
+                for ch in 0..CHANNELS {
+                    for f in 0..frames {
+                        scratch_b[ch][f] = if f < frames_b {
+                            interleaved_b[f * CHANNELS + ch]
+                        } else {
+                            0.0
+                        };
+                    }
                 }
-            }
 
-            chains[nx.chain_ix].update(&nx.settings, nx.track_gain_db);
-            if nx.settings.enabled {
-                chains[nx.chain_ix].process_music(&mut scratch_b, frames);
-            }
-            chains[nx.chain_ix].apply_gain(&mut scratch_b, frames);
-
-            let gain_b = crossfade.curve.gain_in(x as f32);
-            for ch in 0..CHANNELS {
-                for f in 0..frames {
-                    mix[ch][f] += scratch_b[ch][f] * gain_b;
+                chains[nx.chain_ix].update(&nx.settings, nx.track_gain_db);
+                if nx.settings.enabled {
+                    chains[nx.chain_ix].process_music(&mut scratch_b, frames);
                 }
-            }
+                chains[nx.chain_ix].apply_gain(&mut scratch_b, frames);
+
+                let gain_b = crossfade.curve.gain_in(x as f32);
+                for ch in 0..CHANNELS {
+                    for f in 0..frames {
+                        mix[ch][f] += scratch_b[ch][f] * gain_b;
+                    }
+                }
             }
         }
 

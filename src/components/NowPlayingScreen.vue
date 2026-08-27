@@ -3,12 +3,11 @@
  * The full-screen "now playing" takeover: large artwork on the left, queue on
  * the right, over a backdrop built from the artwork itself.
  *
- * The background is the same image scaled up and heavily blurred rather than
- * an extracted palette. That gives the colours of the cover for free, stays
- * correct for every image, and costs one already-cached decode.
+ * The background uses the same artwork scaled up and blurred, giving each
+ * track a matching colour field without needing a separate palette service.
  */
-import { computed } from "vue";
-import { useRouter } from "vue-router";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { onBeforeRouteLeave, useRouter } from "vue-router";
 import PnmIcon from "./icons/PnmIcon.vue";
 import Artwork from "./Artwork.vue";
 import QueueList from "./QueueList.vue";
@@ -26,6 +25,46 @@ const backdrop = computed(() => artUrl(track.value?.artworkId));
 const subtitle = computed(() => subtitleFor([track.value?.artist, track.value?.album]));
 const items = computed(() => player.queue.items);
 const current = computed(() => player.queue.currentIndex);
+const queueReady = ref(false);
+const curtainVisible = ref(true);
+let queueTimer: number | null = null;
+let curtainFrame: number | null = null;
+
+onMounted(() => {
+  // Give the webview two paints to rasterize the static artwork blur and panel
+  // behind an opaque layer. Only that cheap layer changes opacity afterward.
+  curtainFrame = window.requestAnimationFrame(() => {
+    curtainFrame = window.requestAnimationFrame(() => {
+      curtainVisible.value = false;
+      curtainFrame = null;
+    });
+  });
+
+  // Populate the expensive queue only after the curtain has finished revealing
+  // the rest of the screen.
+  queueTimer = window.setTimeout(() => {
+    queueReady.value = true;
+    queueTimer = null;
+  }, 160);
+});
+
+onBeforeRouteLeave(async () => {
+  // Likewise, unmount the expensive list before the shell begins fading out.
+  if (queueTimer !== null) {
+    window.clearTimeout(queueTimer);
+    queueTimer = null;
+  }
+  queueReady.value = false;
+  curtainVisible.value = true;
+  await nextTick();
+  await new Promise<void>((resolve) => window.setTimeout(resolve, 110));
+  return true;
+});
+
+onBeforeUnmount(() => {
+  if (queueTimer !== null) window.clearTimeout(queueTimer);
+  if (curtainFrame !== null) window.cancelAnimationFrame(curtainFrame);
+});
 
 async function jump(index: number) {
   await api.playQueueIndex(index);
@@ -48,10 +87,7 @@ function openMenu(index: number, event: MouseEvent) {
 </script>
 
 <template>
-  <!-- `pnm-rises` is the hook the route transition uses to tell this apart
-       from an ordinary page: it is the element that slides, while whatever is
-       behind it stays still. Unscoped on purpose so global CSS can see it. -->
-  <section class="screen pnm-rises" :class="{ 'has-art': !!backdrop }">
+  <section class="screen" :class="{ 'has-art': !!backdrop }">
     <!-- Backdrop: the cover, blown up and blurred. -->
     <div v-if="backdrop" class="screen__backdrop" aria-hidden="true">
       <img :src="backdrop" alt="" draggable="false" />
@@ -87,10 +123,10 @@ function openMenu(index: number, event: MouseEvent) {
         </div>
       </div>
 
-      <aside class="screen__queue">
+      <aside class="screen__queue" :aria-busy="!queueReady">
         <h2>Playing Next</h2>
-        <div v-if="items.length === 0" class="screen__empty">Nothing queued.</div>
-        <div v-else class="screen__list scroll-area">
+        <div v-if="queueReady && items.length === 0" class="screen__empty">Nothing queued.</div>
+        <div v-else-if="queueReady" class="screen__list scroll-area">
           <QueueList
             :items="items"
             :current-index="current"
@@ -104,6 +140,12 @@ function openMenu(index: number, event: MouseEvent) {
         </div>
       </aside>
     </div>
+
+    <div
+      class="screen__curtain"
+      :class="{ 'is-visible': curtainVisible }"
+      aria-hidden="true"
+    />
   </section>
 </template>
 
@@ -119,12 +161,26 @@ function openMenu(index: number, event: MouseEvent) {
   color: var(--text);
 }
 
+.screen__curtain {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  background: var(--bg);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.1s ease-out;
+  will-change: opacity;
+}
+
+.screen__curtain.is-visible {
+  opacity: 1;
+}
+
 .screen__backdrop {
   position: absolute;
   inset: 0;
   overflow: hidden;
-  /* Forces its own compositor layer, so the 64px blur below is rasterised
-     once rather than on every frame of the slide. */
+  /* Keep the expensive blur on its own compositor layer. */
   transform: translateZ(0);
 }
 

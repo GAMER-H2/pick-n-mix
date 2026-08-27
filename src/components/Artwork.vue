@@ -25,7 +25,15 @@ watch(
     :class="{ 'has-shadow': shadow }"
     :style="{ width: `${size}px`, height: `${size}px`, borderRadius: `${radius}px` }"
   >
-    <img v-if="src" :src="src" alt="" draggable="false" @error="failed = true" />
+    <img
+      v-if="src"
+      :src="src"
+      alt=""
+      loading="lazy"
+      decoding="async"
+      draggable="false"
+      @error="failed = true"
+    />
     <PnmIcon v-else name="music" :size="Math.max(14, size * 0.36)" class="artwork__fallback" />
   </div>
 </template>

@@ -306,6 +306,7 @@ textarea {
   opacity: 0;
 }
 
+
 .pop-enter-active,
 .pop-leave-active {
   transition: opacity 0.16s var(--ease), transform 0.16s var(--ease);
@@ -315,38 +316,6 @@ textarea {
 .pop-leave-to {
   opacity: 0;
   transform: translateY(6px) scale(0.98);
-}
-
-/*
- * The full-screen player rises from the bottom over whatever page is already
- * on screen, which stays put and visible underneath.
- *
- * Only the player itself is transformed — it is lifted out of flow for the
- * duration so it genuinely overlays rather than displacing the page. The page
- * gets a transition too, but purely so Vue keeps it mounted until the slide
- * finishes; nothing about it actually changes.
- *
- * Transform only, no opacity: the player carries a heavily blurred backdrop,
- * and fading it forces that blur to be re-composited every frame.
- */
-.rise-enter-active.pnm-rises,
-.rise-leave-active.pnm-rises {
-  position: absolute;
-  inset: 0;
-  z-index: 3;
-  transition: transform 0.22s var(--ease);
-  will-change: transform;
-}
-
-.rise-enter-from.pnm-rises,
-.rise-leave-to.pnm-rises {
-  transform: translateY(100%);
-}
-
-/* Held in place, purely to stay mounted for the duration of the slide. */
-.rise-enter-active:not(.pnm-rises),
-.rise-leave-active:not(.pnm-rises) {
-  transition: opacity 0.22s var(--ease);
 }
 
 .slide-panel-enter-active,
