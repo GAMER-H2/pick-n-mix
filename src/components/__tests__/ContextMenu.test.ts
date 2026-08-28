@@ -57,6 +57,10 @@ function track(id: string, title: string): Track {
     musicbrainzReleaseId: null,
     gainDb: null,
     addedAt: 0,
+    fileCount: 1,
+    missingFileCount: 0,
+    effectiveFileId: `${id}-file`,
+    preferredFileId: null,
   };
 }
 
@@ -114,6 +118,43 @@ describe("context menu actions", () => {
     const labels = labelsOf(wrapper);
     expect(labels.some((l) => l.includes("Go to Album"))).toBe(false);
     expect(labels.some((l) => l.includes("Go to Artist"))).toBe(true);
+  });
+
+  it("offers duplicate management only for one merged song", async () => {
+    const ui = useUiStore();
+    const wrapper = mount(ContextMenu);
+    const duplicate = { ...track("t1", "One"), fileCount: 2 };
+
+    ui.openContextMenu({ x: 0, y: 0, tracks: [duplicate] });
+    await wrapper.vm.$nextTick();
+    expect(labelsOf(wrapper)).toContain("Show duplicate files");
+
+    const duplicateButton = wrapper.findAll("button").find((button) =>
+      button.text().includes("Show duplicate files"),
+    );
+    if (!duplicateButton) throw new Error("Expected the duplicate files action");
+    await duplicateButton.trigger("click");
+    expect(ui.duplicateTrack).toEqual(duplicate);
+
+    ui.openContextMenu({ x: 0, y: 0, tracks: [duplicate, track("t2", "Two")] });
+    await wrapper.vm.$nextTick();
+    expect(labelsOf(wrapper)).not.toContain("Show duplicate files");
+  });
+
+  it("uses warning styling when one of the duplicate files is missing", async () => {
+    const ui = useUiStore();
+    const wrapper = mount(ContextMenu);
+    ui.openContextMenu({
+      x: 0,
+      y: 0,
+      tracks: [{ ...track("t1", "One"), fileCount: 2, missingFileCount: 1 }],
+    });
+    await wrapper.vm.$nextTick();
+
+    const button = wrapper.findAll("button").find((item) =>
+      item.text().includes("Show duplicate files"),
+    );
+    expect(button?.find(".menu__icon.is-warning").exists()).toBe(true);
   });
 
   it("offers mixer settings only inside a playlist", async () => {

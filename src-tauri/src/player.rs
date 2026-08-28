@@ -324,6 +324,27 @@ impl Player {
             .map(|item| (order_index, item))
     }
 
+    /// Refresh one queue snapshot without disturbing its playlist mixer or any
+    /// other occurrence of the same logical song. The id guard prevents an I/O
+    /// result racing a queue mutation from overwriting a different entry.
+    pub fn refresh_track_at(&mut self, order_index: usize, track: Track) -> bool {
+        let Some(queue_index) = self.order.get(order_index).copied() else {
+            return false;
+        };
+        let Some(item) = self.queue.get_mut(queue_index) else {
+            return false;
+        };
+        if item.track.id != track.id {
+            return false;
+        }
+        item.track = track;
+        true
+    }
+
+    pub fn refresh_current_track(&mut self, track: Track) -> bool {
+        self.refresh_track_at(self.cursor, track)
+    }
+
     pub fn view(&self) -> QueueView {
         let items: Vec<Track> = self
             .order
@@ -500,6 +521,25 @@ mod tests {
         assert_eq!(p.current().unwrap().id, "t2");
         p.remove_at(0);
         assert_eq!(p.current().unwrap().id, "t2");
+    }
+
+    #[test]
+    fn refreshing_one_queue_snapshot_preserves_identity_and_other_entries() {
+        let mut p = Player::new();
+        p.set_queue(tracks(3), 1);
+        let mut refreshed = p.current().unwrap().clone();
+        refreshed.location = "/new/effective.flac".into();
+        refreshed.file_count = 2;
+
+        assert!(p.refresh_current_track(refreshed));
+        assert_eq!(p.current().unwrap().location, "/new/effective.flac");
+        assert_eq!(p.view().items[0].location, "/m/0.flac");
+        assert_eq!(p.view().items[2].location, "/m/2.flac");
+
+        let mut wrong = p.current().unwrap().clone();
+        wrong.id = "different-song".into();
+        assert!(!p.refresh_track_at(1, wrong));
+        assert_eq!(p.current().unwrap().id, "t1");
     }
 
     #[test]

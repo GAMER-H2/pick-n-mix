@@ -20,6 +20,7 @@ import type {
   ScanReport,
   StreamInfo,
   Track,
+  TrackFile,
 } from "./types";
 
 // -- library ---------------------------------------------------------------
@@ -35,6 +36,26 @@ export const artistTracks = (artistId: string) => invoke<Track[]>("artist_tracks
 export const getTrack = (id: string) => invoke<Track | null>("get_track", { id });
 export const search = (query: string) => invoke<Track[]>("search", { query });
 export const enrichTrack = (id: string) => invoke<Track | null>("enrich_track", { id });
+
+// -- duplicate files -------------------------------------------------------
+export const listTrackFiles = (songId: string) =>
+  invoke<TrackFile[]>("list_track_files", { songId });
+export const setPreferredTrackFile = (songId: string, fileId: string | null) =>
+  invoke<Track>("set_preferred_track_file", { songId, fileId });
+export const previewTrackFile = (songId: string, fileId: string) =>
+  invoke<void>("preview_track_file", { songId, fileId });
+export const stopTrackFilePreview = () => invoke<void>("stop_track_file_preview");
+export const restoreNeedsDestination = (path: string) =>
+  invoke<boolean>("restore_needs_destination", { path });
+export const relinkTrackFile = (
+  fileId: string,
+  path: string,
+  destinationFolder: string | null,
+) => invoke<Track>("relink_track_file", { fileId, path, destinationFolder });
+export const trashTrackFile = (fileId: string) =>
+  invoke<Track | null>("trash_track_file", { fileId });
+export const forgetMissingTrackFile = (fileId: string) =>
+  invoke<Track | null>("forget_missing_track_file", { fileId });
 
 // -- playback --------------------------------------------------------------
 export const playTracks = (request: {

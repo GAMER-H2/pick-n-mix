@@ -20,15 +20,22 @@ const router = useRouter();
 const el = ref<HTMLElement | null>(null);
 const menu = computed(() => ui.contextMenu);
 const track = computed(() => menu.value?.tracks[0] ?? null);
-/** Keep the menu inside the window. */
+/** Keep the complete menu inside the window, including conditional rows. */
 const position = computed(() => {
   const m = menu.value;
-  if (!m) return { left: "0px", top: "0px" };
+  const t = track.value;
+  if (!m || !t) return { left: "0px", top: "0px" };
+
+  const playlistRows = m.playlistId !== undefined && m.entryIndex !== undefined ? 2 : 0;
+  const duplicateRows = m.tracks.length === 1 && t.fileCount > 1 ? 1 : 0;
+  const buttonCount = 6 + (t.album.trim() === "" ? 0 : 1) + playlistRows + duplicateRows;
+  const separatorCount = 2 + (playlistRows > 0 ? 1 : 0);
   const width = 232;
-  const height = 300;
+  const height = Math.min(buttonCount * 31 + separatorCount * 11 + 10, window.innerHeight - 16);
+
   return {
-    left: `${Math.min(m.x, window.innerWidth - width - 8)}px`,
-    top: `${Math.min(m.y, window.innerHeight - height - 8)}px`,
+    left: `${Math.max(8, Math.min(m.x, window.innerWidth - width - 8))}px`,
+    top: `${Math.max(8, Math.min(m.y, window.innerHeight - height - 8))}px`,
   };
 });
 
@@ -39,6 +46,7 @@ interface Item {
   action: () => unknown;
   separated?: boolean;
   danger?: boolean;
+  warning?: boolean;
 }
 
 const items = computed<Item[]>(() => {
@@ -97,8 +105,25 @@ const items = computed<Item[]>(() => {
     });
   }
 
+  const showDuplicates = count === 1 && t.fileCount > 1;
+  if (showDuplicates) {
+    const hasMissingFiles = t.missingFileCount > 0;
+    list.push({
+      label: "Show duplicate files",
+      icon: hasMissingFiles ? "warningCircle" : "duplicateFiles",
+      warning: hasMissingFiles,
+      separated: true,
+      action: () => (ui.duplicateTrack = t),
+    });
+  }
+
   list.push(
-    { label: "Get Info", icon: "info", separated: true, action: () => (ui.infoTrack = t) },
+    {
+      label: "Get Info",
+      icon: "info",
+      separated: !showDuplicates,
+      action: () => (ui.infoTrack = t),
+    },
     {
       label: "Look Up Online",
       icon: "sparkle",
@@ -180,7 +205,12 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="run(item)"
         >
-          <PnmIcon :name="item.icon" :size="17" />
+          <PnmIcon
+            class="menu__icon"
+            :class="{ 'is-warning': item.warning }"
+            :name="item.icon"
+            :size="17"
+          />
           <span>{{ item.label }}</span>
         </button>
       </template>
@@ -199,6 +229,8 @@ onBeforeUnmount(() => {
   box-shadow: var(--shadow-popover);
   border: 0.5px solid var(--separator);
   transform-origin: top left;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
 }
 
 .menu__item {
@@ -216,6 +248,10 @@ onBeforeUnmount(() => {
 .menu__item:hover {
   background: var(--accent);
   color: var(--accent-contrast);
+}
+
+.menu__icon.is-warning {
+  color: #d7373f;
 }
 
 .menu__item.is-danger {

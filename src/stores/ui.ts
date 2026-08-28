@@ -14,6 +14,7 @@ export interface ContextMenuState {
 export const useUiStore = defineStore("ui", () => {
   const contextMenu = ref<ContextMenuState | null>(null);
   const infoTrack = ref<Track | null>(null);
+  const duplicateTrack = ref<Track | null>(null);
   const queueOpen = ref(false);
   const addToPlaylistFor = ref<Track[] | null>(null);
   const toast = ref<{ message: string; kind: "info" | "error" } | null>(null);
@@ -36,6 +37,7 @@ export const useUiStore = defineStore("ui", () => {
   return {
     contextMenu,
     infoTrack,
+    duplicateTrack,
     queueOpen,
     addToPlaylistFor,
     toast,

@@ -12,6 +12,7 @@ import QueuePanel from "./components/QueuePanel.vue";
 import AdvancedMixer from "./components/mixer/AdvancedMixer.vue";
 import ContextMenu from "./components/ContextMenu.vue";
 import AddToPlaylistDialog from "./components/AddToPlaylistDialog.vue";
+import DuplicateFilesDialog from "./components/DuplicateFilesDialog.vue";
 import { usePlayerStore } from "./stores/player";
 import { useLibraryStore } from "./stores/library";
 import { usePlaylistStore } from "./stores/playlists";
@@ -122,6 +123,7 @@ onBeforeUnmount(() => {
 
     <ContextMenu />
     <AddToPlaylistDialog />
+    <DuplicateFilesDialog />
   </div>
 </template>
 

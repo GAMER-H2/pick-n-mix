@@ -100,43 +100,26 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                 };
                 match event {
                     EngineEvent::TrackFinished => {
-                        let next = {
-                            let mut player = state.player.lock();
-                            player.advance(true).cloned()
-                        };
-                        match next {
-                            Some(track) => {
-                                state.sync_mixer();
-                                match state.engine.load(
-                                    std::path::PathBuf::from(&track.location),
-                                    0.0,
-                                    track.gain_db.unwrap_or(0.0),
-                                ) {
-                                    Ok(_) => {
-                                        state.engine.play();
-                                        let _ = app.emit("track-changed", Some(&track));
-                                        let _ =
-                                            app.emit("queue-changed", state.player.lock().view());
-                                    }
-                                    Err(e) => {
-                                        let _ = app.emit(
-                                            "engine-error",
-                                            format!("could not play {}: {e}", track.title),
-                                        );
-                                    }
-                                }
-                            }
-                            None => {
-                                state.engine.pause();
-                                let _ = app.emit("playing-changed", false);
-                                let _ = app.emit("queue-ended", ());
-                            }
+                        if state.is_previewing() {
+                            continue;
+                        }
+                        let has_next = state.player.lock().advance(true).is_some();
+                        if has_next {
+                            let _ = commands::start_current(&app, &state);
+                        } else {
+                            state.engine.pause();
+                            let _ = app.emit("playing-changed", false);
+                            let _ = app.emit("queue-ended", ());
                         }
                     }
                     EngineEvent::Error { message } => {
                         let _ = app.emit("engine-error", message);
                     }
                     EngineEvent::NeedNext { token } => {
+                        if state.is_previewing() {
+                            state.engine.decline_next(token);
+                            continue;
+                        }
                         // Resolved under the lock (cheap: no I/O), then acted
                         // on after dropping it — opening a decoder can take
                         // tens to hundreds of milliseconds, and holding the
@@ -148,36 +131,49 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                                 (
                                     order_index,
                                     item.track.id.clone(),
-                                    std::path::PathBuf::from(&item.track.location),
-                                    item.track.gain_db.unwrap_or(0.0),
                                     player.effective_mixer_for(item),
                                 )
                             })
                         };
                         match prepared {
-                            Some((order_index, track_id, path, gain_db, settings)) => {
+                            Some((order_index, track_id, settings)) => {
                                 let rate = state.engine.device_sample_rate();
-                                match crate::audio::decode::TrackDecoder::open(&path, rate) {
-                                    Ok(decoder) => state.engine.prepare_next(
-                                        decoder,
-                                        settings,
-                                        gain_db,
-                                        token,
-                                        order_index,
-                                        track_id,
-                                    ),
-                                    Err(e) => {
-                                        eprintln!(
-                                            "audio: could not prepare a crossfade into \
-                                             {}: {e}",
-                                            path.display()
-                                        );
-                                        // Decline rather than cancel: the file
-                                        // will not open on a retry either, and
-                                        // cancelling would have the worker ask
-                                        // again on the very next block.
+                                let files = match state.playback_files(&track_id) {
+                                    Ok(files) => files,
+                                    Err(error) => {
+                                        let _ = app.emit("engine-error", error.to_string());
                                         state.engine.decline_next(token);
+                                        continue;
                                     }
+                                };
+                                let mut opened = None;
+                                for file in files {
+                                    let path = std::path::PathBuf::from(&file.location);
+                                    if let Ok(decoder) =
+                                        crate::audio::decode::TrackDecoder::open(&path, rate)
+                                    {
+                                        opened = Some((decoder, file.gain_db.unwrap_or(0.0)));
+                                        break;
+                                    }
+                                }
+                                match opened {
+                                    Some((decoder, gain_db)) => {
+                                        if let Ok(Some(track)) = state.db.get_track(&track_id) {
+                                            state
+                                                .player
+                                                .lock()
+                                                .refresh_track_at(order_index, track);
+                                        }
+                                        state.engine.prepare_next(
+                                            decoder,
+                                            settings,
+                                            gain_db,
+                                            token,
+                                            order_index,
+                                            track_id,
+                                        );
+                                    }
+                                    None => state.engine.decline_next(token),
                                 }
                             }
                             // End of the queue, or a shuffled repeat-all wrap
@@ -192,6 +188,9 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                         order_index,
                         track_id,
                     } => {
+                        if state.is_previewing() {
+                            continue;
+                        }
                         {
                             let mut player = state.player.lock();
                             match player.jump_to(order_index) {
@@ -212,7 +211,7 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                                 }
                             }
                         }
-                        state.sync_mixer();
+                        state.sync_mixer_settings();
                         let current = state.player.lock().current().cloned();
                         let _ = app.emit("track-changed", &current);
                         let _ = app.emit("queue-changed", state.player.lock().view());
@@ -308,6 +307,14 @@ pub fn run() {
             commands::album_tracks,
             commands::artist_tracks,
             commands::get_track,
+            commands::list_track_files,
+            commands::set_preferred_track_file,
+            commands::preview_track_file,
+            commands::stop_track_file_preview,
+            commands::restore_needs_destination,
+            commands::relink_track_file,
+            commands::trash_track_file,
+            commands::forget_missing_track_file,
             commands::search,
             commands::enrich_track,
             // playback

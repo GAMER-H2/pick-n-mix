@@ -31,6 +31,7 @@ arc-swap = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 lofty = "0.22"
 walkdir = "2"
+trash = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 
 # misc

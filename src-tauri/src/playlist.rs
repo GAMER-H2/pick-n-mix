@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 
 use crate::audio::params::MixerSettings;
 use crate::library::db::Db;
-use crate::library::model::{stable_id, Track};
+use crate::library::model::{normalise, stable_id, Track};
 
 /// Marker so a stray `.json` is not mistaken for a playlist.
 pub const FORMAT_TAG: &str = "pick-n-mix.playlist";
@@ -181,12 +181,17 @@ impl Playlist {
         for (index, entry) in self.tracks.iter().enumerate() {
             // The stored path is tried first as a fast path, then we fall back
             // to matching on musical identity.
-            let by_path = entry
-                .local_path
-                .as_deref()
-                .filter(|p| Path::new(p).exists())
-                .map(|p| stable_id("t", p))
-                .and_then(|id| db.get_track(&id).ok().flatten());
+            let by_path = if let Some(path) = entry.local_path.as_deref() {
+                let direct = match db.file_by_location("local", path)? {
+                    Some(file) => db.get_track(&file.song_id)?,
+                    None => None,
+                };
+                direct
+                    .or(db.get_track(&stable_id("t", path))?)
+                    .filter(|track| normalise(&track.album) == normalise(&entry.album))
+            } else {
+                None
+            };
 
             let track = match by_path {
                 Some(t) => Some(t),
@@ -355,6 +360,27 @@ mod tests {
             resolved.items[0].track.as_ref().unwrap().location,
             "/mine/1.flac"
         );
+    }
+
+    #[test]
+    fn a_path_hint_never_crosses_album_boundaries() {
+        let db = Db::open_in_memory().unwrap();
+        let wrong = track("Song", "Artist", "Wrong Album", "/mine/wrong.flac");
+        let right = track("Song", "Artist", "Right Album", "/mine/right.flac");
+        db.upsert_track(&wrong).unwrap();
+        db.upsert_track(&right).unwrap();
+
+        let mut playlist = Playlist::default();
+        playlist.tracks.push(Entry {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Right Album".into(),
+            local_path: Some(wrong.location),
+            ..Default::default()
+        });
+
+        let resolved = playlist.resolve(&db).unwrap();
+        assert_eq!(resolved.items[0].track.as_ref().unwrap().id, right.id);
     }
 
     #[test]

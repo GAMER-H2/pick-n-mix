@@ -42,10 +42,14 @@ owns the same music, and to keep working as Pick n Mix grows.
 file it will usually be wrong, so entries are matched against the local library
 in descending order of confidence:
 
-1. `musicbrainzRecordingId`, when both sides have one.
-2. The normalised `artist|title|album` key — case, punctuation and repeated
+1. The path hint, when it resolves locally and its album still agrees.
+2. `musicbrainzRecordingId`, when both sides have one **and the albums agree**.
+3. The normalised `artist|title|album` key — case, punctuation and repeated
    whitespace are ignored, so "The Beatles" and "the  beatles" agree.
-3. `artist|title` alone, which catches the same song on a different release.
+
+Matching never falls back across albums. This prevents an album version,
+compilation appearance, live cut or remaster from silently resolving to a
+release the playlist did not name.
 
 An entry that matches nothing is **kept and shown greyed out**, never dropped.
 Add the music later and it lights up.

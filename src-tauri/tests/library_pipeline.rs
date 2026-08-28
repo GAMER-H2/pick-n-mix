@@ -102,7 +102,7 @@ fn rescanning_updates_rather_than_duplicates() {
 }
 
 #[test]
-fn deleted_files_drop_out_of_the_index() {
+fn deleted_files_remain_as_missing_versions_of_the_logical_song() {
     let (music, artwork, _) = fixture("deleted");
     let db = Db::open_in_memory().expect("opening db");
     let folders = vec![music.display().to_string()];
@@ -111,12 +111,16 @@ fn deleted_files_drop_out_of_the_index() {
     std::fs::remove_file(music.join("02 Slow Drift.wav")).expect("removing a file");
     scan::scan_folders(&db, &artwork, &folders, |_, _| {}).expect("second scan");
 
-    assert_eq!(db.track_count().expect("counting"), 2);
-    assert!(db
-        .all_tracks()
-        .unwrap()
+    assert_eq!(db.track_count().expect("counting"), 3);
+    let tracks = db.all_tracks().expect("listing tracks after deletion");
+    let missing = tracks
         .iter()
-        .all(|t| t.title != "02 Slow Drift"));
+        .find(|track| track.title == "02 Slow Drift")
+        .expect("retaining the logical song");
+    assert_eq!(missing.file_count, 1);
+    assert_eq!(missing.missing_file_count, 1);
+    assert!(missing.effective_file_id.is_none());
+    assert!(missing.location.is_empty());
 }
 
 #[test]
@@ -173,6 +177,33 @@ fn a_playlist_survives_being_shared_with_a_different_library() {
         0.4,
         "the playlist's mixer travelled with it"
     );
+}
+
+#[test]
+fn bundled_duplicate_demo_collapses_and_prefers_the_hires_flac() {
+    let music = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test-music/duplicate-demo");
+    let artwork = std::env::temp_dir().join("pnm-lib-test-duplicate-demo-artwork");
+    let _ = std::fs::remove_dir_all(&artwork);
+    std::fs::create_dir_all(&artwork).expect("creating artwork fixture dir");
+    let db = Db::open_in_memory().expect("opening db");
+
+    let report = scan::scan_folders(&db, &artwork, &[music.display().to_string()], |_, _| {})
+        .expect("scanning duplicate demo");
+    assert_eq!(report.scanned, 3);
+    assert!(
+        report.errors.is_empty(),
+        "unexpected errors: {:?}",
+        report.errors
+    );
+
+    let songs = db.all_tracks().expect("listing collapsed songs");
+    assert_eq!(songs.len(), 1, "the three versions should collapse");
+    let song = &songs[0];
+    assert_eq!(song.title, "Duplicate Quality Test");
+    assert_eq!(song.file_count, 3);
+    assert_eq!(song.format.as_deref(), Some("FLAC"));
+    assert_eq!(song.bits_per_sample, Some(24));
+    assert_eq!(song.sample_rate, Some(96_000));
 }
 
 #[test]

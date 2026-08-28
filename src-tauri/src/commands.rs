@@ -3,8 +3,9 @@
 //! Every command returns `Result<T, String>` because `anyhow::Error` is not
 //! serialisable; `err` turns any error into a message safe to show the user.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::{anyhow, bail, Context as _};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
@@ -13,7 +14,7 @@ use crate::audio::crossfade::CrossfadeSettings;
 use crate::audio::decode::StreamInfo;
 use crate::audio::params::{MixerSettings, Resolved};
 use crate::audio::PlaybackSnapshot;
-use crate::library::model::{Album, Artist, ScanReport, Track};
+use crate::library::model::{normalise, stable_id, Album, Artist, ScanReport, Track, TrackFile};
 use crate::library::scan;
 use crate::player::{Context, QueueItem, QueueView, Repeat};
 use crate::playlist::{self, Playlist};
@@ -106,6 +107,198 @@ pub fn get_track(state: State<'_, AppState>, id: String) -> Cmd<Option<Track>> {
 }
 
 #[tauri::command]
+pub fn list_track_files(state: State<'_, AppState>, song_id: String) -> Cmd<Vec<TrackFile>> {
+    state.db.files_for_song(&song_id).map_err(err)
+}
+
+#[tauri::command]
+pub fn set_preferred_track_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    song_id: String,
+    file_id: Option<String>,
+) -> Cmd<Track> {
+    state
+        .db
+        .set_preferred_file(&song_id, file_id.as_deref())
+        .map_err(err)?;
+    let track = state
+        .db
+        .get_track(&song_id)
+        .map_err(err)?
+        .ok_or_else(|| "song not found after setting its preferred file".to_string())?;
+    let _ = app.emit("library-changed", ());
+    Ok(track)
+}
+
+#[tauri::command]
+pub fn preview_track_file(state: State<'_, AppState>, song_id: String, file_id: String) -> Cmd<()> {
+    let file = state
+        .db
+        .file_by_id(&file_id)
+        .map_err(err)?
+        .ok_or_else(|| format!("file not found: {file_id}"))?;
+    let song = state
+        .db
+        .get_track(&song_id)
+        .map_err(err)?
+        .ok_or_else(|| format!("song not found: {song_id}"))?;
+    if file.song_id != song.id {
+        return Err(format!(
+            "file {file_id} does not belong to song {}",
+            song.id
+        ));
+    }
+    if !file.available {
+        return Err("that file is missing and cannot be previewed".into());
+    }
+    state.preview_file(&file).map_err(err)
+}
+
+#[tauri::command]
+pub fn stop_track_file_preview(state: State<'_, AppState>) -> Cmd<()> {
+    state.stop_preview().map(|_| ()).map_err(err)
+}
+
+#[tauri::command]
+pub fn restore_needs_destination(state: State<'_, AppState>, path: String) -> Cmd<bool> {
+    let Ok(path) = Path::new(&path).canonicalize() else {
+        return Ok(true);
+    };
+    let folders = state.db.folders().map_err(err)?;
+    Ok(!folders.iter().any(|folder| {
+        Path::new(folder)
+            .canonicalize()
+            .map(|root| path.starts_with(root))
+            .unwrap_or(false)
+    }))
+}
+
+#[tauri::command]
+pub fn relink_track_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    file_id: String,
+    path: String,
+    destination_folder: Option<String>,
+) -> Cmd<Track> {
+    let file = state
+        .db
+        .file_by_id(&file_id)
+        .map_err(err)?
+        .ok_or_else(|| format!("file not found: {file_id}"))?;
+    let selected = Path::new(&path)
+        .canonicalize()
+        .with_context(|| format!("reading selected file {path}"))
+        .map_err(err)?;
+    if !selected.is_file() {
+        return Err(format!(
+            "selected path is not a file: {}",
+            selected.display()
+        ));
+    }
+
+    // Read and validate before creating a restored copy.
+    let mut replacement = scan::read_track(&selected, &state.paths.artwork).map_err(err)?;
+    let versions = state.db.files_for_song(&file.song_id).map_err(err)?;
+    if !versions
+        .iter()
+        .all(|existing| relink_identity_matches(&replacement, existing))
+    {
+        return Err("selected audio does not match this song".into());
+    }
+
+    let folders = state.db.folders().map_err(err)?;
+    let roots: Vec<(String, PathBuf)> = folders
+        .iter()
+        .filter_map(|folder| {
+            Path::new(folder)
+                .canonicalize()
+                .ok()
+                .map(|root| (folder.clone(), root))
+        })
+        .collect();
+    let target = if roots.iter().any(|(_, root)| selected.starts_with(root)) {
+        selected
+    } else {
+        let destination = destination_folder
+            .as_deref()
+            .ok_or_else(|| "a configured destination folder is required".to_string())?;
+        let canonical_destination = Path::new(destination)
+            .canonicalize()
+            .with_context(|| format!("reading destination folder {destination}"))
+            .map_err(err)?;
+        let root = roots
+            .iter()
+            .find(|(_, root)| *root == canonical_destination)
+            .map(|(_, root)| root)
+            .ok_or_else(|| "destination folder is not a configured library folder".to_string())?;
+        let restored = root.join("Pick n Mix Restored");
+        std::fs::create_dir_all(&restored).map_err(err)?;
+        let target = unique_restored_path(&restored, &selected).map_err(err)?;
+        reject_indexed_target(&state, &file_id, &target).map_err(err)?;
+        std::fs::copy(&selected, &target)
+            .with_context(|| format!("copying restored file to {}", target.display()))
+            .map_err(err)?;
+        target
+    };
+
+    reject_indexed_target(&state, &file_id, &target).map_err(err)?;
+    replacement.location = target.display().to_string();
+    replacement.id = stable_id("t", &replacement.location);
+    state.db.relink_file(&file_id, &replacement).map_err(err)?;
+    let track = state
+        .db
+        .get_track(&file.song_id)
+        .map_err(err)?
+        .ok_or_else(|| "song disappeared after relinking its file".to_string())?;
+    let _ = app.emit("library-changed", ());
+    Ok(track)
+}
+
+#[tauri::command]
+pub fn trash_track_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    file_id: String,
+) -> Cmd<Option<Track>> {
+    let file = state
+        .db
+        .file_by_id(&file_id)
+        .map_err(err)?
+        .ok_or_else(|| format!("file not found: {file_id}"))?;
+    if !file.available {
+        return Err("missing files can be forgotten, but cannot be moved to Trash".into());
+    }
+    state.stop_preview().map_err(err)?;
+    trash::delete(Path::new(&file.location)).map_err(err)?;
+    state.db.forget_file(&file_id).map_err(err)?;
+    let track = state.db.get_track(&file.song_id).map_err(err)?;
+    let _ = app.emit("library-changed", ());
+    Ok(track)
+}
+
+#[tauri::command]
+pub fn forget_missing_track_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    file_id: String,
+) -> Cmd<Option<Track>> {
+    let file = state
+        .db
+        .file_by_id(&file_id)
+        .map_err(err)?
+        .ok_or_else(|| format!("file not found: {file_id}"))?;
+    if file.available {
+        return Err("available files must be moved to Trash, not forgotten".into());
+    }
+    state.db.forget_file(&file_id).map_err(err)?;
+    let track = state.db.get_track(&file.song_id).map_err(err)?;
+    let _ = app.emit("library-changed", ());
+    Ok(track)
+}
+
+#[tauri::command]
 pub fn search(state: State<'_, AppState>, query: String) -> Cmd<Vec<Track>> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
@@ -136,37 +329,61 @@ pub fn enrich_track(app: AppHandle, state: State<'_, AppState>, id: String) -> C
 // Playback
 // ---------------------------------------------------------------------------
 
-/// Load whatever the player says is current and start it.
-fn start_current(app: &AppHandle, state: &AppState) -> Cmd<()> {
-    let (path, gain) = {
-        let player = state.player.lock();
-        match player.current() {
-            Some(track) => (PathBuf::from(&track.location), track.gain_db.unwrap_or(0.0)),
-            None => {
-                state.engine.clear();
-                let _ = app.emit("track-changed", Option::<Track>::None);
-                return Ok(());
-            }
-        }
+/// Resolve and load whatever logical song the player says is current.
+pub(crate) fn start_current(app: &AppHandle, state: &AppState) -> Cmd<()> {
+    load_current(app, state, 0.0, true).map(|_| ())
+}
+
+fn load_current(app: &AppHandle, state: &AppState, position_secs: f64, playing: bool) -> Cmd<bool> {
+    state.cancel_preview();
+    let Some(song_id) = state.player.lock().current().map(|track| track.id.clone()) else {
+        state.engine.clear();
+        let _ = app.emit("track-changed", Option::<Track>::None);
+        return Ok(false);
     };
 
-    // Announce the new track before loading it. Opening the file and refilling
-    // the ring takes a few tens of milliseconds; there is no reason for the
-    // title and artwork to wait for that.
-    let current = state.player.lock().current().cloned();
-    let _ = app.emit("track-changed", &current);
+    let refreshed = state
+        .db
+        .get_track(&song_id)
+        .map_err(err)?
+        .ok_or_else(|| format!("song not found: {song_id}"))?;
+    state.player.lock().refresh_current_track(refreshed.clone());
+    let _ = app.emit("track-changed", Some(&refreshed));
     let _ = app.emit("queue-changed", state.player.lock().view());
 
     state.sync_mixer();
-    match state.engine.load(path, 0.0, gain) {
-        Ok(_) => state.engine.play(),
-        Err(e) => {
-            // The UI has already moved on, so say why the audio did not.
-            let _ = app.emit("engine-error", format!("could not play that track: {e}"));
-            return Err(err(e));
+    let files = state.playback_files(&song_id).map_err(err)?;
+    let mut failures = Vec::new();
+    for file in files {
+        match state.engine.load(
+            PathBuf::from(&file.location),
+            position_secs.max(0.0),
+            file.gain_db.unwrap_or(0.0),
+        ) {
+            Ok(_) => {
+                if playing {
+                    state.engine.play();
+                } else {
+                    state.engine.pause();
+                }
+                return Ok(true);
+            }
+            Err(error) => failures.push(format!("{}: {error}", file.location)),
         }
     }
-    Ok(())
+
+    state.engine.pause();
+    let message = if failures.is_empty() {
+        format!("no available file for {}", refreshed.title)
+    } else {
+        format!(
+            "none of the available files for {} could be opened: {}",
+            refreshed.title,
+            failures.join("; ")
+        )
+    };
+    let _ = app.emit("engine-error", &message);
+    Err(message)
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +403,7 @@ pub struct PlayRequest {
 
 #[tauri::command]
 pub fn play_tracks(app: AppHandle, state: State<'_, AppState>, request: PlayRequest) -> Cmd<()> {
+    state.cancel_preview();
     let tracks = load_tracks(&state, &request.track_ids)?;
     if tracks.is_empty() {
         return Ok(());
@@ -202,6 +420,7 @@ pub fn play_tracks(app: AppHandle, state: State<'_, AppState>, request: PlayRequ
 /// Jump to a position in the current play order.
 #[tauri::command]
 pub fn play_queue_index(app: AppHandle, state: State<'_, AppState>, index: usize) -> Cmd<()> {
+    state.cancel_preview();
     {
         let mut player = state.player.lock();
         if player.jump_to(index).is_none() {
@@ -214,14 +433,30 @@ pub fn play_queue_index(app: AppHandle, state: State<'_, AppState>, index: usize
 #[tauri::command]
 pub fn toggle_play(app: AppHandle, state: State<'_, AppState>) -> Cmd<bool> {
     let playing = state.engine.is_playing();
+    if let Some(preview) = state.cancel_preview() {
+        let normal_was_playing = preview
+            .original
+            .as_ref()
+            .map(|original| original.playing)
+            .unwrap_or(false);
+        let now_playing = !normal_was_playing;
+        let loaded = load_current(&app, &state, 0.0, now_playing)?;
+        let now_playing = loaded && now_playing;
+        let _ = app.emit("playing-changed", now_playing);
+        return Ok(now_playing);
+    }
+
     if playing {
         state.engine.pause();
     } else {
-        // Nothing loaded yet: start at the top of the queue.
         if state.player.lock().current().is_none() {
             return Ok(false);
         }
-        state.engine.play();
+        if state.engine.snapshot().stream.is_none() {
+            load_current(&app, &state, 0.0, true)?;
+        } else {
+            state.engine.play();
+        }
     }
     let now_playing = !playing;
     let _ = app.emit("playing-changed", now_playing);
@@ -230,6 +465,7 @@ pub fn toggle_play(app: AppHandle, state: State<'_, AppState>) -> Cmd<bool> {
 
 #[tauri::command]
 pub fn next_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
+    state.cancel_preview();
     let has_next = state.player.lock().advance(false).is_some();
     if !has_next {
         state.engine.pause();
@@ -243,19 +479,41 @@ pub fn next_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
 #[tauri::command]
 pub fn previous_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
     const RESTART_AFTER_SECS: f64 = 3.0;
-    if state.engine.snapshot().position_secs > RESTART_AFTER_SECS {
-        state.engine.seek(0.0);
+    let cancelled = state.cancel_preview();
+    let position = cancelled
+        .as_ref()
+        .and_then(|preview| preview.original.as_ref())
+        .map(|original| original.position_secs)
+        .unwrap_or_else(|| state.engine.snapshot().position_secs);
+    if position > RESTART_AFTER_SECS {
+        if cancelled.is_some() {
+            load_current(&app, &state, 0.0, true)?;
+        } else {
+            state.engine.seek(0.0);
+        }
         return Ok(());
     }
     if state.player.lock().previous().is_none() {
+        if cancelled.is_some() {
+            return load_current(&app, &state, 0.0, true).map(|_| ());
+        }
         return Ok(());
     }
     start_current(&app, &state)
 }
 
 #[tauri::command]
-pub fn seek(state: State<'_, AppState>, position_secs: f64) -> Cmd<()> {
-    state.engine.seek(position_secs.max(0.0));
+pub fn seek(app: AppHandle, state: State<'_, AppState>, position_secs: f64) -> Cmd<()> {
+    if let Some(preview) = state.cancel_preview() {
+        let playing = preview
+            .original
+            .as_ref()
+            .map(|original| original.playing)
+            .unwrap_or(false);
+        load_current(&app, &state, position_secs, playing)?;
+    } else {
+        state.engine.seek(position_secs.max(0.0));
+    }
     Ok(())
 }
 
@@ -292,6 +550,7 @@ pub fn current_track(state: State<'_, AppState>) -> Cmd<Option<Track>> {
 
 #[tauri::command]
 pub fn play_next(app: AppHandle, state: State<'_, AppState>, track_ids: Vec<String>) -> Cmd<()> {
+    state.cancel_preview();
     let tracks = load_tracks(&state, &track_ids)?;
     let was_empty = {
         let mut player = state.player.lock();
@@ -312,6 +571,7 @@ pub fn play_next(app: AppHandle, state: State<'_, AppState>, track_ids: Vec<Stri
 
 #[tauri::command]
 pub fn add_to_queue(app: AppHandle, state: State<'_, AppState>, track_ids: Vec<String>) -> Cmd<()> {
+    state.cancel_preview();
     let tracks = load_tracks(&state, &track_ids)?;
     let was_empty = {
         let mut player = state.player.lock();
@@ -329,6 +589,7 @@ pub fn add_to_queue(app: AppHandle, state: State<'_, AppState>, track_ids: Vec<S
 
 #[tauri::command]
 pub fn remove_from_queue(app: AppHandle, state: State<'_, AppState>, index: usize) -> Cmd<()> {
+    state.cancel_preview();
     state.player.lock().remove_at(index);
     // The removed entry might be exactly what a pending crossfade was
     // prepared into.
@@ -339,6 +600,7 @@ pub fn remove_from_queue(app: AppHandle, state: State<'_, AppState>, index: usiz
 
 #[tauri::command]
 pub fn clear_queue(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
+    state.cancel_preview();
     state.player.lock().clear();
     state.engine.clear();
     let _ = app.emit("queue-changed", state.player.lock().view());
@@ -348,6 +610,7 @@ pub fn clear_queue(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
 
 #[tauri::command]
 pub fn set_shuffle(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Cmd<()> {
+    state.cancel_preview();
     state.player.lock().set_shuffle(enabled);
     let _ = state
         .db
@@ -360,6 +623,7 @@ pub fn set_shuffle(app: AppHandle, state: State<'_, AppState>, enabled: bool) ->
 
 #[tauri::command]
 pub fn set_repeat(app: AppHandle, state: State<'_, AppState>, mode: Repeat) -> Cmd<()> {
+    state.cancel_preview();
     state.player.lock().set_repeat(mode);
     if let Ok(raw) = serde_json::to_string(&mode) {
         let _ = state.db.set_setting(SETTING_REPEAT, &raw);
@@ -810,6 +1074,7 @@ pub fn move_in_queue(
     from: usize,
     to: usize,
 ) -> Cmd<()> {
+    state.cancel_preview();
     if state.player.lock().move_item(from, to) {
         // Reordering can change what immediately follows the current track.
         state.engine.cancel_next();
@@ -852,6 +1117,7 @@ pub fn play_playlist(
     id: String,
     start_index: Option<usize>,
 ) -> Cmd<()> {
+    state.cancel_preview();
     let Some((_, p)) = find_playlist(&state, &id) else {
         return Err("playlist not found".into());
     };
@@ -897,6 +1163,92 @@ pub fn play_playlist(
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn relink_identity_matches(candidate: &Track, existing: &TrackFile) -> bool {
+    if matches!(
+        (candidate.disc_number, existing.disc_number),
+        (Some(a), Some(b)) if a != b
+    ) || matches!(
+        (candidate.track_number, existing.track_number),
+        (Some(a), Some(b)) if a != b
+    ) {
+        return false;
+    }
+
+    let album = normalise(&candidate.album);
+    if album != normalise(&existing.album) {
+        return false;
+    }
+    let same_mbid = match (
+        candidate.musicbrainz_recording_id.as_deref().map(str::trim),
+        existing.musicbrainz_recording_id.as_deref().map(str::trim),
+    ) {
+        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => a.eq_ignore_ascii_case(b),
+        _ => false,
+    };
+    if same_mbid {
+        return true;
+    }
+    !album.is_empty()
+        && normalise(&candidate.artist) == normalise(&existing.artist)
+        && normalise(&candidate.title) == normalise(&existing.title)
+        && candidate.duration_secs.is_finite()
+        && existing.duration_secs.is_finite()
+        && (candidate.duration_secs - existing.duration_secs).abs() <= 2.0
+}
+
+fn unique_restored_path(folder: &Path, source: &Path) -> anyhow::Result<PathBuf> {
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| anyhow!("selected path has no file name"))?;
+    let first = folder.join(file_name);
+    if !first.exists() {
+        return Ok(first);
+    }
+
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("selected file name is not valid Unicode"))?;
+    let extension = source.extension().and_then(|value| value.to_str());
+    for suffix in 1u32.. {
+        let name = match extension {
+            Some(extension) => format!("{stem} ({suffix}).{extension}"),
+            None => format!("{stem} ({suffix})"),
+        };
+        let candidate = folder.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("the numeric suffix space is finite only after exhausting u32")
+}
+
+fn reject_indexed_target(state: &AppState, file_id: &str, target: &Path) -> anyhow::Result<()> {
+    let location = target.display().to_string();
+    if let Some(indexed) = state.db.file_by_location(scan::SOURCE_LOCAL, &location)? {
+        if indexed.id != file_id {
+            bail!("target path is already indexed by file {}", indexed.id);
+        }
+    }
+
+    if let Ok(target) = target.canonicalize() {
+        for location in state.db.locations(scan::SOURCE_LOCAL)? {
+            if location == target.display().to_string() {
+                continue;
+            }
+            let path = Path::new(&location);
+            if path.canonicalize().ok().as_deref() == Some(target.as_path()) {
+                if let Some(indexed) = state.db.file_by_location(scan::SOURCE_LOCAL, &location)? {
+                    if indexed.id != file_id {
+                        bail!("target path is already indexed by file {}", indexed.id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_tracks(state: &AppState, ids: &[String]) -> Cmd<Vec<Track>> {
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
@@ -920,5 +1272,82 @@ fn request_missing_beds(state: &AppState) {
         if !state.engine.has_bed(&filter.id) {
             state.engine.request_bed(&filter.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod duplicate_file_tests {
+    use super::*;
+
+    fn candidate() -> Track {
+        Track {
+            title: " Song ".into(),
+            artist: "ARTIST".into(),
+            album: "Album".into(),
+            duration_secs: 181.9,
+            track_number: Some(2),
+            disc_number: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn existing() -> TrackFile {
+        TrackFile {
+            title: "song".into(),
+            artist: "Artist".into(),
+            album: "album".into(),
+            duration_secs: 180.0,
+            track_number: Some(2),
+            disc_number: Some(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn relink_identity_requires_album_duration_and_positions() {
+        assert!(relink_identity_matches(&candidate(), &existing()));
+
+        let mut other_album = candidate();
+        other_album.album = "Other".into();
+        assert!(!relink_identity_matches(&other_album, &existing()));
+
+        let mut too_long = candidate();
+        too_long.duration_secs = 182.01;
+        assert!(!relink_identity_matches(&too_long, &existing()));
+
+        let mut wrong_position = candidate();
+        wrong_position.track_number = Some(3);
+        assert!(!relink_identity_matches(&wrong_position, &existing()));
+    }
+
+    #[test]
+    fn equal_nonempty_mbid_allows_two_albumless_versions() {
+        let mut candidate = candidate();
+        candidate.album.clear();
+        candidate.title = "Different".into();
+        candidate.musicbrainz_recording_id = Some("MBID".into());
+        let mut existing = existing();
+        existing.album.clear();
+        existing.title = "Other".into();
+        existing.musicbrainz_recording_id = Some("mbid".into());
+        assert!(relink_identity_matches(&candidate, &existing));
+
+        existing.album = "Album".into();
+        assert!(!relink_identity_matches(&candidate, &existing));
+    }
+
+    #[test]
+    fn restored_collisions_add_a_suffix_before_the_extension() {
+        let root = std::env::temp_dir().join(format!(
+            "pnm-restore-test-{}",
+            stable_id("d", &format!("{:?}", std::time::Instant::now()))
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("song.flac"), b"one").unwrap();
+        std::fs::write(root.join("song (1).flac"), b"two").unwrap();
+
+        let target = unique_restored_path(&root, Path::new("/outside/song.flac")).unwrap();
+        assert_eq!(target.file_name().unwrap(), "song (2).flac");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

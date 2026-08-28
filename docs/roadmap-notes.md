@@ -5,16 +5,19 @@ making before any code gets written.
 
 ---
 
-## Medium: duplicate song handling
+## Medium: duplicate song handling — **done**
 
-**Size:** ~1–2 days. Not hard, but it changes the library's central idea.
+**Implemented:** logical songs now own ranked file versions, merged metadata,
+manual preference, missing-file fallback, temporary comparison previews,
+relink/copy restoration, and cross-platform Trash deletion.
 
-Today one row = one file. This needs one row = one *song*, with files hanging
-off it. That is a schema change, not a tweak:
+One public row now represents one *song*, with physical versions hanging off
+it. Existing file-based IDs migrate through aliases so playlists and references
+continue to resolve:
 
 ```sql
-CREATE TABLE songs  (id, title, artist, album, ..., preferred_file_id);
-CREATE TABLE files  (id, song_id, location, format, bitrate, sample_rate, ...);
+CREATE TABLE songs      (id, title, artist, album, ..., preferred_file_id);
+CREATE TABLE track_files(id, song_id, location, format, bitrate, sample_rate, ...);
 ```
 
 Grouping key: the existing `match_key` (normalised artist|title|album) plus
@@ -28,13 +31,13 @@ file size as a tiebreak.
 Metadata merge: prefer the most complete value per field rather than the
 highest-quality file's, so a well-tagged MP3 can fill gaps a bare FLAC leaves.
 
-**Decisions you'd need to make:**
-- Should a duplicate ever be *shown*? A "2 versions" affordance on the row is
-  useful; silent collapsing makes missing songs hard to explain.
-- Do the two files have to agree on album? Same song on an album and on a
-  compilation are arguably different entries.
-- What happens when the preferred file goes missing — fall back silently, or
-  flag it?
+**Settled behavior:**
+- Duplicates are exposed through **Show duplicate files**, with comparison,
+  temporary previews, preference controls, relinking and Trash actions.
+- Album agreement is mandatory. Albumless files only combine when both have the
+  same non-empty MusicBrainz recording ID.
+- A missing preferred file falls back silently, while the context-menu warning
+  and modal explain what is missing and allow it to be restored.
 
 ---
 

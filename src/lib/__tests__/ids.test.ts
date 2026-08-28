@@ -46,6 +46,10 @@ describe("stable ids", () => {
       musicbrainzReleaseId: null,
       gainDb: null,
       addedAt: 0,
+      fileCount: 1,
+      missingFileCount: 0,
+      effectiveFileId: "f1",
+      preferredFileId: null,
     };
 
     // Two tracks from the same album agree even with different track artists.

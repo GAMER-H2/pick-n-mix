@@ -1,11 +1,17 @@
 Small Tasks:
-
+- Back and forward buttons should take into account where a page has been scrolled to and what's in the search box so that they can be restored
+- Sorting options on the library tabs
+- Playlists in their 3 dots menu have a new toggleable option called "shuffle-only". If enabled, the playlist order is always ignored and everytime it is selected to play, the order is shuffled. If a specific track in the playlist is selected, it will play first but the order afterwards will be shuffled.
+- Another playlist option, ability to replace the image with an image file from the machine. A copy of this image is made and stored so no reference is ever lost
+- The queue (both full-screen and small view) when brought up should have the currently playing song in the centre of the view.
+- If a track is shown as playing in a list, the pause icon it has should play/pause the song rather than start from the beginning. The exception is a playlist where the track is treated as separate so it shouldn't even light up as playing if the song is being played from another source
+- When opening the app, it should remember its window size when it was last closed (including whether it was maximised o r not) and restore that size.
+- Queuing a song from a playlist that isn't currently being played, means that any mixer settings apply to just that song (keeping the override order of playlist --> track) when it is played in the queue. Those settings can be adjusted while they are playing but they won't save to the playlist/track in the playlist. Once the track has finished, the mixer settings revert back to what they were before the song started playing. For future reference when playlist advanced crossfade abilities are added, they are ignored if queuing an individual track from the playlist
 
 Medium Tasks:
 - Duplicate song handling - same song gets collapsed into one, combining metadata in the program's database, file that is played back is the one with the highest quality (bitrate, sample rate, file type)
 - Settings page - Theme, fade pause/play, keep reverb on pause, library management, output device override select
 - Expanded EQ controls brings up a dialogue modal pop-up that is a clone of Logic Pro's EQ controls in this application's style
-- Crossfade global controls in DJ Mixer - simple slider for crossfade length in pop-up DJ Mixer, graph controls for global DJ Mixer that shows the keyframes of each song to manipulate
 - Home page showing recently played, archive mix, most played playlists, and simple recommendations
 
 Large Tasks:

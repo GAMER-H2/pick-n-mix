@@ -32,9 +32,9 @@ Vue UI  ──invoke/events──►  Tauri commands
                                  │
                     ┌────────────┼─────────────┐
                     ▼            ▼             ▼
-                 Player      SQLite index   Playlist files
-                (queue)      (a rebuildable  (.pnmx, shareable)
-                    │          cache)
+                 Player      SQLite library  Playlist files
+                (queue)      (songs + file   (.pnmx, shareable)
+                    │          versions)
                     ▼
               Audio engine
    decode ─► varispeed ─► EQ ─► delay ─► reverb ─► lo-fi
@@ -70,6 +70,20 @@ A layer that only sets `reverb` leaves every other section inherited. See
 Point the app at a folder; tags, artwork and ReplayGain are read from the files
 themselves. Nothing touches the network unless you pick **Look Up Online**,
 which queries MusicBrainz and the Cover Art Archive.
+
+Files representing the same artist, title and album within two seconds are
+collapsed into one song. Matching MusicBrainz recording IDs are stronger
+evidence, but album agreement is still mandatory; untagged, albumless files are
+only combined when both carry the same recording ID. Pick n Mix automatically
+plays the best available version—lossless first, then bit depth and sample rate,
+bitrate and size—while merging richer tags from the other files.
+
+Right-click a collapsed song and choose **Show duplicate files** to compare or
+preview versions, override automatic selection, relink missing files, or move a
+version to the operating system Trash/Recycle Bin. Missing preferred files fall
+back silently and become preferred again if restored. These preferences and
+missing-file records make the SQLite library durable user state rather than a
+fully disposable cache; folders and audio files remain the source of the music.
 
 Library sources sit behind a `LibrarySource` trait so Navidrome and Jellyfin can
 be added without changing the UI or the player.

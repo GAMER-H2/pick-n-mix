@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Track {
     pub id: String,
@@ -36,6 +36,14 @@ pub struct Track {
     /// Normalisation gain in dB, from ReplayGain tags when present.
     pub gain_db: Option<f32>,
     pub added_at: i64,
+    /// Number of known file versions for this logical song.
+    pub file_count: u32,
+    /// Number of known versions whose file is currently unavailable.
+    pub missing_file_count: u32,
+    /// The file version supplying the playable location and technical fields.
+    pub effective_file_id: Option<String>,
+    /// A manually selected version. It remains set while that file is missing.
+    pub preferred_file_id: Option<String>,
 }
 
 impl Track {
@@ -44,6 +52,44 @@ impl Track {
         match_key(&self.artist, &self.title, &self.album)
     }
 }
+
+/// One physical or remote file version belonging to a logical song.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TrackFile {
+    pub id: String,
+    pub song_id: String,
+    pub source_id: String,
+    pub location: String,
+    pub title: String,
+    pub artist: String,
+    pub album_artist: String,
+    pub album: String,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub year: Option<i32>,
+    pub genre: Option<String>,
+    pub duration_secs: f64,
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u32>,
+    pub bits_per_sample: Option<u32>,
+    pub bitrate_kbps: Option<u32>,
+    pub file_size: Option<u64>,
+    pub format: Option<String>,
+    pub artwork_id: Option<String>,
+    pub musicbrainz_recording_id: Option<String>,
+    pub musicbrainz_release_id: Option<String>,
+    pub gain_db: Option<f32>,
+    pub added_at: i64,
+    pub modified_at: i64,
+    pub available: bool,
+    pub missing: bool,
+    pub preferred: bool,
+    pub effective: bool,
+}
+
+/// Alternate terminology used by duplicate-management callers.
+pub type FileVersion = TrackFile;
 
 /// Loose normalisation so "The Beatles" and "the beatles " agree.
 pub fn normalise(s: &str) -> String {

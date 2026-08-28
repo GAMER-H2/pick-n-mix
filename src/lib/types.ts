@@ -1,7 +1,6 @@
 /** Mirrors the Rust types in `src-tauri/src`. Keep the two in step. */
 
-export interface Track {
-  id: string;
+interface TrackFields {
   sourceId: string;
   location: string;
   title: string;
@@ -24,6 +23,26 @@ export interface Track {
   musicbrainzReleaseId: string | null;
   gainDb: number | null;
   addedAt: number;
+}
+
+/** A merged song returned by library and playback commands. */
+export interface Track extends TrackFields {
+  id: string;
+  fileCount: number;
+  missingFileCount: number;
+  effectiveFileId: string | null;
+  preferredFileId: string | null;
+}
+
+/** One physical version of a merged song. */
+export interface TrackFile extends TrackFields {
+  id: string;
+  songId: string;
+  modifiedAt: number;
+  available: boolean;
+  missing: boolean;
+  preferred: boolean;
+  effective: boolean;
 }
 
 export interface Album {
