@@ -2,6 +2,22 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import type { Track } from "@/lib/types";
 
+/**
+ * Playlist-wide options, shown when the menu was opened from a playlist's own
+ * "more" button rather than from one of its rows.
+ *
+ * The handlers are supplied by the playlist view because they need its loaded
+ * playlist and its refresh; the menu only has to draw them.
+ */
+export interface PlaylistMenuOptions {
+  id: string;
+  shuffleOnly: boolean;
+  hasArtwork: boolean;
+  onToggleShuffleOnly: () => Promise<void>;
+  onChooseArtwork: () => Promise<void>;
+  onClearArtwork: () => Promise<void>;
+}
+
 export interface ContextMenuState {
   x: number;
   y: number;
@@ -9,6 +25,8 @@ export interface ContextMenuState {
   /** Set when the menu was opened from inside a playlist. */
   playlistId?: string;
   entryIndex?: number;
+  /** Set when the menu was opened from a playlist header. */
+  playlistOptions?: PlaylistMenuOptions;
 }
 
 export const useUiStore = defineStore("ui", () => {

@@ -9,6 +9,7 @@
  */
 import { computed, ref, watch } from "vue";
 import { useRoute } from "vue-router";
+import { open } from "@tauri-apps/plugin-dialog";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
 import CollectionHeader from "@/components/CollectionHeader.vue";
 import TrackRow from "@/components/TrackRow.vue";
@@ -55,9 +56,70 @@ watch(
   { immediate: true },
 );
 
+/**
+ * A song in a playlist is its own thing: it carries this playlist's mixer and
+ * this playlist's position. So a row only counts as playing when the queue is
+ * actually running *this* playlist — the same song playing from the library or
+ * another playlist leaves these rows alone.
+ */
+const playingThisPlaylist = computed(
+  () => !!playlist.value && player.queue.context?.id === playlist.value.id,
+);
+
+function isCurrent(item: ResolvedEntry) {
+  return (
+    playingThisPlaylist.value && !!item.track && player.track?.id === item.track.id
+  );
+}
+
 async function play(startIndex = 0) {
   if (!playlist.value) return;
   await api.playPlaylist(playlist.value.id, startIndex);
+}
+
+/** Clicking the row that is already playing toggles it instead of restarting. */
+async function playEntry(item: ResolvedEntry) {
+  if (isCurrent(item)) {
+    await player.toggle();
+    return;
+  }
+  await play(item.index);
+}
+
+async function toggleShuffleOnly() {
+  const p = playlist.value;
+  if (!p) return;
+  await api.setPlaylistShuffleOnly(p.id, !p.shuffleOnly);
+  await playlists.refresh();
+}
+
+/**
+ * Replace the playlist image. The backend copies the file into the artwork
+ * cache, so the picture survives the original being moved or deleted.
+ */
+async function chooseArtwork() {
+  const p = playlist.value;
+  if (!p) return;
+  const selected = await open({
+    multiple: false,
+    title: "Choose a playlist image",
+    filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
+  });
+  if (typeof selected !== "string") return;
+  try {
+    await api.setPlaylistArtwork(p.id, selected);
+    await playlists.refresh();
+    ui.notify("Playlist image updated");
+  } catch (e) {
+    ui.notify(`Could not use that image: ${e}`, "error");
+  }
+}
+
+async function clearArtwork() {
+  const p = playlist.value;
+  if (!p) return;
+  await api.clearPlaylistArtwork(p.id);
+  await playlists.refresh();
 }
 
 async function shuffle() {
@@ -114,6 +176,14 @@ async function saveDescription() {
           x: $event.clientX,
           y: $event.clientY,
           tracks: available.map((i) => i.track!),
+          playlistOptions: {
+            id: playlist!.id,
+            shuffleOnly: playlist!.shuffleOnly,
+            hasArtwork: !!playlist!.artwork,
+            onToggleShuffleOnly: toggleShuffleOnly,
+            onChooseArtwork: chooseArtwork,
+            onClearArtwork: clearArtwork,
+          },
         })
       "
     >
@@ -159,10 +229,10 @@ async function saveDescription() {
         :fallback-title="item.entry.title"
         :fallback-subtitle="`${item.entry.album} · ${item.entry.artist}`"
         show-artwork
-        :current="!!item.track && player.track?.id === item.track.id"
+        :current="isCurrent(item)"
         :playing="player.playing"
         :has-mixer-override="!!item.entry.mixer"
-        @play="play(item.index)"
+        @play="playEntry(item)"
         @mixer="openEntryMixer(item)"
         @menu="
           item.track &&

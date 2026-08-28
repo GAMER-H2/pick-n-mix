@@ -81,6 +81,65 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The window geometry carried between runs.
+///
+/// Position is deliberately not stored: a window restored onto a monitor that
+/// is no longer attached is worse than one the compositor places itself.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowGeometry {
+    width: u32,
+    height: u32,
+    maximized: bool,
+}
+
+fn saved_geometry(state: &AppState) -> Option<WindowGeometry> {
+    let raw = state.db.get_setting(crate::state::SETTING_WINDOW).ok()??;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Put the window back the size it was closed at.
+fn restore_geometry(state: &AppState, window: &tauri::WebviewWindow) {
+    let Some(saved) = saved_geometry(state) else {
+        return;
+    };
+    // A degenerate size would leave an unusable window; fall back to the
+    // configured default by simply not applying it.
+    if saved.width >= 400 && saved.height >= 300 {
+        let _ = window.set_size(tauri::PhysicalSize::new(saved.width, saved.height));
+    }
+    if saved.maximized {
+        let _ = window.maximize();
+    }
+}
+
+/// Record the geometry on the way out.
+///
+/// While maximised the outer size is the whole screen, which would be a poor
+/// size to restore to once un-maximised, so the previously stored size is kept
+/// and only the maximised flag is updated.
+fn store_geometry(state: &AppState, window: &tauri::WebviewWindow) {
+    let maximized = window.is_maximized().unwrap_or(false);
+    let previous = saved_geometry(state);
+
+    let size = match (maximized, previous) {
+        (true, Some(previous)) => (previous.width, previous.height),
+        _ => match window.outer_size() {
+            Ok(size) => (size.width, size.height),
+            Err(_) => return,
+        },
+    };
+
+    let geometry = WindowGeometry {
+        width: size.0,
+        height: size.1,
+        maximized,
+    };
+    if let Ok(raw) = serde_json::to_string(&geometry) {
+        let _ = state.db.set_setting(crate::state::SETTING_WINDOW, &raw);
+    }
+}
+
 /// Forwards engine events to the frontend and advances the queue when a track
 /// ends. Runs off the audio path so nothing here can glitch playback.
 fn spawn_event_pump(app: tauri::AppHandle) {
@@ -291,6 +350,23 @@ pub fn run() {
             // Needs the managed state, so it goes after `manage`.
             media::init(app.handle());
 
+            // Size the window before it is shown, then keep the setting in step
+            // with however the user leaves it.
+            if let Some(window) = app.get_webview_window("main") {
+                if let Some(state) = app.try_state::<AppState>() {
+                    restore_geometry(&state, &window);
+                }
+                let handle = app.handle().clone();
+                let saved = window.clone();
+                window.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                        if let Some(state) = handle.try_state::<AppState>() {
+                            store_geometry(&state, &saved);
+                        }
+                    }
+                });
+            }
+
             spawn_event_pump(app.handle().clone());
             spawn_ticker(app.handle().clone());
             Ok(())
@@ -360,6 +436,10 @@ pub fn run() {
             commands::remove_from_playlist,
             commands::move_in_playlist,
             commands::set_playlist_entry_mixer,
+            commands::set_playlist_shuffle_only,
+            commands::set_playlist_artwork,
+            commands::clear_playlist_artwork,
+            commands::queue_playlist_entry,
             commands::import_playlist,
             commands::export_playlist,
             commands::play_playlist,

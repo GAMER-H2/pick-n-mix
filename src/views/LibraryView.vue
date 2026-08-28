@@ -3,13 +3,15 @@
  * The library: songs, albums and artists, plus the folder setup shown when
  * nothing has been imported yet.
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
 import Artwork from "@/components/Artwork.vue";
 import TrackRow from "@/components/TrackRow.vue";
+import SelectMenu from "@/components/SelectMenu.vue";
 import { formatTotal } from "@/lib/format";
+import { resolveSort, sortItems, type SortDirection, type SortOption } from "@/lib/sort";
 import { useLibraryStore } from "@/stores/library";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";
@@ -40,7 +42,35 @@ function selectTab(next: Tab) {
   if (next === tab.value) return;
   router.push({ name: "library", query: { ...route.query, tab: next } });
 }
-const query = ref("");
+/**
+ * The search text also lives in the URL, for the same reason the tab does:
+ * back and forward then restore it along with everything else about the page.
+ * Keystrokes `replace` rather than `push`, so typing refines the current
+ * history entry instead of burying it under one entry per character.
+ */
+const query = ref(typeof route.query.q === "string" ? route.query.q : "");
+let queryTimer: number | undefined;
+
+watch(query, (value) => {
+  window.clearTimeout(queryTimer);
+  queryTimer = window.setTimeout(() => {
+    const next = { ...route.query };
+    if (value.trim()) next.q = value;
+    else delete next.q;
+    router.replace({ name: "library", query: next });
+  }, 200);
+});
+
+// Arriving on a history entry that carried different text, via back or forward.
+watch(
+  () => route.query.q,
+  (value) => {
+    const incoming = typeof value === "string" ? value : "";
+    if (incoming !== query.value) query.value = incoming;
+  },
+);
+
+onBeforeUnmount(() => window.clearTimeout(queryTimer));
 
 const normalizedQuery = computed(() => query.value.trim().toLocaleLowerCase());
 const matches = (...fields: Array<string | number | null | undefined>) => {
@@ -48,16 +78,79 @@ const matches = (...fields: Array<string | number | null | undefined>) => {
   return !q || fields.some((field) => String(field ?? "").toLocaleLowerCase().includes(q));
 };
 
+// -- sorting ----------------------------------------------------------------
+
+const SONG_SORTS: ReadonlyArray<SortOption<Track>> = [
+  { id: "title", label: "Title", value: (t) => t.title },
+  { id: "artist", label: "Artist", value: (t) => t.artist },
+  { id: "album", label: "Album", value: (t) => t.album },
+  { id: "year", label: "Year", value: (t) => t.year },
+  { id: "duration", label: "Duration", value: (t) => t.durationSecs },
+  { id: "added", label: "Date Added", value: (t) => t.addedAt },
+];
+
+const ALBUM_SORTS: ReadonlyArray<SortOption<Album>> = [
+  { id: "name", label: "Title", value: (a) => a.name },
+  { id: "artist", label: "Artist", value: (a) => a.artist },
+  { id: "year", label: "Year", value: (a) => a.year },
+  { id: "tracks", label: "Songs", value: (a) => a.trackCount },
+  { id: "duration", label: "Duration", value: (a) => a.durationSecs },
+];
+
+const ARTIST_SORTS: ReadonlyArray<SortOption<Artist>> = [
+  { id: "name", label: "Name", value: (a) => a.name },
+  { id: "albums", label: "Albums", value: (a) => a.albumCount },
+  { id: "tracks", label: "Songs", value: (a) => a.trackCount },
+];
+
+/** Only the labels and ids are read here, so the item type does not matter. */
+const sortOptions = computed<ReadonlyArray<{ id: string; label: string }>>(() => {
+  switch (tab.value) {
+    case "albums":
+      return ALBUM_SORTS;
+    case "artists":
+      return ARTIST_SORTS;
+    default:
+      return SONG_SORTS;
+  }
+});
+
+const sortId = computed(() => {
+  const requested = route.query.sort;
+  const available = sortOptions.value;
+  return available.some((o) => o.id === requested) ? (requested as string) : available[0].id;
+});
+
+const sortDirection = computed<SortDirection>(() =>
+  route.query.dir === "desc" ? "desc" : "asc",
+);
+
+function applySort(id: string, direction: SortDirection) {
+  router.replace({ name: "library", query: { ...route.query, sort: id, dir: direction } });
+}
+
 const filteredTracks = computed<Track[]>(() =>
-  library.tracks.filter((track) =>
-    matches(track.title, track.artist, track.album, track.albumArtist, track.genre, track.year),
+  sortItems(
+    library.tracks.filter((track) =>
+      matches(track.title, track.artist, track.album, track.albumArtist, track.genre, track.year),
+    ),
+    resolveSort(SONG_SORTS, sortId.value),
+    sortDirection.value,
   ),
 );
 const filteredAlbums = computed<Album[]>(() =>
-  library.albums.filter((album) => matches(album.name, album.artist, album.year)),
+  sortItems(
+    library.albums.filter((album) => matches(album.name, album.artist, album.year)),
+    resolveSort(ALBUM_SORTS, sortId.value),
+    sortDirection.value,
+  ),
 );
 const filteredArtists = computed<Artist[]>(() =>
-  library.artists.filter((artist) => matches(artist.name)),
+  sortItems(
+    library.artists.filter((artist) => matches(artist.name)),
+    resolveSort(ARTIST_SORTS, sortId.value),
+    sortDirection.value,
+  ),
 );
 
 const searchPlaceholder = computed(() => `Search ${tab.value}`);
@@ -78,7 +171,16 @@ async function chooseFolder() {
   }
 }
 
+/**
+ * Clicking the row that is already playing toggles it, rather than restarting
+ * it from the beginning. Anything else starts the list from that song.
+ */
 async function playFrom(index: number) {
+  const track = filteredTracks.value[index];
+  if (track && player.track?.id === track.id) {
+    await player.toggle();
+    return;
+  }
   await player.playTracks(filteredTracks.value, index, {
     kind: "library",
     id: "library",
@@ -130,6 +232,20 @@ onMounted(() => {
               type="search"
             />
           </div>
+          <SelectMenu
+            :model-value="sortId"
+            :options="sortOptions"
+            label="Sort"
+            @update:model-value="applySort($event, sortDirection)"
+          />
+          <button
+            class="icon-button library__direction"
+            :title="sortDirection === 'asc' ? 'Sorted ascending' : 'Sorted descending'"
+            :aria-label="sortDirection === 'asc' ? 'Sorted ascending' : 'Sorted descending'"
+            @click="applySort(sortId, sortDirection === 'asc' ? 'desc' : 'asc')"
+          >
+            <PnmIcon :name="sortDirection === 'asc' ? 'chevronUp' : 'chevronDown'" :size="15" />
+          </button>
           <button
             class="pill-button is-plain"
             :disabled="library.scanning"
@@ -288,6 +404,11 @@ onMounted(() => {
   border-radius: 999px;
   background: var(--bg-sunken);
   color: var(--text-tertiary);
+}
+
+.library__direction {
+  width: 28px;
+  height: 28px;
 }
 
 .library__input {

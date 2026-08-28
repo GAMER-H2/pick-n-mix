@@ -128,6 +128,15 @@ export const setPlaylistEntryMixer = (
   index: number,
   settings: MixerSettings | null,
 ) => invoke<void>("set_playlist_entry_mixer", { playlistId, index, settings });
+export const setPlaylistShuffleOnly = (id: string, enabled: boolean) =>
+  invoke<void>("set_playlist_shuffle_only", { id, enabled });
+export const setPlaylistArtwork = (id: string, sourcePath: string) =>
+  invoke<string>("set_playlist_artwork", { id, sourcePath });
+export const clearPlaylistArtwork = (id: string) =>
+  invoke<void>("clear_playlist_artwork", { id });
+/** Queue one entry, carrying that playlist's mixer for this play only. */
+export const queuePlaylistEntry = (playlistId: string, index: number, next: boolean) =>
+  invoke<void>("queue_playlist_entry", { playlistId, index, next });
 export const importPlaylist = (path: string) => invoke<string>("import_playlist", { path });
 export const exportPlaylist = (id: string, destination: string) =>
   invoke<void>("export_playlist", { id, destination });

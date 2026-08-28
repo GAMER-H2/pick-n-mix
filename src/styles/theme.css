@@ -56,6 +56,9 @@
   --separator-strong: rgba(0, 0, 0, 0.16);
   --control-track: rgba(0, 0, 0, 0.12);
   --art-placeholder: linear-gradient(160deg, #e9e9ee, #d8d8e0);
+
+  /* Edge of a window that draws its own frame. Dark against a light desktop. */
+  --window-edge: rgba(0, 0, 0, 0.22);
 }
 
 /* Dark */
@@ -77,6 +80,10 @@
   --separator-strong: rgba(255, 255, 255, 0.18);
   --control-track: rgba(255, 255, 255, 0.16);
   --art-placeholder: linear-gradient(160deg, #2c2c31, #1e1e22);
+
+  /* A dark hairline would vanish into a dark desktop, so the edge is picked
+     out with light here instead, the way KDE and GNOME do in dark themes. */
+  --window-edge: rgba(255, 255, 255, 0.16);
 }
 
 * {

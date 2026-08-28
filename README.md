@@ -9,11 +9,36 @@ crushing and ambience beds applied to your own files as they play.
 npm install
 npm run tauri dev      # development, with hot reload
 npm run tauri build    # release bundle
+npm run build:appimage # Linux AppImage only
 ```
 
 > Build the release binary with `npm run tauri build`, not a bare
 > `cargo build --release`. Running cargo directly leaves Tauri's `dev` flag set,
 > so the binary looks for the Vite dev server and opens a blank window.
+
+### AppImage on rolling-release distributions
+
+`build:appimage` exists because it sets `NO_STRIP=1`. linuxdeploy — which
+Tauri downloads to assemble the AppDir — ships its own `strip` from binutils
+2.35, released in 2020. Current toolchains emit `SHT_RELR` (`.relr.dyn`)
+relative-relocation sections, which that `strip` does not recognise, so it
+fails on nearly every system library it is asked to process:
+
+```
+strip: .../libzstd.so.1: unknown type [0x13] section `.relr.dyn'
+```
+
+linuxdeploy treats those failures as fatal and Tauri reports only
+`failed to run linuxdeploy`. Setting `NO_STRIP=1` skips that step. Nothing is
+lost: the Rust binary is already stripped by `strip = true` in the release
+profile, and the copied system libraries are stripped by the distribution.
+
+Because an AppImage bundles the build host's GTK, glib and ICU, one built on a
+rolling distribution runs on that distribution but not on older ones. Build it
+in a container matching the oldest target if you need portability — but note
+that the reverse also holds, so a container-built AppImage may fail to start on
+a much newer host, where the bundled libraries collide with the host's graphics
+drivers and EGL initialisation aborts.
 
 ## Testing
 

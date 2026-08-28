@@ -856,6 +856,7 @@ pub struct PlaylistSummary {
     pub track_count: usize,
     pub artwork: Option<String>,
     pub has_mixer: bool,
+    pub shuffle_only: bool,
     pub path: String,
 }
 
@@ -870,6 +871,7 @@ pub fn list_playlists(state: State<'_, AppState>) -> Cmd<Vec<PlaylistSummary>> {
             track_count: p.tracks.len(),
             artwork: p.artwork,
             has_mixer: p.mixer.is_some(),
+            shuffle_only: p.shuffle_only,
             path: path.display().to_string(),
         })
         .collect())
@@ -909,6 +911,7 @@ pub fn create_playlist(
         track_count: 0,
         artwork: p.artwork,
         has_mixer: false,
+        shuffle_only: p.shuffle_only,
         path: path.display().to_string(),
     })
 }
@@ -930,6 +933,60 @@ pub fn update_playlist(
     if let Some(description) = description {
         p.description = description;
     }
+    p.save(&path).map_err(err)?;
+    let _ = app.emit("playlists-changed", ());
+    Ok(())
+}
+
+/// Toggle "shuffle-only": the stored order is ignored every time this playlist
+/// is played.
+#[tauri::command]
+pub fn set_playlist_shuffle_only(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Cmd<()> {
+    let Some((path, mut p)) = find_playlist(&state, &id) else {
+        return Err("playlist not found".into());
+    };
+    p.shuffle_only = enabled;
+    p.save(&path).map_err(err)?;
+    let _ = app.emit("playlists-changed", ());
+    Ok(())
+}
+
+/// Replace a playlist's image with a copy of a file from this machine.
+///
+/// The image is copied into the artwork cache, so the playlist keeps its
+/// picture even if the original is later moved or deleted.
+#[tauri::command]
+pub fn set_playlist_artwork(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    source_path: String,
+) -> Cmd<String> {
+    let Some((path, mut p)) = find_playlist(&state, &id) else {
+        return Err("playlist not found".into());
+    };
+    let artwork_id =
+        scan::store_artwork_file(&state.paths.artwork, Path::new(&source_path)).map_err(err)?;
+    p.artwork = Some(artwork_id.clone());
+    p.save(&path).map_err(err)?;
+    let _ = app.emit("playlists-changed", ());
+    Ok(artwork_id)
+}
+
+/// Drop a custom image, falling back to the cover of the first track again.
+#[tauri::command]
+pub fn clear_playlist_artwork(app: AppHandle, state: State<'_, AppState>, id: String) -> Cmd<()> {
+    let Some((path, mut p)) = find_playlist(&state, &id) else {
+        return Err("playlist not found".into());
+    };
+    // The file itself is left in the cache: it is content-addressed and may be
+    // shared with a track's embedded cover.
+    p.artwork = None;
     p.save(&path).map_err(err)?;
     let _ = app.emit("playlists-changed", ());
     Ok(())
@@ -1127,6 +1184,7 @@ pub fn play_playlist(
         name: p.name.clone(),
     };
     let context_mixer = p.mixer.clone();
+    let shuffle_only = p.shuffle_only;
     let resolved = p.resolve(&state.db).map_err(err)?;
 
     // Entries with nothing matching locally are skipped, and the start index
@@ -1150,6 +1208,15 @@ pub fn play_playlist(
         return Err("none of this playlist's tracks are in your library".into());
     }
 
+    // Shuffle-only playlists ignore their stored order. A track the user
+    // actually clicked still plays first; only what follows is shuffled.
+    if shuffle_only {
+        let chosen = items.remove(adjusted_start);
+        crate::player::shuffle_in_place(&mut items);
+        items.insert(0, chosen);
+        adjusted_start = 0;
+    }
+
     {
         let mut player = state.player.lock();
         player.context = Some(context);
@@ -1157,6 +1224,88 @@ pub fn play_playlist(
         player.set_queue_items(items, adjusted_start);
     }
     start_current(&app, &state)
+}
+
+/// Add one playlist entry to the queue without playing the playlist.
+///
+/// The entry brings that playlist's mixer with it, collapsed playlist-then-track
+/// into the queue entry's own layer, so it applies to this one play of this one
+/// song and to nothing else. Because the override lives on the queue entry,
+/// playback reverts to whatever was in force as soon as the song is over, and
+/// nothing is written back to the playlist file.
+///
+/// Crossfade is deliberately dropped: it spans two playlist entries, and only
+/// one of them is being queued.
+#[tauri::command]
+pub fn queue_playlist_entry(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    playlist_id: String,
+    index: usize,
+    next: bool,
+) -> Cmd<()> {
+    state.cancel_preview();
+    let Some((_, p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    let Some(entry) = p.tracks.get(index) else {
+        return Err("that playlist entry no longer exists".into());
+    };
+
+    let track = state
+        .db
+        .resolve(
+            entry.musicbrainz_recording_id.as_deref(),
+            &entry.artist,
+            &entry.title,
+            &entry.album,
+        )
+        .map_err(err)?
+        .ok_or_else(|| format!("\"{}\" is not in your library", entry.title))?;
+
+    // When this playlist is already the queue's context its mixer is applied as
+    // the context layer, so folding it in again would pin sections that should
+    // still fall through.
+    let already_playing_it = state
+        .player
+        .lock()
+        .context
+        .as_ref()
+        .map(|c| c.id == playlist_id)
+        .unwrap_or(false);
+
+    let empty = MixerSettings::default();
+    let mut mixer = if already_playing_it {
+        entry.mixer.clone().unwrap_or_default()
+    } else {
+        p.mixer
+            .as_ref()
+            .unwrap_or(&empty)
+            .overlay(entry.mixer.as_ref().unwrap_or(&empty))
+    };
+    mixer.crossfade = None;
+
+    let item = QueueItem {
+        track,
+        mixer: (mixer != MixerSettings::default()).then_some(mixer),
+    };
+
+    let was_empty = {
+        let mut player = state.player.lock();
+        let empty_queue = player.is_empty();
+        if next {
+            player.play_next_items(vec![item]);
+        } else {
+            player.add_to_queue_items(vec![item]);
+        }
+        empty_queue
+    };
+    if was_empty {
+        return start_current(&app, &state);
+    }
+    state.engine.cancel_next();
+    let _ = app.emit("queue-changed", state.player.lock().view());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

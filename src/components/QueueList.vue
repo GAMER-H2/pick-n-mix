@@ -5,13 +5,13 @@
  * Rows are reordered by dragging a handle rather than the row itself, so a
  * drag can never be mistaken for a click on the song.
  */
-import { computed, ref } from "vue";
+import { computed, nextTick, onMounted, ref } from "vue";
 import PnmIcon from "./icons/PnmIcon.vue";
 import Artwork from "./Artwork.vue";
 import { formatDuration, subtitleFor } from "@/lib/format";
 import type { Track } from "@/lib/types";
 
-withDefaults(
+const props = withDefaults(
   defineProps<{
     items: Track[];
     currentIndex: number | null;
@@ -34,6 +34,50 @@ const dragFrom = ref<number | null>(null);
 const dropAt = ref<number | null>(null);
 
 const isDragging = computed(() => dragFrom.value !== null);
+
+/** The ancestor that actually scrolls this list. */
+function scrollParent(element: HTMLElement): HTMLElement | null {
+  let parent = element.parentElement;
+  while (parent) {
+    const overflow = getComputedStyle(parent).overflowY;
+    if (overflow === "auto" || overflow === "scroll") return parent;
+    parent = parent.parentElement;
+  }
+  return null;
+}
+
+/**
+ * Put the playing track in the middle of the view when the queue is opened.
+ *
+ * Done by hand rather than with `scrollIntoView({ block: "center" })`, which
+ * walks every scrollable ancestor and would drag the page behind the panel
+ * along with it.
+ */
+function centreOnCurrent() {
+  const container = listEl.value;
+  const index = props.currentIndex;
+  if (!container || index === null) return;
+
+  const rows = container.querySelectorAll<HTMLElement>("[data-row]");
+  const row = rows[index];
+  const scroller = scrollParent(container);
+  if (!row || !scroller) return;
+
+  // Measured against the scroller rather than via `offsetTop`, which is
+  // relative to the nearest positioned ancestor and need not be this one.
+  const rowBox = row.getBoundingClientRect();
+  const scrollerBox = scroller.getBoundingClientRect();
+  const offsetWithin = scroller.scrollTop + rowBox.top - scrollerBox.top;
+  const target = offsetWithin - scroller.clientHeight / 2 + rowBox.height / 2;
+  scroller.scrollTop = Math.max(0, target);
+}
+
+// On mount only: the queue is centred when it is brought up, and left alone
+// afterwards so it cannot yank itself away from someone scrolling it.
+onMounted(async () => {
+  await nextTick();
+  centreOnCurrent();
+});
 
 /** Which gap the pointer is currently over, 0..items.length. */
 function gapAt(clientY: number): number {

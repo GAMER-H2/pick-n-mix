@@ -259,6 +259,8 @@ export interface PlaylistSummary {
   trackCount: number;
   artwork: string | null;
   hasMixer: boolean;
+  /** Ignore the stored order and reshuffle on every play. */
+  shuffleOnly: boolean;
   path: string;
 }
 
@@ -291,6 +293,7 @@ export interface ResolvedPlaylist {
   artwork: string | null;
   createdAt: number;
   updatedAt: number;
+  shuffleOnly: boolean;
   mixer: MixerSettings | null;
   items: ResolvedEntry[];
   missingCount: number;

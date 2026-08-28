@@ -277,8 +277,10 @@ function openMenu(index: number, event: MouseEvent) {
 }
 
 .screen__art :deep(.artwork) {
-  width: min(380px, 34vw) !important;
-  height: min(380px, 34vw) !important;
+  /* Scale with both columns and available vertical space. The upper limit keeps
+     the cover visually balanced with the queue on ultrawide displays. */
+  width: clamp(320px, min(46vw, 62vh), 720px) !important;
+  height: clamp(320px, min(46vw, 62vh), 720px) !important;
 }
 
 .screen__meta {
@@ -347,8 +349,9 @@ function openMenu(index: number, event: MouseEvent) {
   }
 
   .screen__art :deep(.artwork) {
-    width: min(240px, 40vw) !important;
-    height: min(240px, 40vw) !important;
+    /* The single-column layout still leaves meaningful room for the queue. */
+    width: clamp(280px, min(54vw, 50vh), 420px) !important;
+    height: clamp(280px, min(54vw, 50vh), 420px) !important;
   }
 }
 </style>

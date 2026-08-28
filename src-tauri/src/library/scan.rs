@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use lofty::config::ParseOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::{Picture, PictureType};
@@ -243,6 +243,36 @@ pub fn store_artwork(dir: &Path, picture: &Picture) -> Result<String> {
     Ok(id)
 }
 
+/// Copy an image the user picked into the artwork cache, keyed by its contents
+/// the same way embedded covers are. The copy is what everything refers to
+/// afterwards, so moving or deleting the original cannot break the reference.
+pub fn store_artwork_file(dir: &Path, source: &Path) -> Result<String> {
+    let data = std::fs::read(source)
+        .with_context(|| format!("reading image {}", source.display()))?;
+
+    let ext = match source
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "png",
+        "gif" => "gif",
+        "webp" => "webp",
+        _ => "jpg",
+    };
+
+    let id = format!("{}.{ext}", stable_id("art", &fingerprint(&data)));
+    let path = dir.join(&id);
+    if !path.exists() {
+        std::fs::create_dir_all(dir).ok();
+        std::fs::write(&path, &data)
+            .with_context(|| format!("writing artwork {}", path.display()))?;
+    }
+    Ok(id)
+}
+
 /// Cheap content fingerprint: length plus a sample of the bytes. Artwork files
 /// that collide here would have to be the same size and match at every probe.
 fn fingerprint(data: &[u8]) -> String {
@@ -293,6 +323,42 @@ mod tests {
         let c = vec![9u8, 8, 7, 6, 5];
         assert_eq!(fingerprint(&a), fingerprint(&b));
         assert_ne!(fingerprint(&a), fingerprint(&c));
+    }
+
+    #[test]
+    fn a_chosen_image_is_copied_into_the_cache_and_survives_the_original() {
+        let dir = std::env::temp_dir().join(format!(
+            "pnm-art-{}",
+            stable_id("d", &format!("{:?}", std::time::Instant::now()))
+        ));
+        let cache = dir.join("artwork");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let source = dir.join("cover.png");
+        std::fs::write(&source, b"pretend png bytes").unwrap();
+
+        let id = store_artwork_file(&cache, &source).unwrap();
+        assert!(id.ends_with(".png"), "the source extension is kept: {id}");
+
+        // The point of copying: deleting what the user picked changes nothing.
+        std::fs::remove_file(&source).unwrap();
+        assert_eq!(
+            std::fs::read(cache.join(&id)).unwrap(),
+            b"pretend png bytes"
+        );
+
+        // Content-addressed, so the same image chosen twice is stored once.
+        let again = dir.join("copy-of-cover.png");
+        std::fs::write(&again, b"pretend png bytes").unwrap();
+        assert_eq!(store_artwork_file(&cache, &again).unwrap(), id);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_image_is_reported_rather_than_stored() {
+        let cache = std::env::temp_dir().join("pnm-art-missing");
+        assert!(store_artwork_file(&cache, Path::new("/nope/not-here.png")).is_err());
     }
 
     #[test]

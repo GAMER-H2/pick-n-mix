@@ -1,5 +1,6 @@
 import { createRouter, createWebHashHistory } from "vue-router";
 import { trackNavigation } from "./lib/navigation";
+import { trackScrollPositions } from "./lib/viewState";
 
 /**
  * Hash history: the app is served from a custom scheme inside the webview,
@@ -28,3 +29,4 @@ export const router = createRouter({
 });
 
 trackNavigation(router);
+trackScrollPositions(router);

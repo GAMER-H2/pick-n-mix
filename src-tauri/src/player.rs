@@ -165,16 +165,20 @@ impl Player {
 
     /// Insert directly after the current track.
     pub fn play_next(&mut self, tracks: Vec<Track>) {
-        if tracks.is_empty() {
+        self.play_next_items(tracks.into_iter().map(QueueItem::from).collect());
+    }
+
+    /// As [`Player::play_next`], for entries that carry their own override.
+    pub fn play_next_items(&mut self, items: Vec<QueueItem>) {
+        if items.is_empty() {
             return;
         }
         if self.queue.is_empty() {
-            self.set_queue(tracks, 0);
+            self.set_queue_items(items, 0);
             return;
         }
         let insert_at = self.queue.len();
-        self.queue
-            .extend(tracks.iter().cloned().map(QueueItem::from));
+        self.queue.extend(items);
         let new_indices: Vec<usize> = (insert_at..self.queue.len()).collect();
         for (offset, index) in new_indices.into_iter().enumerate() {
             self.order.insert(self.cursor + 1 + offset, index);
@@ -183,15 +187,20 @@ impl Player {
 
     /// Append to the very end of the play order.
     pub fn add_to_queue(&mut self, tracks: Vec<Track>) {
-        if tracks.is_empty() {
+        self.add_to_queue_items(tracks.into_iter().map(QueueItem::from).collect());
+    }
+
+    /// As [`Player::add_to_queue`], for entries that carry their own override.
+    pub fn add_to_queue_items(&mut self, items: Vec<QueueItem>) {
+        if items.is_empty() {
             return;
         }
         if self.queue.is_empty() {
-            self.set_queue(tracks, 0);
+            self.set_queue_items(items, 0);
             return;
         }
         let start = self.queue.len();
-        self.queue.extend(tracks.into_iter().map(QueueItem::from));
+        self.queue.extend(items);
         self.order.extend(start..self.queue.len());
     }
 
@@ -398,7 +407,7 @@ impl Player {
 
 /// Fisher-Yates using a cheap xorshift seeded from the clock. Playlist order
 /// does not need cryptographic randomness, and this avoids a dependency.
-fn shuffle_in_place(items: &mut [usize]) {
+pub(crate) fn shuffle_in_place<T>(items: &mut [T]) {
     if items.len() < 2 {
         return;
     }
@@ -477,6 +486,65 @@ mod tests {
         p.play_next(extra);
         assert_eq!(p.advance(false).unwrap().id, "x");
         assert_eq!(p.advance(false).unwrap().id, "t1");
+    }
+
+    /// A song queued out of a playlist brings that playlist's mixer with it,
+    /// applied to that one play and to nothing around it.
+    #[test]
+    fn a_queued_entry_keeps_its_own_mixer_and_gives_it_back_afterwards() {
+        let mut p = Player::new();
+        p.set_queue(tracks(2), 0);
+
+        let queued = QueueItem {
+            track: Track {
+                id: "guest".into(),
+                ..Default::default()
+            },
+            mixer: Some(MixerSettings {
+                reverb: Some(Reverb {
+                    enabled: true,
+                    mix: 0.8,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        p.play_next_items(vec![queued]);
+
+        // The song it was queued from is unaffected.
+        assert_eq!(p.effective_mixer().reverb.mix, Reverb::default().mix);
+
+        assert_eq!(p.advance(false).unwrap().id, "guest");
+        assert_eq!(p.effective_mixer().reverb.mix, 0.8, "the override applies");
+
+        assert_eq!(p.advance(false).unwrap().id, "t1");
+        assert_eq!(
+            p.effective_mixer().reverb.mix,
+            Reverb::default().mix,
+            "and is gone once that song is over"
+        );
+    }
+
+    #[test]
+    fn appending_entries_preserves_their_overrides() {
+        let mut p = Player::new();
+        p.set_queue(tracks(1), 0);
+        p.add_to_queue_items(vec![QueueItem {
+            track: Track {
+                id: "guest".into(),
+                ..Default::default()
+            },
+            mixer: Some(MixerSettings {
+                lofi: Some(crate::audio::params::Lofi {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }]);
+
+        assert_eq!(p.advance(false).unwrap().id, "guest");
+        assert!(p.effective_mixer().lofi.enabled);
     }
 
     #[test]

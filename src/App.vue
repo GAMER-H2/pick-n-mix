@@ -6,7 +6,9 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import Sidebar from "./components/Sidebar.vue";
+import PnmIcon from "./components/icons/PnmIcon.vue";
 import NowPlayingBar from "./components/NowPlayingBar.vue";
 import QueuePanel from "./components/QueuePanel.vue";
 import AdvancedMixer from "./components/mixer/AdvancedMixer.vue";
@@ -20,6 +22,7 @@ import { useMixerStore } from "./stores/mixer";
 import { useCrossfadeStore } from "./stores/crossfade";
 import { useUiStore } from "./stores/ui";
 import { installShortcuts } from "./lib/keyboard";
+import { registerScroller } from "./lib/viewState";
 import type { PlaybackSnapshot, QueueView, ResolvedMixer, Track } from "./lib/types";
 
 const player = usePlayerStore();
@@ -32,9 +35,84 @@ const route = useRoute();
 const router = useRouter();
 
 const isNowPlaying = computed(() => route.name === "nowPlaying");
+const usesCustomTitlebar = ref(false);
+const isMaximized = ref(false);
+const isFocused = ref(true);
+/** The scrolling element, handed to the back/forward scroll restore. */
+const mainEl = ref<HTMLElement | null>(null);
+
+type ResizeDirection =
+  | "East"
+  | "North"
+  | "NorthEast"
+  | "NorthWest"
+  | "South"
+  | "SouthEast"
+  | "SouthWest"
+  | "West";
+
+const resizeRegions: ReadonlyArray<{ direction: ResizeDirection; className: string }> = [
+  { direction: "North", className: "app__resize-region--north" },
+  { direction: "NorthEast", className: "app__resize-region--north-east" },
+  { direction: "East", className: "app__resize-region--east" },
+  { direction: "SouthEast", className: "app__resize-region--south-east" },
+  { direction: "South", className: "app__resize-region--south" },
+  { direction: "SouthWest", className: "app__resize-region--south-west" },
+  { direction: "West", className: "app__resize-region--west" },
+  { direction: "NorthWest", className: "app__resize-region--north-west" },
+];
+
+/**
+ * Whether this window has to draw its own frame.
+ *
+ * Asked of the window rather than inferred from the user agent, so it stays
+ * true to whatever `decorations` the platform config actually applied instead
+ * of being a second, silently divergent source of truth.
+ */
+async function usesClientSideDecorations() {
+  if (!("__TAURI_INTERNALS__" in window)) return false;
+  try {
+    return !(await getCurrentWindow().isDecorated());
+  } catch (error) {
+    reportWindowControlError(error);
+    return false;
+  }
+}
+
+/** Kept in step so the frame and its shadow drop away when maximised. */
+async function syncMaximized() {
+  try {
+    isMaximized.value = await getCurrentWindow().isMaximized();
+  } catch (error) {
+    reportWindowControlError(error);
+  }
+}
+
+async function minimizeWindow() {
+  await getCurrentWindow().minimize();
+}
+
+async function toggleMaximizeWindow() {
+  await getCurrentWindow().toggleMaximize();
+  await syncMaximized();
+}
+
+async function closeWindow() {
+  await getCurrentWindow().close();
+}
+
+async function startResizeWindow(direction: ResizeDirection) {
+  await getCurrentWindow().startResizeDragging(direction);
+}
+
+function reportWindowControlError(error: unknown) {
+  console.error("Unable to change the window state:", error);
+}
 
 const unlisteners = ref<UnlistenFn[]>([]);
 let removeShortcuts: (() => void) | null = null;
+let unlistenResize: UnlistenFn | null = null;
+let unlistenFocus: UnlistenFn | null = null;
 
 onMounted(async () => {
   // Follow the system appearance.
@@ -43,6 +121,27 @@ onMounted(async () => {
     document.documentElement.setAttribute("data-theme", media.matches ? "dark" : "light");
   applyTheme();
   media.addEventListener("change", applyTheme);
+
+  if (await usesClientSideDecorations()) {
+    usesCustomTitlebar.value = true;
+    document.documentElement.classList.add("is-custom-titlebar");
+    await syncMaximized();
+    // Maximising, tiling and snapping all arrive as a resize.
+    unlistenResize = await getCurrentWindow().onResized(() => {
+      void syncMaximized();
+    });
+
+    try {
+      isFocused.value = await getCurrentWindow().isFocused();
+    } catch (error) {
+      reportWindowControlError(error);
+    }
+    unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload }) => {
+      isFocused.value = payload;
+    });
+  }
+
+  registerScroller(mainEl.value);
 
   removeShortcuts = installShortcuts(player, ui, router);
 
@@ -82,17 +181,58 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   unlisteners.value.forEach((un) => un());
   removeShortcuts?.();
+  unlistenResize?.();
+  unlistenFocus?.();
+  registerScroller(null);
+  document.documentElement.classList.remove("is-custom-titlebar");
 });
 </script>
 
 <template>
-  <div class="app">
+  <div
+    class="app"
+    :class="{
+      'app--framed': usesCustomTitlebar,
+      'is-maximized': isMaximized,
+      'is-unfocused': !isFocused,
+    }"
+  >
     <div class="app__body">
       <Sidebar />
 
-      <main class="app__main" :class="{ 'is-screen': isNowPlaying }">
-        <!-- Draggable strip beneath the overlay title bar. -->
-        <div v-if="!isNowPlaying" class="app__titlebar" data-tauri-drag-region />
+      <main ref="mainEl" class="app__main" :class="{ 'is-screen': isNowPlaying }">
+        <div v-if="!isNowPlaying || usesCustomTitlebar" class="app__titlebar">
+          <div class="app__drag-region" data-tauri-drag-region />
+          <div v-if="usesCustomTitlebar" class="app__window-controls">
+            <button
+              class="icon-button app__window-control"
+              type="button"
+              title="Minimize"
+              aria-label="Minimize window"
+              @click="minimizeWindow().catch(reportWindowControlError)"
+            >
+              <PnmIcon name="minimize" :size="16" />
+            </button>
+            <button
+              class="icon-button app__window-control"
+              type="button"
+              title="Maximize or restore"
+              aria-label="Maximize or restore window"
+              @click="toggleMaximizeWindow().catch(reportWindowControlError)"
+            >
+              <PnmIcon name="maximize" :size="15" />
+            </button>
+            <button
+              class="icon-button app__window-control app__window-control--close"
+              type="button"
+              title="Close"
+              aria-label="Close window"
+              @click="closeWindow().catch(reportWindowControlError)"
+            >
+              <PnmIcon name="close" :size="16" />
+            </button>
+          </div>
+        </div>
         <!-- The full-screen player owns its lightweight curtain fade. Keeping
              the blurred view outside a route-level opacity transition avoids
              re-compositing its filters on every animation frame. -->
@@ -124,15 +264,82 @@ onBeforeUnmount(() => {
     <ContextMenu />
     <AddToPlaylistDialog />
     <DuplicateFilesDialog />
+
+    <!-- Only meaningful without server-side decorations; on every other
+         platform these would be invisible strips swallowing clicks along the
+         window edges, including on the scrollbar. -->
+    <template v-if="usesCustomTitlebar && !isMaximized">
+      <div
+        v-for="region in resizeRegions"
+        :key="region.direction"
+        class="app__resize-region"
+        :class="region.className"
+        @pointerdown.prevent="startResizeWindow(region.direction).catch(reportWindowControlError)"
+      />
+    </template>
   </div>
 </template>
 
 <style scoped>
+:global(html.is-custom-titlebar),
+:global(html.is-custom-titlebar body),
+:global(html.is-custom-titlebar #app) {
+  background: transparent;
+}
+
+/* How much of the window is given over to the shadow on each side. A blur
+   cannot spread further than this, so it sets the softness ceiling. */
+.app {
+  --frame-inset: 24px;
+}
+
 .app {
   display: flex;
   flex-direction: column;
   height: 100%;
   background: var(--bg);
+}
+
+/*
+ * Client-side decorations have to draw their own shadow: KWin only shadows
+ * windows it decorates itself. The window is therefore made slightly larger
+ * than the visible app and the difference left transparent, which is the same
+ * trick GTK uses for its CSD windows — a shadow drawn on an element flush with
+ * the window edge would simply be clipped away.
+ */
+.app--framed {
+  overflow: hidden;
+  height: calc(100% - var(--frame-inset) * 2);
+  margin: var(--frame-inset);
+  border-radius: 11px;
+  /* Shaped after KWin's own: a hairline edge, then a broad, soft, mostly
+     downward falloff rather than a tight dark ring. The hairline follows the
+     theme because a black one disappears into a dark desktop — which is most
+     of the reason an undecorated window looks flat.
+
+     Every layer stays inside `--frame-inset`, since anything spreading further
+     is simply clipped by the window and wasted. */
+  box-shadow:
+    0 0 0 1px var(--window-edge),
+    0 1px 2px rgba(0, 0, 0, 0.22),
+    0 4px 10px rgba(0, 0, 0, 0.24),
+    0 10px 28px rgba(0, 0, 0, 0.3);
+  transition: box-shadow 0.16s var(--ease);
+}
+
+/* An inactive window keeps its outline but loses the shadow, so the focused
+   window is the one that stands off the desktop. */
+.app--framed.is-unfocused {
+  box-shadow: 0 0 0 1px var(--window-edge);
+}
+
+/* Maximised and tiled windows sit flush against their edges, so the inset and
+   the shadow would only show as a gap. */
+.app--framed.is-maximized {
+  height: 100%;
+  margin: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .app__body {
@@ -159,8 +366,100 @@ onBeforeUnmount(() => {
   position: sticky;
   top: 0;
   z-index: 5;
+  display: flex;
   height: 30px;
   background: linear-gradient(var(--bg) 60%, transparent);
+}
+
+.app__drag-region {
+  flex: 1;
+}
+
+.app__window-controls {
+  position: relative;
+  z-index: 6;
+  display: flex;
+  padding-right: 3px;
+}
+
+.app__window-control {
+  width: 30px;
+  height: 30px;
+  border-radius: 0;
+}
+
+.app__window-control--close:hover {
+  background: #d83b01;
+  color: #fff;
+}
+
+.app__resize-region {
+  position: fixed;
+  z-index: 5;
+}
+
+.app__resize-region--north,
+.app__resize-region--south {
+  right: var(--frame-inset);
+  left: var(--frame-inset);
+  height: var(--frame-inset);
+  cursor: ns-resize;
+}
+
+.app__resize-region--north {
+  top: 0;
+}
+
+.app__resize-region--south {
+  bottom: 0;
+}
+
+.app__resize-region--east,
+.app__resize-region--west {
+  top: var(--frame-inset);
+  bottom: var(--frame-inset);
+  width: var(--frame-inset);
+  cursor: ew-resize;
+}
+
+.app__resize-region--east {
+  right: 0;
+}
+
+.app__resize-region--west {
+  left: 0;
+}
+
+.app__resize-region--north-east,
+.app__resize-region--north-west,
+.app__resize-region--south-east,
+.app__resize-region--south-west {
+  width: var(--frame-inset);
+  height: var(--frame-inset);
+}
+
+.app__resize-region--north-east {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+
+.app__resize-region--north-west {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+
+.app__resize-region--south-east {
+  right: 0;
+  bottom: 0;
+  cursor: nwse-resize;
+}
+
+.app__resize-region--south-west {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
 }
 
 .app__scan {

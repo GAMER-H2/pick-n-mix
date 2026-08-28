@@ -28,8 +28,10 @@ const position = computed(() => {
 
   const playlistRows = m.playlistId !== undefined && m.entryIndex !== undefined ? 2 : 0;
   const duplicateRows = m.tracks.length === 1 && t.fileCount > 1 ? 1 : 0;
-  const buttonCount = 6 + (t.album.trim() === "" ? 0 : 1) + playlistRows + duplicateRows;
-  const separatorCount = 2 + (playlistRows > 0 ? 1 : 0);
+  const optionRows = m.playlistOptions ? (m.playlistOptions.hasArtwork ? 3 : 2) : 0;
+  const buttonCount =
+    6 + (t.album.trim() === "" ? 0 : 1) + playlistRows + duplicateRows + optionRows;
+  const separatorCount = 2 + (playlistRows > 0 ? 1 : 0) + (optionRows > 0 ? 1 : 0);
   const width = 232;
   const height = Math.min(buttonCount * 31 + separatorCount * 11 + 10, window.innerHeight - 16);
 
@@ -47,6 +49,8 @@ interface Item {
   separated?: boolean;
   danger?: boolean;
   warning?: boolean;
+  /** Draws a tick on the right, for options that are on or off. */
+  checked?: boolean;
 }
 
 const items = computed<Item[]>(() => {
@@ -62,12 +66,31 @@ const items = computed<Item[]>(() => {
 
   const tracks = [...m.tracks];
 
+  /**
+   * Queuing a song out of a playlist takes that playlist's mixer with it, for
+   * that one play only. The dedicated command exists so the playlist and entry
+   * layers are collapsed onto the queue entry rather than being lost, which is
+   * what queuing the bare track id would do.
+   */
+  const fromPlaylistEntry =
+    m.playlistId !== undefined && m.entryIndex !== undefined && count === 1
+      ? { playlistId: m.playlistId, index: m.entryIndex }
+      : null;
+
   const list: Item[] = [
     {
       label: "Play Next",
       icon: "playNext",
       action: async () => {
-        await api.playNext(ids);
+        if (fromPlaylistEntry) {
+          await api.queuePlaylistEntry(
+            fromPlaylistEntry.playlistId,
+            fromPlaylistEntry.index,
+            true,
+          );
+        } else {
+          await api.playNext(ids);
+        }
         // Refresh explicitly as well as listening for the event, so the panel
         // is right even if the event is missed, and say so either way.
         await player.refreshQueue();
@@ -78,7 +101,15 @@ const items = computed<Item[]>(() => {
       label: "Add to Queue",
       icon: "addToQueue",
       action: async () => {
-        await api.addToQueue(ids);
+        if (fromPlaylistEntry) {
+          await api.queuePlaylistEntry(
+            fromPlaylistEntry.playlistId,
+            fromPlaylistEntry.index,
+            false,
+          );
+        } else {
+          await api.addToQueue(ids);
+        }
         await player.refreshQueue();
         ui.notify(`Added ${what} to the queue`);
       },
@@ -163,6 +194,30 @@ const items = computed<Item[]>(() => {
     });
   }
 
+  // Options for the playlist as a whole, from its own "more" button.
+  const options = m.playlistOptions;
+  if (options) {
+    list.push({
+      label: "Shuffle-Only",
+      icon: "shuffle",
+      separated: true,
+      checked: options.shuffleOnly,
+      action: options.onToggleShuffleOnly,
+    });
+    list.push({
+      label: "Change Image…",
+      icon: "image",
+      action: options.onChooseArtwork,
+    });
+    if (options.hasArtwork) {
+      list.push({
+        label: "Reset Image",
+        icon: "trash",
+        action: options.onClearArtwork,
+      });
+    }
+  }
+
   return list;
 });
 
@@ -203,6 +258,7 @@ onBeforeUnmount(() => {
           class="menu__item"
           :class="{ 'is-danger': item.danger }"
           role="menuitem"
+          :aria-checked="item.checked === undefined ? undefined : item.checked"
           @click="run(item)"
         >
           <PnmIcon
@@ -212,6 +268,7 @@ onBeforeUnmount(() => {
             :size="17"
           />
           <span>{{ item.label }}</span>
+          <PnmIcon v-if="item.checked" class="menu__tick" name="check" :size="15" />
         </button>
       </template>
     </div>
@@ -248,6 +305,11 @@ onBeforeUnmount(() => {
 .menu__item:hover {
   background: var(--accent);
   color: var(--accent-contrast);
+}
+
+.menu__tick {
+  margin-left: auto;
+  flex: none;
 }
 
 .menu__icon.is-warning {

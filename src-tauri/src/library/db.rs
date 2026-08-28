@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::library::model::{match_key, normalise, stable_id, Album, Artist, Track, TrackFile};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -71,24 +71,40 @@ impl Db {
             "#,
         )?;
 
-        let has_legacy_tracks = table_exists(&tx, "tracks")?;
-        if has_legacy_tracks {
-            tx.execute_batch("ALTER TABLE tracks RENAME TO legacy_tracks;")?;
-        }
-        create_current_schema(&tx)?;
-
-        if has_legacy_tracks {
-            let legacy = {
-                let mut stmt = tx.prepare(&format!(
-                    "{LEGACY_TRACK_SELECT} FROM legacy_tracks ORDER BY id"
-                ))?;
-                let rows = stmt.query_map([], row_to_legacy_track)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            for track in legacy {
-                upsert_track_tx(&tx, &track)?;
+        // A database that already has the song/file tables is upgraded in
+        // place; only a fresh or pre-songs database gets the schema created.
+        if !table_exists(&tx, "songs")? {
+            let has_legacy_tracks = table_exists(&tx, "tracks")?;
+            if has_legacy_tracks {
+                tx.execute_batch("ALTER TABLE tracks RENAME TO legacy_tracks;")?;
             }
-            tx.execute_batch("DROP TABLE legacy_tracks;")?;
+            create_current_schema(&tx)?;
+
+            if has_legacy_tracks {
+                let legacy = {
+                    let mut stmt = tx.prepare(&format!(
+                        "{LEGACY_TRACK_SELECT} FROM legacy_tracks ORDER BY id"
+                    ))?;
+                    let rows = stmt.query_map([], row_to_legacy_track)?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for track in legacy {
+                    upsert_track_tx(&tx, &track)?;
+                }
+                tx.execute_batch("DROP TABLE legacy_tracks;")?;
+            }
+        }
+
+        // Schema 1 -> 2: per-file match key, so duplicate detection can look
+        // candidates up through an index rather than scanning every file.
+        if !column_exists(&tx, "track_files", "match_key")? {
+            tx.execute_batch(
+                r#"
+                ALTER TABLE track_files ADD COLUMN match_key TEXT NOT NULL DEFAULT '';
+                CREATE INDEX IF NOT EXISTS idx_files_matchkey ON track_files (match_key);
+                "#,
+            )?;
+            backfill_file_match_keys(&tx)?;
         }
 
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -651,6 +667,10 @@ fn create_current_schema(tx: &Transaction<'_>) -> Result<()> {
             added_at                 INTEGER NOT NULL DEFAULT 0,
             modified_at              INTEGER NOT NULL DEFAULT 0,
             available                INTEGER NOT NULL DEFAULT 1,
+            -- Normalised artist|title|album for this file specifically. Indexed
+            -- so duplicate detection can find candidates instead of walking
+            -- every file in the library for every file it indexes.
+            match_key                TEXT NOT NULL DEFAULT '',
             UNIQUE (source_id, location)
         );
 
@@ -665,9 +685,40 @@ fn create_current_schema(tx: &Transaction<'_>) -> Result<()> {
         CREATE INDEX idx_songs_mbid     ON songs (musicbrainz_recording_id);
         CREATE INDEX idx_files_song     ON track_files (song_id);
         CREATE INDEX idx_files_mbid     ON track_files (musicbrainz_recording_id);
+        CREATE INDEX idx_files_matchkey ON track_files (match_key);
         CREATE INDEX idx_aliases_song   ON track_aliases (song_id);
         "#,
     )?;
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Populate `track_files.match_key` for a database written before it existed.
+/// The key is normalised in Rust, so this cannot be a single UPDATE.
+fn backfill_file_match_keys(tx: &Transaction<'_>) -> Result<()> {
+    let rows: Vec<(String, String, String, String)> = {
+        let mut stmt = tx.prepare("SELECT id, artist, title, album FROM track_files")?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, artist, title, album) in rows {
+        tx.execute(
+            "UPDATE track_files SET match_key = ?2 WHERE id = ?1",
+            params![id, match_key(&artist, &title, &album)],
+        )?;
+    }
     Ok(())
 }
 
@@ -762,10 +813,10 @@ fn upsert_track_tx(tx: &Transaction<'_>, track: &Track) -> Result<bool> {
             track_number, disc_number, year, genre, duration_secs, sample_rate,
             channels, bits_per_sample, bitrate_kbps, file_size, format, artwork_id,
             musicbrainz_recording_id, musicbrainz_release_id, gain_db, added_at,
-            modified_at, available
+            modified_at, available, match_key
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-            ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, 1
+            ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, 1, ?26
         )
         "#,
         params![
@@ -794,6 +845,7 @@ fn upsert_track_tx(tx: &Transaction<'_>, track: &Track) -> Result<bool> {
             track.gain_db,
             track.added_at,
             now(),
+            track.match_key(),
         ],
     )?;
     tx.execute(
@@ -835,7 +887,8 @@ fn write_file_fields(
             musicbrainz_release_id = ?21,
             gain_db = ?22,
             modified_at = ?23,
-            available = ?24
+            available = ?24,
+            match_key = ?25
         WHERE id = ?1
         "#,
         params![
@@ -863,29 +916,68 @@ fn write_file_fields(
             track.gain_db,
             now(),
             available,
+            track.match_key(),
         ],
     )?;
     Ok(())
 }
 
 fn find_duplicate_song(tx: &Transaction<'_>, track: &Track) -> Result<Option<String>> {
-    let candidates = load_raw_files(tx, None)?;
-    let mut song_ids: Vec<String> = candidates
-        .iter()
-        .filter(|file| duplicate_match(track, file))
-        .map(|file| file.song_id.clone())
-        .collect();
+    // Narrow to songs that could possibly match before comparing anything.
+    //
+    // `duplicate_match` succeeds by one of exactly two routes: an equal
+    // non-empty recording id, or equal normalised artist, title and album —
+    // which is precisely an equal match key. Both are indexed, so this asks for
+    // a handful of rows rather than reading the whole library for every file
+    // being indexed, which made a first scan quadratic in the library size.
+    let mut song_ids = candidate_song_ids(tx, track)?;
     song_ids.sort();
     song_ids.dedup();
 
     // Requiring agreement with every version prevents duration-tolerance chains
     // from creating a group whose endpoints are more than two seconds apart.
-    Ok(song_ids.into_iter().find(|song_id| {
-        candidates
-            .iter()
-            .filter(|file| file.song_id == *song_id)
-            .all(|file| duplicate_match(track, file))
-    }))
+    for song_id in song_ids {
+        let versions = load_raw_files(tx, Some(&song_id))?;
+        if !versions.is_empty() && versions.iter().all(|file| duplicate_match(track, file)) {
+            return Ok(Some(song_id));
+        }
+    }
+    Ok(None)
+}
+
+/// Songs owning at least one file that could match `track`.
+fn candidate_song_ids(tx: &Transaction<'_>, track: &Track) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+
+    {
+        let mut stmt = tx.prepare("SELECT DISTINCT song_id FROM track_files WHERE match_key = ?1")?;
+        let rows = stmt.query_map(params![track.match_key()], |row| row.get::<_, String>(0))?;
+        for id in rows {
+            ids.push(id?);
+        }
+    }
+
+    // A shared recording id groups files even when the tags disagree, so it
+    // cannot be found through the match key.
+    if let Some(mbid) = track
+        .musicbrainz_recording_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT song_id FROM track_files
+             WHERE musicbrainz_recording_id IS NOT NULL
+               AND musicbrainz_recording_id <> ''
+               AND musicbrainz_recording_id = ?1 COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![mbid], |row| row.get::<_, String>(0))?;
+        for id in rows {
+            ids.push(id?);
+        }
+    }
+
+    Ok(ids)
 }
 
 fn duplicate_match(track: &Track, file: &TrackFile) -> bool {
@@ -1325,6 +1417,68 @@ mod tests {
         value.bitrate_kbps = Some(bitrate);
         value.file_size = Some(u64::from(bitrate) * 1000);
         value
+    }
+
+    /// Candidates are now looked up through an index rather than by reading
+    /// every file, so each route into `duplicate_match` needs to still be
+    /// reachable. This one cannot be found by match key: the tags disagree.
+    #[test]
+    fn a_shared_recording_id_still_groups_files_whose_tags_disagree() {
+        let db = Db::open_in_memory().unwrap();
+
+        let mut first = track("Song", "Artist", "Album", "/m/a.flac");
+        first.musicbrainz_recording_id = Some("mbid-1".into());
+        let mut second = track("Sng (Remaster)", "The Artist", "Album", "/m/b.flac");
+        second.musicbrainz_recording_id = Some("MBID-1".into());
+
+        db.upsert_track(&first).unwrap();
+        db.upsert_track(&second).unwrap();
+
+        assert_eq!(db.song_count().unwrap(), 1, "the recording id groups them");
+        assert_eq!(db.file_count().unwrap(), 2);
+    }
+
+    /// The other route: no recording ids at all, matched purely on tags.
+    #[test]
+    fn matching_tags_still_group_without_any_recording_id() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Song", "Artist", "Album", "/m/a.flac"))
+            .unwrap();
+        db.upsert_track(&track("song", "artist", "album", "/m/b.mp3"))
+            .unwrap();
+
+        assert_eq!(db.song_count().unwrap(), 1);
+        assert_eq!(db.file_count().unwrap(), 2);
+    }
+
+    /// Narrowing must not become a way of accidentally merging things: songs
+    /// that share nothing indexable stay apart.
+    #[test]
+    fn unrelated_songs_are_not_drawn_together_by_the_lookup() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("One", "Artist", "Album", "/m/a.flac"))
+            .unwrap();
+        db.upsert_track(&track("Two", "Artist", "Album", "/m/b.flac"))
+            .unwrap();
+        assert_eq!(db.song_count().unwrap(), 2);
+    }
+
+    /// Tags change on rescan, so the stored key has to change with them or the
+    /// file becomes invisible to the next duplicate lookup.
+    #[test]
+    fn retagging_a_file_updates_the_key_it_is_found_by() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Wrong Title", "Artist", "Album", "/m/a.flac"))
+            .unwrap();
+        // Same location, corrected tags: an update, not a new file.
+        db.upsert_track(&track("Right Title", "Artist", "Album", "/m/a.flac"))
+            .unwrap();
+
+        // A second file carrying the corrected tags must now find it.
+        db.upsert_track(&track("Right Title", "Artist", "Album", "/m/b.mp3"))
+            .unwrap();
+        assert_eq!(db.song_count().unwrap(), 1, "the key followed the retag");
+        assert_eq!(db.file_count().unwrap(), 2);
     }
 
     #[test]

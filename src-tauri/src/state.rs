@@ -83,6 +83,8 @@ pub const SETTING_GLOBAL_MIXER: &str = "mixer.global";
 pub const SETTING_VOLUME: &str = "player.volume";
 pub const SETTING_REPEAT: &str = "player.repeat";
 pub const SETTING_SHUFFLE: &str = "player.shuffle";
+/// Window geometry as the user left it, restored on the next launch.
+pub const SETTING_WINDOW: &str = "window.geometry";
 /// Legacy location for crossfade settings. On startup its value is migrated
 /// into [`SETTING_GLOBAL_MIXER`] when that mixer has no crossfade section.
 pub const SETTING_CROSSFADE: &str = "crossfade.global";

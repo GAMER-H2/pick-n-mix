@@ -40,6 +40,10 @@ pub struct Playlist {
     pub artwork: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Ignore the stored order: every time this playlist is played, shuffle it.
+    /// Starting on a chosen track still honours that choice, and only the songs
+    /// after it are shuffled.
+    pub shuffle_only: bool,
     /// Mixer override applied to everything played from this playlist.
     pub mixer: Option<MixerSettings>,
     pub tracks: Vec<Entry>,
@@ -60,6 +64,7 @@ impl Default for Playlist {
             artwork: None,
             created_at: now,
             updated_at: now,
+            shuffle_only: false,
             mixer: None,
             tracks: Vec::new(),
             extra: Map::new(),
@@ -440,6 +445,22 @@ mod tests {
                 .mix,
             0.9
         );
+    }
+
+    #[test]
+    fn shuffle_only_defaults_off_and_round_trips() {
+        let dir = tempdir();
+        let path = dir.join("shuffled.pnmx");
+
+        // A file written before the option existed must still load, and must
+        // not suddenly start shuffling itself.
+        std::fs::write(&path, r#"{ "name": "Old", "tracks": [] }"#).unwrap();
+        assert!(!Playlist::load(&path).unwrap().shuffle_only);
+
+        let mut playlist = Playlist::default();
+        playlist.shuffle_only = true;
+        playlist.save(&path).unwrap();
+        assert!(Playlist::load(&path).unwrap().shuffle_only);
     }
 
     #[test]
