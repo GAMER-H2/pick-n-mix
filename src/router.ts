@@ -21,6 +21,7 @@ export const router = createRouter({
       name: "playlist",
       component: () => import("./views/PlaylistView.vue"),
     },
+    { path: "/mix/:kind", name: "mix", component: () => import("./views/MixView.vue") },
     { path: "/album/:id", name: "album", component: () => import("./views/AlbumView.vue") },
     { path: "/artist/:id", name: "artist", component: () => import("./views/ArtistView.vue") },
     { path: "/:pathMatch(.*)*", redirect: "/" },

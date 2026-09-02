@@ -1,5 +1,27 @@
 /** Mirrors the Rust types in `src-tauri/src`. Keep the two in step. */
 
+export type ThemePreference = "system" | "light" | "dark";
+export type FadeMode = "off" | "play" | "pause" | "both";
+
+/** Durable visual, playback, and recommendation preferences. */
+export interface AppPreferences {
+  theme: ThemePreference;
+  accent: string;
+  fadeMode: FadeMode;
+  /** Let reverb and delay tails ring out after a pause. */
+  keepReverbOnPause: boolean;
+  /** Output device by name; empty means the system default. */
+  outputDevice: string;
+  mixLength: number;
+  replayDays: number;
+  replayMinPlays: number;
+  archiveDays: number;
+  archiveMinPlays: number;
+  discoverMaxPlays: number;
+  hiddenBuiltInPresetIds: string[];
+  hiddenBuiltInFilterIds: string[];
+}
+
 interface TrackFields {
   sourceId: string;
   location: string;
@@ -119,6 +141,20 @@ export interface Eq {
   bands: EqBand[];
 }
 
+/**
+ * One frame of the output spectrum, tapped after the whole effect chain.
+ *
+ * The axis travels with the data rather than being duplicated as constants on
+ * this side, so the UI cannot disagree with the engine about what a bin means.
+ */
+export interface AnalyserFrame {
+  /** Magnitudes in dBFS, log-spaced from `minHz` to `maxHz`. */
+  bins: number[];
+  minHz: number;
+  maxHz: number;
+  floorDb: number;
+}
+
 export interface Pitch {
   semitones: number;
   cents: number;
@@ -204,6 +240,7 @@ export interface Preset {
 export interface FilterInfo {
   id: string;
   name: string;
+  builtIn: boolean;
   available: boolean;
   path: string | null;
 }
@@ -262,6 +299,59 @@ export interface PlaylistSummary {
   /** Ignore the stored order and reshuffle on every play. */
   shuffleOnly: boolean;
   path: string;
+}
+
+// -- home ---------------------------------------------------------------------
+
+/** The generated mixes, in the order the home page shows them. */
+export type MixKind = "replay" | "archive" | "discover";
+
+export interface MixSummary {
+  kind: MixKind;
+  name: string;
+  description: string;
+  trackCount: number;
+  /** Covers of the first few songs, for the card's artwork. */
+  artworkIds: string[];
+  pinned: boolean;
+}
+
+/** One recommendation, which is either a song or a whole album. */
+export interface HomePick {
+  kind: "song" | "album";
+  /** Song id, or the stable album id the album view routes by. */
+  id: string;
+  title: string;
+  subtitle: string;
+  artworkId: string | null;
+  /** Why this was picked, shown next to it. */
+  reason: string;
+  trackIds: string[];
+}
+
+export interface HomeShelves {
+  mixes: MixSummary[];
+  picks: HomePick[];
+  recentPlaylists: PlaylistSummary[];
+  /** Counted plays overall, to tell "no history yet" from "empty shelf". */
+  playTotal: number;
+}
+
+export interface Play {
+  songId: string;
+  playedAt: number;
+  secondsPlayed: number;
+  fraction: number;
+  /** Whether this passed the bar to count as a play rather than a skip. */
+  counted: boolean;
+  contextKind: string | null;
+  contextId: string | null;
+}
+
+export interface PlayRecord {
+  play: Play;
+  /** Null once the song has left the library — history outlives it. */
+  track: Track | null;
 }
 
 export interface PlaylistEntry {

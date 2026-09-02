@@ -4,15 +4,20 @@ import { computed, ref } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import { presetSections } from "@/lib/mixer";
 import { useMixerStore } from "@/stores/mixer";
+import { useSettingsStore } from "@/stores/settings";
 import { useUiStore } from "@/stores/ui";
 
 const mixer = useMixerStore();
+const settings = useSettingsStore();
 const ui = useUiStore();
 const open = ref(false);
 const naming = ref(false);
 const draftName = ref("");
 
 const current = computed(() => mixer.targetLayer.preset as string | undefined);
+const visiblePresets = computed(() => mixer.presets.filter((preset) =>
+  !preset.builtIn || !settings.preferences.hiddenBuiltInPresetIds.includes(preset.id),
+));
 
 async function choose(id: string) {
   const preset = mixer.presets.find((p) => p.id === id);
@@ -49,7 +54,7 @@ async function remove(id: string, event: Event) {
       <div v-if="open" class="preset__menu">
         <div class="preset__group">Built In</div>
         <button
-          v-for="preset in mixer.presets.filter((p) => p.builtIn)"
+          v-for="preset in visiblePresets.filter((p) => p.builtIn)"
           :key="preset.id"
           class="preset__item"
           @click="choose(preset.id)"
@@ -58,10 +63,10 @@ async function remove(id: string, event: Event) {
           <PnmIcon v-if="current === preset.name" name="check" :size="14" />
         </button>
 
-        <template v-if="mixer.presets.some((p) => !p.builtIn)">
+        <template v-if="visiblePresets.some((p) => !p.builtIn)">
           <div class="preset__group">Yours</div>
           <button
-            v-for="preset in mixer.presets.filter((p) => !p.builtIn)"
+            v-for="preset in visiblePresets.filter((p) => !p.builtIn)"
             :key="preset.id"
             class="preset__item"
             @click="choose(preset.id)"

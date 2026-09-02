@@ -33,6 +33,9 @@ lofty = "0.22"
 walkdir = "2"
 trash = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+# Cover art thumbnails: decode whatever embedded picture formats show up in
+# practice, encode thumbnails as jpeg regardless of the source format.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 
 # misc
 anyhow = "1"
@@ -44,6 +47,18 @@ urlencoding = "2"
 # stays pure Rust and self-contained; irrelevant on macOS, which uses
 # MPNowPlayingInfoCenter.
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+
+# Dependencies are optimised even in a debug build, while this crate stays
+# unoptimised and debuggable.
+#
+# Audio decoding and resampling are almost entirely `symphonia` and `rubato`,
+# and unoptimised they are dramatically slower — decoding the six packaged
+# atmospheres took 101 seconds in a plain debug build against 2.4 in release,
+# which is the difference between an atmosphere starting and appearing not to
+# work at all. `tauri dev` builds in debug, so this is the profile the app is
+# actually developed against.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 codegen-units = 1

@@ -41,53 +41,213 @@ highest-quality file's, so a well-tagged MP3 can fill gaps a bare FLAC leaves.
 
 ---
 
-## Medium: settings page
+## Medium: settings page — **done**
 
-**Size:** ~1 day for most of it; the device override is the awkward part.
+**Implemented:** a global Settings workspace opened from the new cog beside the
+history buttons. macOS keeps the cog with Back/Forward, while the Linux custom
+title bar moves it to the opposite edge. The modal uses the same elevated,
+blurred treatment as the expanded EQ, with Theme, Playback, Recommendations,
+Mixer and Library in a fixed left rail and the selected pane centred beside it.
 
-Easy, all frontend plus a key in the existing `settings` table:
-- **Theme** — the CSS already keys off `data-theme`; add system/light/dark.
-- **Fade on pause/play** — the callback already ramps over ~8 ms; expose the
-  constant as a setting.
-- **Library management** — folder add/remove/rescan already exist as commands;
-  this is a screen for them.
+Preferences are one camel-case `AppPreferences` document in the existing SQLite
+`settings` table (`app.preferences`). Rust supplies defaults and clamps user
+input, while `stores/settings.ts` applies appearance immediately and rolls an
+optimistic change back if persistence fails.
 
-The two that need engine work:
-- **Keep reverb on pause.** Right now pause stops the callback draining the
-  ring, which is what makes it instant. To let a tail ring out, pause has to
-  keep pulling and feed silence into the effect chain until it decays, then
-  stop. Doable, but it undoes the "resumes exactly where it stopped" property
-  unless you track how many frames of silence you pushed and rewind by that
-  much.
-- **Output device override.** `AudioEngine` picks the default device once at
-  start-up and the ring is sized from its rate. Changing device means tearing
-  down the stream, the ring and the worker, then reopening at the new rate and
-  reloading the current track at its current position. Cleanest as a
-  `restart(device_id)` on the engine; roughly half a day on its own.
+The panes use the app's own vocabulary rather than a parallel set of controls
+private to this modal: `SelectMenu` instead of native `<select>` (which renders
+as the platform widget and sits badly against everything else), the global
+pill-button styles instead of a second square-button family, `.text-field`'s
+focus ring on inputs, `--bg-sidebar` and the accent-tinted active row from the
+real sidebar, and the shared radius scale throughout.
+
+**What shipped:**
+- **Theme** follows system/light/dark and derives the hover, active and tint
+  tokens from a persisted custom accent rather than changing only `--accent`.
+- **Pause/play fade** defaults off. `fadeMode` is `off`, `play`, `pause` or
+  `both`; the output callback stores that as a directional atomic bitmask and
+  chooses its 12 ms ramp independently when rising and falling. Turning the
+  control off is genuinely immediate rather than merely hiding the option.
+- **Recommendations** exposes mix length and the Replay/Archive/Discover day and
+  play thresholds. `AppState::generate_mix` and the SQL queries consume those
+  values, invalidate held mixes when they change, and refresh the visible Home
+  shelves immediately.
+- **Listening history** reuses `QueueList` in a non-reorderable mode: same art,
+  play affordance and context menu as the queue, but no grip or move path. Each
+  row adds Played/Skipped, timestamp and listened duration; removed-library
+  songs remain visible and clearable. Playing a row closes Settings. Per-song
+  and confirmed clear-all commands invalidate recommendations, and resetting
+  the in-flight `PlayTracker` prevents pre-clear progress being written back
+  when the current song ends.
+- **Preset management** opens the real Advanced DJ Mixer as a sidecar within the
+  Settings workspace. `stores/presetEditor.ts` owns an isolated resolved draft,
+  so turning knobs does not alter live playback and the first backend write is
+  the explicit Save. Custom presets update by stable id; a compiled built-in is
+  immutable and Save creates a custom copy instead. Built-ins can be hidden and
+  restored, with hidden IDs persisted separately from the preset files.
+- **Ambience filters** now carry an explicit `builtIn` flag. Built-ins can be
+  hidden/restored without deleting their audio or stopping an active bed;
+  imported custom files can be deleted. Hidden active filters remain visible in
+  the mixer until switched off. Import and catalogue refresh use the existing
+  app-data filters directory.
+- **Library** manages local folders and rescans through the existing commands.
+  Navidrome and Jellyfin are deliberate preview cards describing merged-source
+  sync and keychain-backed credentials; they do not collect or fake a server
+  configuration before remote playback exists.
+
+`QueueList` gained nullable rows, metadata slots and optional reorder/remove
+controls rather than growing a separate history-only list. `ContextMenuState`
+also gained an optional `onSelect` hook so a menu opened above Settings can close
+the workspace only after an action is chosen, not merely on right-click.
+
+**Keep reverb on pause** is now live. The awkward part was never rendering the
+tail; it was that the ring already holds up to `RING_MILLIS` of *processed
+music* that has not been heard yet. Letting that through makes pause feel late,
+and discarding it loses the listener's place. So pausing with a tail does both:
+the ring is flushed, and the decoder is wound back to `decoded_secs - queued`
+— the position accounting the progress bar already did — which is exactly what
+was heard. The worker then pushes silence through the chain until the output
+falls below an audible floor or an eight-second budget runs out, and
+`tail_active` keeps the callback consuming at full gain even though `playing`
+is already false. Resuming mid-tail flushes again so leftover tail cannot play
+in front of the music. A chain with neither reverb nor delay skips all of this,
+so pause stays instant when there is nothing to ring out.
+
+**Output-device override** is live too, without the wholesale
+`AudioEngine::restart` the sketch assumed. The cpal stream is not `Send`, so it
+already lived on its own thread; that thread now loops on a reopen channel
+instead of sleeping forever, and dropping the old stream is what closes the
+device. The worker is handed the new ring through `Cmd::Rebind` rather than
+being torn down, so the queue, mixer and every other bit of state survive — it
+only re-prepares the chains, limiter, ambience and analyser at the new rate.
+Voices *are* dropped, because a decoder resamples to the rate it was opened
+with, so the command layer reloads the current track at its position and play
+state. A device that fails to open falls back to the default rather than
+leaving the app silent, and a saved device that is no longer plugged in does
+the same at startup while the preference keeps pointing at it.
+
+**Still open:** nothing on this item.
 
 ---
 
-## Medium: expanded EQ modal (Logic-style)
+## Medium: packaged atmospheres — **done**
 
-**Size:** ~2 days.
+**Implemented:** the six royalty-free beds in `audio_assets/` (Rain, Fireplace,
+Forest, City, Ocean and Vinyl Crackle) are bundled as Tauri resources under
+`audio_assets/`, then resolved into the existing ambience catalogue at startup.
+The app does not copy packaged audio into mutable app data: imported user audio
+stays separate, and a custom file with the same built-in id deliberately takes
+precedence.
 
-The DSP side already supports it — bands are arbitrary
-`{kind, freq, gainDb, q, enabled}` and the advanced panel edits all of them.
-What is missing is the *graph*.
+The old user-facing **Filters** label is now **Atmospheres**. An active sound
+shows its small rotary volume knob directly below the button in both mixer
+surfaces, while the existing per-layer settings continue to persist through the
+mixer cascade.
 
-- Compute the response by evaluating each biquad's transfer function at ~256
-  log-spaced frequencies and summing the dB. That maths belongs in TypeScript
-  so it redraws at pointer speed; it duplicates the coefficient formulas in
-  `dsp.rs`, so a shared test-vector fixture is worth having to stop the two
-  drifting.
-- Draw the summed curve plus a faint per-band curve, as an SVG path.
-- Each band is a draggable node: x = frequency (log), y = gain, scroll or
-  vertical drag with a modifier = Q.
-- Add an analyser overlay later — that needs the engine to publish FFT
-  magnitudes, which is a separate chunk.
+Each active built-in is drawn as the thing it is rather than sharing one
+generic shimmer: rain falls as discrete droplets over overcast grey, a
+fireplace flickers with two embers deliberately out of step so it does not read
+as a pulse, city windows drift past on two different column rhythms so the
+skyline is not a barcode, and a record's grooves turn under surface noise.
+Keyed off a `data-atmosphere` attribute, all CSS, and all `transform`/`opacity`
+on pseudo-elements so the compositor handles it and nothing competes with the
+audio thread. Imported sounds have no such vocabulary to draw on and keep the
+plain accent fill. `prefers-reduced-motion` stops the motion but keeps the
+colours — a still fire is still recognisably fire.
 
-**Decisions:** how many bands (Logic has 8 including fixed HP/LP)? Does the
-modal edit the same layer the panel is pointed at, or always global?
+Built-ins remain hideable rather than deletable, custom atmospheres remain
+importable/deletable from Settings, and the backend reports `builtIn` explicitly
+so the two actions cannot be confused.
+
+**Fixed since — two separate causes, both of which looked identical from the
+outside** (a button that lights up and produces nothing):
+
+*The request path.* The worker asked for a bed once and remembered it forever,
+so a decode that failed, a file that was replaced, or a bed dropped from the
+bank by hiding or deleting it left that atmosphere silent for the whole session
+with no way back. Requests now repeat on an interval until the bed actually
+lands (`ambience::BedRequests`), and are forgotten once it does, so a bed
+removed later is fetched again from scratch. Two smaller holes went with it:
+`set_playlist_entry_mixer` never asked for beds a per-song override turned on,
+and `install_bed`/`remove_bed` were read-modify-write on an `ArcSwap`, so an
+install could silently discard a concurrent removal.
+
+*The decode path — the bigger one.* Bed decoding ran inline on the 5 Hz ticker,
+which is the thread that emits the `playback` event driving the progress bar.
+Measured on the packaged assets in a debug build: 0.1–0.5 s each, except
+`vinyl_crackle` at **86 seconds**, because it is the only asset that is not
+48 kHz and so the only one that goes through the sinc resampler. That single
+decode froze the progress bar outright and left every bed queued behind it,
+which is why in practice only the first atmosphere ever started. Two changes:
+
+- Decoding moved to its own `pnm-ambience` thread, blocking on the request
+  stream, so nothing the interface depends on can be held up by it.
+- `[profile.dev.package."*"] opt-level = 2` in `Cargo.toml`. Decoding is almost
+  entirely `symphonia` and `rubato`, and unoptimised they are dramatically
+  slower — the six assets went from **101 s to 8.9 s** in debug, against 2.4 s
+  in release. `tauri dev` builds in debug, so this is the profile the app is
+  actually developed against; the app's own crate stays unoptimised and
+  debuggable.
+
+`tests/ambience_assets.rs` decodes every packaged bed and fails if one is
+missing, silent, or takes long enough to read as broken. It prints each bed's
+rate and timing, so a future asset that needs resampling is visible rather than
+merely slow.
+
+**Worth knowing:** `vinyl_crackle.mp3` is still 44.1 kHz and still ~7 s to load
+in debug, against well under one for the rest. Re-encoding it to 48 kHz would
+remove the resampler from the path entirely; it was left alone rather than
+re-encoding someone's audio without asking.
+
+---
+
+## Medium: expanded EQ modal (Logic-style) — **done**
+
+**Implemented:** `components/mixer/EqModal.vue`, opened by the expand button on
+the advanced panel's EQ section, which used to unfold an inline band table.
+
+**Settled decisions:**
+- **Eight bands by default** — high-pass, low shelf, four peaks, high shelf,
+  low-pass — but still editable: bands can be added up to `dsp::MAX_BANDS`
+  (12), removed, and switched between all five kinds.
+- **The two pass filters ship disabled.** A pass filter has no flat setting, so
+  an enabled one would have quietly changed the sound of every existing mix the
+  moment the default grew from six bands to eight.
+- **The modal edits whichever layer the panel is pointed at**, like every other
+  section. A modal that always edited global would silently discard the
+  playlist or per-song context the panel was opened in.
+- Existing six-band layers keep working untouched: `bands` is a `Vec`, so an
+  older saved mixer is simply a shorter list.
+- `EqSliders` draws a fader per *gain-bearing* band, so the simple mixer still
+  shows the six faders it always did.
+
+**The curve.** `lib/eqCurve.ts` re-derives the RBJ designs from `dsp.rs` and
+evaluates `|H(e^jw)|` at 220 log-spaced points. That is a real duplication of
+the engine's maths, so both sides assert against
+`src/lib/__tests__/fixtures/eq-coefficients.json`, generated by
+`src-tauri/tests/eq_parity.rs` (`PNM_WRITE_FIXTURES=1 cargo test --test
+eq_parity`). The fixture deliberately includes the clamped inputs — sub-10 Hz,
+past Nyquist, Q below the floor — since those are the easiest thing for a
+reimplementation to miss.
+
+**The analyser** was built rather than deferred. `audio/analyser.rs` holds a
+hand-rolled radix-2 FFT (no new dependency for one fixed size), tapped on the
+master bus *after* the limiter so the spectrum reflects the EQ being drawn over
+it. It reduces to 96 log-spaced bins in Rust — with attack/release ballistics
+and the dB conversion — so the UI receives a few dozen ready-to-draw numbers.
+Pulled by `analyser_frame` on demand at frame rate rather than pushed as an
+event, and gated by `set_analyser_enabled` so the FFT only runs while the modal
+is actually open.
+
+**Worth knowing:** nodes are absolutely positioned HTML over the SVG rather
+than SVG circles. Under `preserveAspectRatio="none"` a circle renders as an
+ellipse, and correcting for that means measuring the element and converting
+radii on every resize — which is exactly the machinery `CrossfadeGraph.vue`
+carries and this avoids.
+
+**Still open:** the graph shows a spectrum but no per-band solo/listen, and the
+node cannot be dragged for Q (the wheel does it). Neither seemed worth the
+extra modifier-key surface.
 
 ---
 
@@ -128,44 +288,80 @@ larger feature that builds on this engine work.
 
 ---
 
-## Medium: home page
+## Medium: home page — **done**
 
-**Size:** ~1–2 days. The easiest of the medium items, but it needs history
-that is not being recorded yet.
+**Implemented:** `views/HomeView.vue` — three generated mixes across the top,
+a Top Picks grid of explainable recommendations, and a Recent Playlists row.
+A mix opens as a playlist (`views/MixView.vue`, route `/mix/:kind`) and can be
+played, pinned into the sidebar above real playlists, or saved into a playlist.
 
-Nothing currently tracks plays. That is the whole job; the page itself is a
-few shelves reusing the existing card and row components.
+### Listening history
+
+Schema 3 adds `plays`, which every shelf is derived from:
 
 ```sql
 CREATE TABLE plays (
-    id         INTEGER PRIMARY KEY,
-    track_id   TEXT NOT NULL,
-    played_at  INTEGER NOT NULL,
-    -- How much of it was actually heard, so skips do not count as plays.
-    fraction   REAL NOT NULL
+    id             INTEGER PRIMARY KEY,
+    song_id        TEXT    NOT NULL,
+    played_at      INTEGER NOT NULL,
+    seconds_played REAL    NOT NULL,   -- accumulated while playing only
+    fraction       REAL    NOT NULL,
+    counted        INTEGER NOT NULL,   -- passed the bar, i.e. not a skip
+    context_kind   TEXT, context_id TEXT
 );
 ```
 
-Write a row when a track ends or is skipped, from the same place in
-`lib.rs` that already handles `TrackFinished`. Count it as a play only past
-some threshold — 50% or 4 minutes, whichever comes first, is the usual rule.
+There is deliberately **no foreign key to `songs`**: a rescan legitimately
+deletes and recreates song rows, and history should outlive that. Reads join
+back and ignore orphans.
 
-The four shelves:
-- **Recently played** — `SELECT DISTINCT track_id ... ORDER BY played_at DESC`.
-- **Most played playlists** — needs the play row to record the playback
-  context too, so add a nullable `context_id`.
-- **Archive mix** — "things you have not heard in a while": tracks whose most
-  recent play is older than N months, shuffled. Cheap and genuinely nice.
-- **Simple recommendations** — no ML needed and none wanted. "More from an
-  artist you played this week", "the rest of this album", "not played since
-  2023". Rules like these are explainable, which matters more than clever.
+`history.rs` measures the time rather than inferring it from the playhead.
+This matters more than it looks: position-based counting means scrubbing to
+the end of a track marks it played, and skipping through twenty songs leaves
+twenty plays behind — which is exactly what fills a "most played" shelf with
+music that was rejected on sight. Instead the tracker is ticked from the
+existing 5 Hz ticker and adds only elapsed wall time while the engine reports
+playing, with a per-tick cap so a machine waking from sleep cannot bank an
+hour of "listening".
 
-**Decisions:**
-- Does a skip count as a play? (Suggest: recorded, but flagged by `fraction`.)
-- Is history private/clearable? A "clear listening history" button is worth
-  having from the start rather than retrofitting.
-- Do shelves refresh live, or on app start? Live means invalidating on every
-  track end; on-open is simpler and nobody notices.
+Every route by which one song replaces another funnels through
+`AppState::begin_play`, so a play is recorded exactly once whether the track
+ended, was skipped, or was promoted by a crossfade on the audio thread's own
+schedule. The in-flight play is also banked on window close.
+
+### Settled decisions
+
+- **A skip does not count.** Under 25 seconds heard is a skip; the row is still
+  written (an abandoned song is information) but `counted` is 0 and no shelf
+  looks at it. A song shorter than 25 s counts when essentially finished, or it
+  could be played daily forever and never appear.
+- **Mixes are generated once per session and held** (`AppState::mix`). Two of
+  the three are partly random and all three derive from history that playing
+  them immediately changes, so a live query would reshuffle a mix while it was
+  being listened to. "Regenerate" is the deliberate way to get a new one.
+- **History is clearable.** `clear_listening_history` also drops the held
+  mixes, since leaving them would keep serving recommendations built from data
+  the listener just asked to be rid of. The screen for this belongs in
+  Settings — see that section.
+
+### The mixes
+
+- **Replay** — ≥2 counted plays in the last 30 days, most played first.
+- **Archive** — ≥3 lifetime counted plays but nothing in the last 60 days.
+- **Discover** — built in tiers, because the obvious query ("everything never
+  played") surfaces whatever stray non-music files sit in the library. Every
+  tier needs evidence the song is wanted music: played 1–3 times, or never
+  played but on an album the listener has played, or by an artist they have.
+
+**Top Picks** interleaves three rules so one with many matches cannot fill the
+shelf: "More from {artist}" (played this week, suggesting something not played
+recently), "{n} of {total} played" (a part-heard album), and "Not played since
+{year}". Each pick carries its reason as text — a recommendation that cannot
+explain itself is indistinguishable from a random one, and reads as broken the
+moment it suggests something unwanted.
+
+**Still open:** the history screen itself. `listening_history` and
+`clear_listening_history` exist and are tested; nothing calls them yet.
 
 ---
 

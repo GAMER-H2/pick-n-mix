@@ -59,7 +59,16 @@ watch(
   { immediate: true },
 );
 
+/**
+ * Clicking the row that is already playing toggles it, rather than restarting
+ * it from the beginning. Anything else starts the list from that song.
+ */
 async function play(index = 0) {
+  const track = tracks.value[index];
+  if (track && player.track?.id === track.id) {
+    await player.toggle();
+    return;
+  }
   await player.playTracks(tracks.value, index, {
     kind: "artist",
     id: String(route.params.id),

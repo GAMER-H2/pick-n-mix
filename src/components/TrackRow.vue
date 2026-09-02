@@ -113,7 +113,7 @@ const subtitle = computed(() =>
   gap: 12px;
   height: 56px;
   content-visibility: auto;
-  contain-intrinsic-block-size: 56px;
+  contain-intrinsic-block-size: auto 56px;
   padding: 0 10px 0 4px;
   border-radius: var(--radius-sm);
   position: relative;

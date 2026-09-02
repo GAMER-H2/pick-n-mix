@@ -4,15 +4,18 @@
 //! can be ranked, preferred, marked missing, relinked, or forgotten independently.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
-use crate::library::model::{match_key, normalise, stable_id, Album, Artist, Track, TrackFile};
+use crate::library::model::{
+    match_key, normalise, stable_id, Album, Artist, HomePick, Play, PlayRecord, Track, TrackFile,
+};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -107,6 +110,12 @@ impl Db {
             backfill_file_match_keys(&tx)?;
         }
 
+        // Schema 2 -> 3: listening history, which the home page's mixes and
+        // recommendations are derived from.
+        if !table_exists(&tx, "plays")? {
+            tx.execute_batch(CREATE_PLAYS)?;
+        }
+
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -196,6 +205,389 @@ impl Db {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // -- listening history -----------------------------------------------
+
+    pub fn record_play(&self, play: &Play) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO plays
+               (song_id, played_at, seconds_played, fraction, counted, context_kind, context_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                play.song_id,
+                play.played_at,
+                play.seconds_played,
+                play.fraction,
+                play.counted as i32,
+                play.context_kind,
+                play.context_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Most recent listens first, for the history screen.
+    pub fn recent_plays(&self, limit: usize) -> Result<Vec<PlayRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT song_id, played_at, seconds_played, fraction, counted,
+                    context_kind, context_id
+             FROM plays ORDER BY played_at DESC, id DESC LIMIT ?1",
+        )?;
+        let plays = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(Play {
+                    song_id: row.get(0)?,
+                    played_at: row.get(1)?,
+                    seconds_played: row.get(2)?,
+                    fraction: row.get(3)?,
+                    counted: row.get::<_, i32>(4)? != 0,
+                    context_kind: row.get(5)?,
+                    context_id: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut track_stmt = conn.prepare(&format!("{TRACK_SELECT} WHERE s.id = ?1"))?;
+        plays
+            .into_iter()
+            .map(|play| {
+                let track = track_stmt
+                    .query_row(params![play.song_id], row_to_track)
+                    .optional()?;
+                Ok(PlayRecord { play, track })
+            })
+            .collect()
+    }
+
+    /// How many counted plays exist, so the UI can tell "no history yet" from
+    /// "history exists but this particular mix has nothing in it".
+    pub fn counted_play_total(&self) -> Result<u32> {
+        let conn = self.conn.lock();
+        Ok(
+            conn.query_row("SELECT COUNT(*) FROM plays WHERE counted = 1", [], |row| {
+                row.get(0)
+            })?,
+        )
+    }
+
+    pub fn clear_history(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM plays", [])?;
+        Ok(())
+    }
+
+    pub fn clear_history_for_song(&self, song_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM plays WHERE song_id = ?1", params![song_id])?;
+        Ok(())
+    }
+
+    /// Songs played repeatedly in the recent past.
+    pub fn replay_mix(&self, limit: usize, since: i64, min_plays: u32) -> Result<Vec<Track>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{TRACK_SELECT}
+             JOIN (
+                SELECT song_id, COUNT(*) AS plays, MAX(played_at) AS last_at
+                FROM plays
+                WHERE counted = 1 AND played_at >= ?1
+                GROUP BY song_id
+                HAVING COUNT(*) >= ?3
+             ) p ON p.song_id = s.id
+             ORDER BY p.plays DESC, p.last_at DESC
+             LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![since, limit as i64, min_plays], row_to_track)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Songs that were once played a lot but have gone quiet.
+    pub fn archive_mix(
+        &self,
+        limit: usize,
+        stale_before: i64,
+        min_plays: u32,
+    ) -> Result<Vec<Track>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{TRACK_SELECT}
+             JOIN (
+                SELECT song_id, COUNT(*) AS plays, MAX(played_at) AS last_at
+                FROM plays
+                WHERE counted = 1
+                GROUP BY song_id
+                HAVING COUNT(*) >= ?3 AND MAX(played_at) < ?1
+             ) p ON p.song_id = s.id
+             ORDER BY p.plays DESC, p.last_at ASC
+             LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![stale_before, limit as i64, min_plays], row_to_track)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Neglected corners of the library.
+    ///
+    /// Built in tiers, because the obvious query — "everything never played" —
+    /// surfaces whatever stray non-music files happen to sit in the library
+    /// alongside the actual albums. Every tier requires some evidence that the
+    /// song is music the listener actually wanted: either they have played it
+    /// themselves, or they have played its album or its artist.
+    pub fn discover_mix(&self, limit: usize, max_plays: u32) -> Result<Vec<Track>> {
+        let conn = self.conn.lock();
+        let mut out: Vec<Track> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // Tier 1: played, but only a handful of times, longest ago first.
+        let mut stmt = conn.prepare(&format!(
+            "{TRACK_SELECT}
+             JOIN (
+                SELECT song_id, COUNT(*) AS plays, MAX(played_at) AS last_at
+                FROM plays
+                WHERE counted = 1
+                GROUP BY song_id
+                HAVING COUNT(*) BETWEEN 1 AND ?2
+             ) p ON p.song_id = s.id
+             ORDER BY p.last_at ASC
+             LIMIT ?1"
+        ))?;
+        for track in stmt.query_map(params![limit as i64, max_plays], row_to_track)? {
+            let track = track?;
+            if seen.insert(track.id.clone()) {
+                out.push(track);
+            }
+        }
+        drop(stmt);
+
+        // Tier 2: never played, but sitting on an album the listener has.
+        // Tier 3 widens that to the artist. Both are ordered randomly, which
+        // is the point of the shelf — but the mix is cached for the session,
+        // so it will not reshuffle underfoot.
+        for condition in [
+            "EXISTS (SELECT 1 FROM songs sib
+                     JOIN plays pl ON pl.song_id = sib.id AND pl.counted = 1
+                     WHERE sib.album = s.album) AND s.album <> ''",
+            "EXISTS (SELECT 1 FROM songs sib
+                     JOIN plays pl ON pl.song_id = sib.id AND pl.counted = 1
+                     WHERE COALESCE(NULLIF(sib.album_artist, ''), sib.artist)
+                         = COALESCE(NULLIF(s.album_artist, ''), s.artist))",
+        ] {
+            if out.len() >= limit {
+                break;
+            }
+            let mut stmt = conn.prepare(&format!(
+                "{TRACK_SELECT}
+                 WHERE s.id NOT IN (SELECT song_id FROM plays WHERE counted = 1)
+                   AND {condition}
+                 ORDER BY RANDOM() LIMIT ?1"
+            ))?;
+            for track in stmt.query_map(params![limit as i64], row_to_track)? {
+                let track = track?;
+                if out.len() >= limit {
+                    break;
+                }
+                if seen.insert(track.id.clone()) {
+                    out.push(track);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Playlists ordered by when they were last played from.
+    pub fn recent_playlist_ids(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT context_id, MAX(played_at) AS last_at
+             FROM plays
+             WHERE context_kind = 'playlist' AND context_id IS NOT NULL
+             GROUP BY context_id
+             ORDER BY last_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Explainable recommendations, drawn from three rules and interleaved so
+    /// one rule with a lot of matches cannot fill the whole shelf.
+    pub fn top_picks(&self, limit: usize, now_secs: i64) -> Result<Vec<HomePick>> {
+        const WEEK: i64 = 7 * 86_400;
+        const MONTH: i64 = 30 * 86_400;
+        const YEAR: i64 = 365 * 86_400;
+
+        let from_artists = self.picks_more_from_artist(limit, now_secs - WEEK, now_secs - MONTH)?;
+        let from_albums = self.picks_finish_album(limit)?;
+        let from_age = self.picks_not_played_since(limit, now_secs - YEAR)?;
+
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut sources = [
+            from_artists.into_iter(),
+            from_albums.into_iter(),
+            from_age.into_iter(),
+        ];
+        let mut exhausted = 0;
+        while out.len() < limit && exhausted < sources.len() {
+            exhausted = 0;
+            for source in sources.iter_mut() {
+                match source.next() {
+                    Some(pick) => {
+                        if out.len() < limit && seen.insert(pick.id.clone()) {
+                            out.push(pick);
+                        }
+                    }
+                    None => exhausted += 1,
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// "More from an artist you played this week", skipping anything they have
+    /// already had on recently.
+    fn picks_more_from_artist(
+        &self,
+        limit: usize,
+        played_since: i64,
+        exclude_since: i64,
+    ) -> Result<Vec<HomePick>> {
+        let conn = self.conn.lock();
+        let artists = {
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(NULLIF(s.album_artist, ''), s.artist) AS a, MAX(p.played_at) AS t
+                 FROM plays p JOIN songs s ON s.id = p.song_id
+                 WHERE p.counted = 1 AND p.played_at >= ?1 AND a <> ''
+                 GROUP BY a ORDER BY t DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![played_since, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut stmt = conn.prepare(&format!(
+            "{TRACK_SELECT}
+             WHERE COALESCE(NULLIF(s.album_artist, ''), s.artist) = ?1
+               AND s.id NOT IN
+                   (SELECT song_id FROM plays WHERE counted = 1 AND played_at >= ?2)
+             ORDER BY RANDOM() LIMIT 1"
+        ))?;
+        let mut out = Vec::new();
+        for artist in artists {
+            if let Some(track) = stmt
+                .query_row(params![artist, exclude_since], row_to_track)
+                .optional()?
+            {
+                out.push(HomePick {
+                    kind: "song".into(),
+                    id: track.id.clone(),
+                    title: track.title.clone(),
+                    subtitle: track.artist.clone(),
+                    artwork_id: track.artwork_id.clone(),
+                    reason: format!("More from {artist}"),
+                    track_ids: vec![track.id],
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// "You started this album but never finished it."
+    fn picks_finish_album(&self, limit: usize) -> Result<Vec<HomePick>> {
+        let conn = self.conn.lock();
+        let albums = {
+            let mut stmt = conn.prepare(
+                "SELECT s.album,
+                        COALESCE(NULLIF(s.album_artist, ''), s.artist) AS aa,
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN EXISTS (
+                            SELECT 1 FROM plays p WHERE p.song_id = s.id AND p.counted = 1
+                        ) THEN 1 ELSE 0 END) AS heard
+                 FROM songs s
+                 WHERE s.album <> ''
+                 GROUP BY s.album, aa
+                 HAVING heard > 0 AND heard < total
+                 ORDER BY (heard * 1.0 / total) DESC, total DESC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut stmt = conn.prepare(&format!(
+            "{TRACK_SELECT}
+             WHERE s.album = ?1 AND COALESCE(NULLIF(s.album_artist, ''), s.artist) = ?2
+             ORDER BY s.disc_number, s.track_number"
+        ))?;
+        let mut out = Vec::new();
+        for (album, artist, total, heard) in albums {
+            let tracks = stmt
+                .query_map(params![album, artist], row_to_track)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let Some(first) = tracks.first() else {
+                continue;
+            };
+            out.push(HomePick {
+                kind: "album".into(),
+                id: album_id_for(first),
+                title: album.clone(),
+                subtitle: artist,
+                artwork_id: tracks.iter().find_map(|t| t.artwork_id.clone()),
+                reason: format!("{} of {total} played", heard),
+                track_ids: tracks.into_iter().map(|t| t.id).collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// "You have not heard this since <year>."
+    fn picks_not_played_since(&self, limit: usize, before: i64) -> Result<Vec<HomePick>> {
+        let conn = self.conn.lock();
+        // The song ids and their dates are fetched first rather than joined
+        // into `TRACK_SELECT`: that constant fixes its own select list, so a
+        // joined column would not actually come back in the row.
+        let stale = {
+            let mut stmt = conn.prepare(
+                "SELECT song_id, MAX(played_at) AS last_at
+                 FROM plays WHERE counted = 1
+                 GROUP BY song_id HAVING MAX(played_at) < ?1
+                 ORDER BY last_at ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![before, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut stmt = conn.prepare(&format!("{TRACK_SELECT} WHERE s.id = ?1"))?;
+        let mut out = Vec::new();
+        for (song_id, last_at) in stale {
+            let Some(track) = stmt.query_row(params![song_id], row_to_track).optional()? else {
+                continue;
+            };
+            out.push(HomePick {
+                kind: "song".into(),
+                id: track.id.clone(),
+                title: track.title.clone(),
+                subtitle: track.artist.clone(),
+                artwork_id: track.artwork_id.clone(),
+                reason: format!("Not played since {}", year_of(last_at)),
+                track_ids: vec![track.id],
+            });
+        }
+        Ok(out)
     }
 
     // -- collapsed songs -------------------------------------------------
@@ -689,8 +1081,42 @@ fn create_current_schema(tx: &Transaction<'_>) -> Result<()> {
         CREATE INDEX idx_aliases_song   ON track_aliases (song_id);
         "#,
     )?;
+    tx.execute_batch(CREATE_PLAYS)?;
     Ok(())
 }
+
+/// Listening history.
+///
+/// Rows are kept even when they do not count as a play, because "started and
+/// abandoned after four seconds" is a real signal about a song, and throwing
+/// it away at write time would make it unrecoverable later. `counted` carries
+/// the judgement so the shelf queries do not each have to re-derive it.
+///
+/// No foreign key to `songs`: history should survive a song being removed from
+/// the library and re-added, and a rescan legitimately deletes and recreates
+/// rows. Orphaned history is harmless — every read joins back to `songs` and
+/// so simply ignores it.
+const CREATE_PLAYS: &str = r#"
+CREATE TABLE IF NOT EXISTS plays (
+    id             INTEGER PRIMARY KEY,
+    song_id        TEXT    NOT NULL,
+    played_at      INTEGER NOT NULL,
+    -- Seconds actually heard: accumulated while playing, so pausing and
+    -- seeking cannot inflate it.
+    seconds_played REAL    NOT NULL DEFAULT 0,
+    -- How far through the song that got, 0..1.
+    fraction       REAL    NOT NULL DEFAULT 0,
+    -- Whether this passed the bar to count as a play rather than a skip.
+    counted        INTEGER NOT NULL DEFAULT 0,
+    -- What it was played from, so playlists can be ranked by use.
+    context_kind   TEXT,
+    context_id     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_plays_song    ON plays (song_id, played_at);
+CREATE INDEX IF NOT EXISTS idx_plays_at      ON plays (played_at);
+CREATE INDEX IF NOT EXISTS idx_plays_context ON plays (context_kind, context_id, played_at);
+"#;
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -950,7 +1376,8 @@ fn candidate_song_ids(tx: &Transaction<'_>, track: &Track) -> Result<Vec<String>
     let mut ids = Vec::new();
 
     {
-        let mut stmt = tx.prepare("SELECT DISTINCT song_id FROM track_files WHERE match_key = ?1")?;
+        let mut stmt =
+            tx.prepare("SELECT DISTINCT song_id FROM track_files WHERE match_key = ?1")?;
         let rows = stmt.query_map(params![track.match_key()], |row| row.get::<_, String>(0))?;
         for id in rows {
             ids.push(id?);
@@ -1389,6 +1816,35 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Civil year of a Unix timestamp.
+///
+/// Worked out arithmetically rather than by pulling in a date library: the
+/// only date this codebase ever has to render is the year on a "not played
+/// since" label, and `chrono` would be a large dependency for one integer.
+/// Days are counted from 1970 through whole 400-year cycles, which is exactly
+/// how the Gregorian leap rule repeats, so this stays correct indefinitely.
+fn year_of(timestamp: i64) -> i64 {
+    let mut days = timestamp.div_euclid(86_400);
+    let mut year = 1970;
+
+    let cycles = days.div_euclid(146_097);
+    year += cycles * 400;
+    days -= cycles * 146_097;
+
+    loop {
+        let length = if is_leap(year) { 366 } else { 365 };
+        if days < length {
+            return year;
+        }
+        days -= length;
+        year += 1;
+    }
+}
+
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1794,5 +2250,308 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    // -- listening history ---------------------------------------------
+
+    const DAY: i64 = 86_400;
+
+    fn play(song_id: &str, at: i64, counted: bool) -> Play {
+        Play {
+            song_id: song_id.into(),
+            played_at: at,
+            seconds_played: if counted { 120.0 } else { 4.0 },
+            fraction: if counted { 0.7 } else { 0.02 },
+            counted,
+            context_kind: None,
+            context_id: None,
+        }
+    }
+
+    /// Seed `count` counted plays for a song, spaced a day apart ending at `last`.
+    fn seed_plays(db: &Db, song_id: &str, count: usize, last: i64) {
+        for i in 0..count {
+            db.record_play(&play(song_id, last - (i as i64) * DAY, true))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_skip_is_recorded_but_does_not_feed_the_mixes() {
+        let db = Db::open_in_memory().unwrap();
+        let song = track("Song", "Artist", "Album", "/m/a.flac");
+        db.upsert_track(&song).unwrap();
+        let id = db.all_tracks().unwrap()[0].id.clone();
+
+        let at = now();
+        for _ in 0..5 {
+            db.record_play(&play(&id, at, false)).unwrap();
+        }
+
+        // The rows are kept — "started and abandoned" is real information —
+        // but nothing that ranks by listening counts them.
+        assert_eq!(db.recent_plays(50).unwrap().len(), 5);
+        assert_eq!(db.counted_play_total().unwrap(), 0);
+        assert!(db.replay_mix(20, at - 30 * DAY, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_replay_mix_wants_repeats_not_one_offs() {
+        let db = Db::open_in_memory().unwrap();
+        for (i, title) in ["Repeated", "Once"].iter().enumerate() {
+            db.upsert_track(&track(title, "Artist", "Album", &format!("/m/{i}.flac")))
+                .unwrap();
+        }
+        let tracks = db.all_tracks().unwrap();
+        let repeated = tracks.iter().find(|t| t.title == "Repeated").unwrap();
+        let once = tracks.iter().find(|t| t.title == "Once").unwrap();
+
+        let at = now();
+        seed_plays(&db, &repeated.id, 4, at);
+        seed_plays(&db, &once.id, 1, at);
+
+        let mix = db.replay_mix(20, at - 30 * DAY, 2).unwrap();
+        let titles: Vec<_> = mix.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["Repeated"]);
+        assert!(db.replay_mix(20, at - 30 * DAY, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_replay_mix_ignores_plays_outside_its_window() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Old", "Artist", "Album", "/m/old.flac"))
+            .unwrap();
+        let id = db.all_tracks().unwrap()[0].id.clone();
+
+        let at = now();
+        seed_plays(&db, &id, 5, at - 200 * DAY);
+
+        assert!(db.replay_mix(20, at - 30 * DAY, 2).unwrap().is_empty());
+        // The same song is exactly what the archive mix is for.
+        let archive = db.archive_mix(20, at - 60 * DAY, 3).unwrap();
+        assert_eq!(archive.len(), 1);
+        assert_eq!(archive[0].title, "Old");
+        assert!(db.archive_mix(20, at - 60 * DAY, 6).unwrap().is_empty());
+    }
+
+    /// A song still in rotation is not "archived", however often it was played.
+    #[test]
+    fn the_archive_mix_excludes_anything_played_lately() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Current", "Artist", "Album", "/m/cur.flac"))
+            .unwrap();
+        let id = db.all_tracks().unwrap()[0].id.clone();
+
+        let at = now();
+        seed_plays(&db, &id, 10, at);
+
+        assert!(db.archive_mix(20, at - 60 * DAY, 3).unwrap().is_empty());
+    }
+
+    /// The whole point of the tiering: a stray non-music file that was never
+    /// played, by an artist never played, must not be recommended.
+    #[test]
+    fn the_discover_mix_leaves_unplayed_strays_alone() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Barely", "Known", "Record", "/m/barely.flac"))
+            .unwrap();
+        db.upsert_track(&track("Voice Memo", "", "", "/m/memo.m4a"))
+            .unwrap();
+        let tracks = db.all_tracks().unwrap();
+        let barely = tracks.iter().find(|t| t.title == "Barely").unwrap();
+
+        seed_plays(&db, &barely.id, 2, now());
+
+        let mix = db.discover_mix(20, 3).unwrap();
+        let titles: Vec<_> = mix.iter().map(|t| t.title.as_str()).collect();
+        assert!(titles.contains(&"Barely"), "got {titles:?}");
+        assert!(!titles.contains(&"Voice Memo"), "got {titles:?}");
+    }
+
+    /// An unplayed track earns its place through the album around it.
+    #[test]
+    fn the_discover_mix_reaches_unplayed_tracks_on_a_known_album() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Heard", "Artist", "Album", "/m/1.flac"))
+            .unwrap();
+        db.upsert_track(&track("Unheard", "Artist", "Album", "/m/2.flac"))
+            .unwrap();
+        let tracks = db.all_tracks().unwrap();
+        let heard = tracks.iter().find(|t| t.title == "Heard").unwrap();
+
+        seed_plays(&db, &heard.id, 2, now());
+
+        let titles: Vec<_> = db
+            .discover_mix(20, 3)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert!(titles.iter().any(|t| t == "Unheard"), "got {titles:?}");
+    }
+
+    #[test]
+    fn a_heavily_played_song_is_not_a_discovery() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Favourite", "Artist", "Album", "/m/fav.flac"))
+            .unwrap();
+        let id = db.all_tracks().unwrap()[0].id.clone();
+        seed_plays(&db, &id, 12, now());
+
+        let titles: Vec<_> = db
+            .discover_mix(20, 3)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert!(!titles.iter().any(|t| t == "Favourite"), "got {titles:?}");
+        assert!(db
+            .discover_mix(20, 12)
+            .unwrap()
+            .iter()
+            .any(|track| track.title == "Favourite"));
+    }
+
+    #[test]
+    fn a_half_heard_album_becomes_a_finish_it_pick() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..4 {
+            db.upsert_track(&track(
+                &format!("Track {i}"),
+                "Artist",
+                "Half Album",
+                &format!("/m/{i}.flac"),
+            ))
+            .unwrap();
+        }
+        let tracks = db.all_tracks().unwrap();
+        seed_plays(&db, &tracks[0].id, 2, now());
+
+        let picks = db.top_picks(6, now()).unwrap();
+        let album = picks
+            .iter()
+            .find(|p| p.kind == "album")
+            .expect("expected an album pick");
+        assert_eq!(album.title, "Half Album");
+        assert_eq!(album.reason, "1 of 4 played");
+        // Playing the pick should enqueue the whole album, not just the rest.
+        assert_eq!(album.track_ids.len(), 4);
+    }
+
+    /// A fully-heard album has nothing left to finish.
+    #[test]
+    fn a_complete_album_is_not_offered_to_be_finished() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..2 {
+            db.upsert_track(&track(
+                &format!("Track {i}"),
+                "Artist",
+                "Done",
+                &format!("/m/{i}.flac"),
+            ))
+            .unwrap();
+        }
+        for t in db.all_tracks().unwrap() {
+            seed_plays(&db, &t.id, 2, now());
+        }
+
+        let picks = db.top_picks(6, now()).unwrap();
+        assert!(!picks.iter().any(|p| p.title == "Done"));
+    }
+
+    #[test]
+    fn a_long_forgotten_song_is_labelled_with_its_year() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Forgotten", "Artist", "Album", "/m/f.flac"))
+            .unwrap();
+        let id = db.all_tracks().unwrap()[0].id.clone();
+
+        // 2021-01-01, comfortably over a year before any plausible "now".
+        db.record_play(&play(&id, 1_609_459_200, true)).unwrap();
+
+        let picks = db.top_picks(6, now()).unwrap();
+        let pick = picks
+            .iter()
+            .find(|p| p.title == "Forgotten")
+            .expect("expected the stale song");
+        assert_eq!(pick.reason, "Not played since 2021");
+    }
+
+    #[test]
+    fn playlists_are_ranked_by_when_they_were_last_played_from() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Song", "Artist", "Album", "/m/a.flac"))
+            .unwrap();
+        let id = db.all_tracks().unwrap()[0].id.clone();
+
+        let at = now();
+        for (playlist, when) in [("older", at - 5 * DAY), ("newer", at)] {
+            let mut row = play(&id, when, true);
+            row.context_kind = Some("playlist".into());
+            row.context_id = Some(playlist.into());
+            db.record_play(&row).unwrap();
+        }
+
+        assert_eq!(db.recent_playlist_ids(10).unwrap(), vec!["newer", "older"]);
+    }
+
+    #[test]
+    fn clearing_one_songs_history_leaves_other_songs_history() {
+        let db = Db::open_in_memory().unwrap();
+        for (title, path) in [("Clear", "/m/a.flac"), ("Keep", "/m/b.flac")] {
+            db.upsert_track(&track(title, "Artist", "Album", path))
+                .unwrap();
+        }
+        let tracks = db.all_tracks().unwrap();
+        let clear = tracks.iter().find(|track| track.title == "Clear").unwrap();
+        let keep = tracks.iter().find(|track| track.title == "Keep").unwrap();
+        seed_plays(&db, &clear.id, 2, now());
+        seed_plays(&db, &keep.id, 3, now());
+
+        db.clear_history_for_song(&clear.id).unwrap();
+
+        let history = db.recent_plays(10).unwrap();
+        assert_eq!(history.len(), 3);
+        assert!(history.iter().all(|record| record.play.song_id == keep.id));
+    }
+
+    #[test]
+    fn clearing_history_leaves_the_library_alone() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track("Song", "Artist", "Album", "/m/a.flac"))
+            .unwrap();
+        let id = db.all_tracks().unwrap()[0].id.clone();
+        seed_plays(&db, &id, 3, now());
+
+        db.clear_history().unwrap();
+
+        assert_eq!(db.counted_play_total().unwrap(), 0);
+        assert!(db.recent_plays(50).unwrap().is_empty());
+        assert_eq!(db.all_tracks().unwrap().len(), 1);
+    }
+
+    /// History outlives the library: a rescan deletes and recreates song rows,
+    /// and the read path must not choke on rows pointing at songs that are gone.
+    #[test]
+    fn history_survives_the_song_it_refers_to_disappearing() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_play(&play("song-that-never-existed", now(), true))
+            .unwrap();
+
+        let history = db.recent_plays(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].track.is_none());
+        assert!(db.replay_mix(10, 0, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn years_are_derived_correctly_across_leap_boundaries() {
+        assert_eq!(year_of(0), 1970);
+        // Precise boundaries either side of a leap day.
+        assert_eq!(year_of(951_782_400), 2000); // 2000-02-29
+        assert_eq!(year_of(1_609_459_199), 2020); // last second of 2020
+        assert_eq!(year_of(1_609_459_200), 2021); // first second of 2021
+        assert_eq!(year_of(1_704_067_200), 2024);
+        assert_eq!(year_of(4_102_444_800), 2100); // not a leap year
     }
 }

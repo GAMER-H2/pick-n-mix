@@ -115,7 +115,7 @@ function openAdvanced() {
     </div>
 
     <div class="popover__section">
-      <label class="popover__label popover__label--block">Filters</label>
+      <label class="popover__label popover__label--block">Atmospheres</label>
       <FilterGrid />
     </div>
   </div>

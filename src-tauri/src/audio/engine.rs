@@ -20,9 +20,9 @@
 //! first — there is never an orphaned fading-out voice to manage afterwards.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
@@ -45,6 +45,10 @@ const RING_MILLIS: usize = 120;
 /// Extra lead time added on top of the crossfade curve's own lead, so a slow
 /// decoder-open (a cold disk, a large file) still finishes before it's needed.
 const TRIGGER_HEADROOM_SECS: f64 = 2.0;
+/// How long to wait before asking again for an ambience bed that has not
+/// arrived. Long enough not to spam a bed that is simply slow to decode, short
+/// enough that recovering from a failure is not something the listener notices.
+const BED_RETRY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
@@ -69,7 +73,7 @@ pub enum EngineEvent {
 }
 
 /// Everything the UI needs to draw the transport, polled on a timer.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackSnapshot {
     pub playing: bool,
@@ -84,9 +88,31 @@ pub struct PlaybackSnapshot {
     pub stream: Option<StreamInfo>,
 }
 
+const FADE_PLAY: u8 = 1;
+const FADE_PAUSE: u8 = 2;
+
+fn fade_mode_bits(mode: &str) -> u8 {
+    match mode {
+        "play" => FADE_PLAY,
+        "pause" => FADE_PAUSE,
+        "both" => FADE_PLAY | FADE_PAUSE,
+        _ => 0,
+    }
+}
+
+fn fade_step(mode: u8, playing: bool, ramp_step: f32) -> f32 {
+    let direction = if playing { FADE_PLAY } else { FADE_PAUSE };
+    if mode & direction != 0 {
+        ramp_step
+    } else {
+        1.0
+    }
+}
+
 /// Shared state read by the worker and the callback without locking.
 struct Shared {
     playing: AtomicBool,
+    fade_mode: AtomicU8,
     volume: AtomicU32,
     position_ms: AtomicU64,
     duration_ms: AtomicU64,
@@ -103,12 +129,24 @@ struct Shared {
     /// Set by the worker after a seek or track change; the callback discards
     /// whatever is still queued so the old audio is never heard.
     flush: AtomicBool,
+    /// Latest spectrum of the processed output, in dBFS. Only maintained
+    /// while something is actually looking at it.
+    analyser_bins: ArcSwap<Vec<f32>>,
+    analyser_on: AtomicBool,
+    /// Let reverb and delay tails ring out after a pause instead of stopping
+    /// with the music.
+    keep_tail: AtomicBool,
+    /// Set by the worker while such a tail is draining. The callback keeps
+    /// consuming and stays at full gain while it is set, even though
+    /// `playing` is already false.
+    tail_active: AtomicBool,
 }
 
 impl Shared {
     fn new() -> Self {
         Shared {
             playing: AtomicBool::new(false),
+            fade_mode: AtomicU8::new(0),
             volume: AtomicU32::new(1.0f32.to_bits()),
             position_ms: AtomicU64::new(0),
             duration_ms: AtomicU64::new(0),
@@ -122,11 +160,24 @@ impl Shared {
             stream_info: ArcSwap::from_pointee(None),
             device_name: ArcSwap::from_pointee(String::new()),
             flush: AtomicBool::new(false),
+            analyser_bins: ArcSwap::from_pointee(vec![
+                crate::audio::analyser::FLOOR_DB;
+                crate::audio::analyser::BINS
+            ]),
+            analyser_on: AtomicBool::new(false),
+            keep_tail: AtomicBool::new(false),
+            tail_active: AtomicBool::new(false),
         }
     }
 
     fn volume(&self) -> f32 {
         f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+
+    /// Whether the output should be sounding: either playing, or ringing out
+    /// a reverb tail after a pause.
+    fn audible(&self) -> bool {
+        self.playing.load(Ordering::Relaxed) || self.tail_active.load(Ordering::Relaxed)
     }
 }
 
@@ -192,7 +243,20 @@ enum Cmd {
     DeclineNext {
         token: u64,
     },
+    /// The output moved to another device, so the worker must write into the
+    /// new ring and re-prepare everything that was built for the old rate.
+    Rebind {
+        producer: rtrb::Producer<f32>,
+        rate: u32,
+    },
     Shutdown,
+}
+
+/// A request to reopen the output on a different device.
+struct Reopen {
+    /// Device name, or `None` for the system default.
+    device: Option<String>,
+    reply: Sender<Result<u32>>,
 }
 
 pub struct AudioEngine {
@@ -201,6 +265,8 @@ pub struct AudioEngine {
     /// Ids of beds the worker wants decoded, drained by the app layer.
     bed_requests: Receiver<String>,
     bed_tx: Sender<String>,
+    /// Asks the output thread to close its stream and open another.
+    reopen_tx: Sender<Reopen>,
 }
 
 impl AudioEngine {
@@ -214,24 +280,13 @@ impl AudioEngine {
         let (ready_tx, ready_rx) = bounded::<Result<(u32, usize)>>(1);
         let stream_shared = Arc::clone(&shared);
         let (ring_tx, ring_rx) = bounded::<rtrb::Producer<f32>>(1);
+        let (reopen_tx, reopen_rx) = unbounded::<Reopen>();
+        let rebind_tx = cmd_tx.clone();
 
         std::thread::Builder::new()
             .name("pnm-audio-out".into())
-            .spawn(move || match open_output(&stream_shared) {
-                Ok((stream, rate, channels, producer)) => {
-                    let _ = ring_tx.send(producer);
-                    let _ = ready_tx.send(Ok((rate, channels)));
-                    if let Err(e) = stream.play() {
-                        eprintln!("audio: failed to start stream: {e}");
-                    }
-                    // Hold the stream open for the life of the process.
-                    loop {
-                        std::thread::sleep(Duration::from_secs(3600));
-                    }
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                }
+            .spawn(move || {
+                output_thread(stream_shared, ready_tx, ring_tx, reopen_rx, rebind_tx)
             })
             .map_err(|e| anyhow!("spawning audio thread: {e}"))?;
 
@@ -263,7 +318,44 @@ impl AudioEngine {
             cmd_tx,
             bed_requests,
             bed_tx,
+            reopen_tx,
         })
+    }
+
+    /// Output devices currently available, by name.
+    pub fn output_devices() -> Vec<String> {
+        let host = cpal::default_host();
+        let Ok(devices) = host.output_devices() else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = devices
+            .filter(|device| device.default_output_config().is_ok())
+            .filter_map(|device| device.description().ok().map(|d| d.name().to_string()))
+            .collect();
+        // A host can list the same endpoint more than once.
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Move playback to another output device, or back to the system default.
+    ///
+    /// The stream, its ring and the sample rate all change together, so the
+    /// worker is rebound to a new ring rather than the engine being rebuilt —
+    /// that keeps the queue, mixer and every other bit of state in place. The
+    /// caller is responsible for reloading the current track afterwards: a
+    /// decoder resamples to a fixed target rate chosen when it was opened, so
+    /// one opened for the old device cannot feed the new one.
+    pub fn set_output_device(&self, name: Option<&str>) -> Result<u32> {
+        let (reply, rx) = bounded(1);
+        self.reopen_tx
+            .send(Reopen {
+                device: name.filter(|n| !n.is_empty()).map(|n| n.to_string()),
+                reply,
+            })
+            .map_err(|_| anyhow!("the audio output thread is not running"))?;
+        rx.recv()
+            .map_err(|_| anyhow!("the audio output thread stopped while switching device"))?
     }
 
     pub fn load(&self, path: PathBuf, start_secs: f64, gain_db: f32) -> Result<StreamInfo> {
@@ -290,6 +382,12 @@ impl AudioEngine {
 
     pub fn is_playing(&self) -> bool {
         self.shared.playing.load(Ordering::Relaxed)
+    }
+
+    pub fn set_fade_mode(&self, mode: &str) {
+        self.shared
+            .fade_mode
+            .store(fade_mode_bits(mode), Ordering::Relaxed);
     }
 
     pub fn seek(&self, secs: f64) {
@@ -366,20 +464,63 @@ impl AudioEngine {
         self.shared.device_rate.load(Ordering::Relaxed)
     }
 
+    /// Let reverb and delay tails ring out after a pause rather than stopping
+    /// with the music.
+    pub fn set_keep_tail(&self, enabled: bool) {
+        self.shared.keep_tail.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Start or stop maintaining the spectrum.
+    ///
+    /// Off by default: the FFT is cheap but not free, and nothing but the
+    /// expanded EQ ever looks at it, so it runs only while that is open.
+    pub fn set_analyser_enabled(&self, enabled: bool) {
+        self.shared.analyser_on.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The latest spectrum of the processed output, in dBFS.
+    pub fn analyser_bins(&self) -> Arc<Vec<f32>> {
+        self.shared.analyser_bins.load_full()
+    }
+
     /// Publish a newly decoded ambience bed to the worker.
+    ///
+    /// `rcu` rather than load-modify-store: the ticker thread installs beds
+    /// while command threads remove them, and a plain read-modify-write would
+    /// let one silently discard the other's change.
     pub fn install_bed(&self, id: String, samples: Arc<Vec<f32>>) {
-        let mut next = (**self.shared.bank.load()).clone();
-        next.insert(id, samples);
-        self.shared.bank.store(Arc::new(next));
+        self.shared.bank.rcu(|bank| {
+            let mut next = (**bank).clone();
+            next.insert(id.clone(), Arc::clone(&samples));
+            next
+        });
     }
 
     pub fn has_bed(&self, id: &str) -> bool {
         self.shared.bank.load().contains_key(id)
     }
 
+    pub fn remove_bed(&self, id: &str) {
+        self.shared.bank.rcu(|bank| {
+            let mut next = (**bank).clone();
+            next.remove(id);
+            next
+        });
+    }
+
     /// Bed ids the worker has asked for since the last call.
     pub fn take_bed_requests(&self) -> Vec<String> {
         self.bed_requests.try_iter().collect()
+    }
+
+    /// A handle on the bed request stream, for a thread that does nothing but
+    /// decode them.
+    ///
+    /// Decoding a bed is slow — seconds, and far longer for one that needs
+    /// resampling — so it must not share a thread with anything the interface
+    /// depends on being prompt.
+    pub fn bed_request_stream(&self) -> Receiver<String> {
+        self.bed_requests.clone()
     }
 
     /// Ask for a bed to be decoded even though nothing is playing yet.
@@ -413,13 +554,99 @@ impl Drop for AudioEngine {
 // Output device
 // ---------------------------------------------------------------------------
 
+/// Owns the cpal stream for the life of the process, reopening it whenever the
+/// output device changes.
+///
+/// The stream lives here rather than in [`AudioEngine`] because it is not
+/// `Send`. Dropping it is what closes the old device, which is why each
+/// reopen happens at the top of this loop with the previous stream already out
+/// of scope.
+fn output_thread(
+    shared: Arc<Shared>,
+    ready_tx: Sender<Result<(u32, usize)>>,
+    ring_tx: Sender<rtrb::Producer<f32>>,
+    reopen_rx: Receiver<Reopen>,
+    rebind_tx: Sender<Cmd>,
+) {
+    let mut handoff = Some((ready_tx, ring_tx));
+    let mut wanted: Option<String> = None;
+    let mut pending: Option<Sender<Result<u32>>> = None;
+
+    loop {
+        let opened = open_output(&shared, wanted.as_deref());
+        let stream = match opened {
+            Ok((stream, rate, channels, producer)) => {
+                match handoff.take() {
+                    // Start-up: `AudioEngine::new` is waiting for both of these.
+                    Some((ready, ring)) => {
+                        let _ = ring.send(producer);
+                        let _ = ready.send(Ok((rate, channels)));
+                    }
+                    // A device change: the worker already exists and needs to
+                    // be pointed at the new ring.
+                    None => {
+                        let _ = rebind_tx.send(Cmd::Rebind { producer, rate });
+                    }
+                }
+                if let Err(e) = stream.play() {
+                    eprintln!("audio: failed to start stream: {e}");
+                }
+                if let Some(reply) = pending.take() {
+                    let _ = reply.send(Ok(rate));
+                }
+                Some(stream)
+            }
+            Err(e) => {
+                if let Some((ready, _)) = handoff.take() {
+                    // Nothing works without an output at start-up.
+                    let _ = ready.send(Err(e));
+                    return;
+                }
+                let message = e.to_string();
+                if let Some(reply) = pending.take() {
+                    let _ = reply.send(Err(e));
+                }
+                if wanted.is_some() {
+                    // The chosen device failed. Fall back to the default
+                    // rather than leaving the app with no audio at all.
+                    eprintln!("audio: {message}; falling back to the default device");
+                    wanted = None;
+                    continue;
+                }
+                None
+            }
+        };
+
+        let Ok(request) = reopen_rx.recv() else {
+            return; // The engine is gone.
+        };
+        wanted = request.device;
+        pending = Some(request.reply);
+        // Closes the old device before the next iteration opens the new one.
+        drop(stream);
+    }
+}
+
 fn open_output(
     shared: &Arc<Shared>,
+    wanted: Option<&str>,
 ) -> Result<(cpal::platform::Stream, u32, usize, rtrb::Producer<f32>)> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow!("no audio output device is available"))?;
+    let device = match wanted {
+        Some(wanted) => host
+            .output_devices()
+            .map_err(|e| anyhow!("listing output devices: {e}"))?
+            .find(|device| {
+                device
+                    .description()
+                    .map(|d| d.name() == wanted)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| anyhow!("output device not found: {wanted}"))?,
+        None => host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("no audio output device is available"))?,
+    };
     let name = device
         .description()
         .map(|d| d.name().to_string())
@@ -462,8 +689,8 @@ where
 {
     let shared = Arc::clone(shared);
     let rate = config.sample_rate as f32;
-    // A short ramp makes pauses, track changes and underrun recovery click-free.
-    let fade_step = 1.0 / (rate * 0.012);
+    // When enabled for a direction, a short ramp makes its transition click-free.
+    let ramp_fade_step = 1.0 / (rate * 0.012);
     let mut fade = 0.0f32;
     let mut volume = shared.volume();
 
@@ -482,7 +709,11 @@ where
                     fade = 0.0;
                 }
 
-                let playing = shared.playing.load(Ordering::Relaxed);
+                // A ringing reverb tail counts as playing here: `playing` is
+                // already false the moment pause is pressed, but the tail the
+                // worker is still feeding in has to be heard out rather than
+                // faded away with the music.
+                let playing = shared.audible();
                 let target_volume = shared.volume();
 
                 for frame in data.chunks_mut(channels) {
@@ -496,7 +727,12 @@ where
                         fade = 0.0;
                     } else {
                         let want_fade = if playing { 1.0 } else { 0.0 };
-                        fade += (want_fade - fade).clamp(-fade_step, fade_step);
+                        let step = fade_step(
+                            shared.fade_mode.load(Ordering::Relaxed),
+                            playing,
+                            ramp_fade_step,
+                        );
+                        fade += (want_fade - fade).clamp(-step, step);
                     }
                     volume += (target_volume - volume).clamp(-0.001, 0.001);
 
@@ -542,7 +778,7 @@ fn worker(
     mut producer: rtrb::Producer<f32>,
     events: Sender<EngineEvent>,
     bed_requests: Sender<String>,
-    device_rate: u32,
+    mut device_rate: u32,
 ) {
     // Two persistent chains, ping-ponged between voices across a crossfade,
     // rather than one built fresh per track: a `Chain` owns the delay lines,
@@ -562,6 +798,10 @@ fn worker(
 
     let mut ambience = AmbienceMixer::new();
     ambience.prepare(device_rate as f32);
+
+    // Fed from the master bus so the spectrum reflects the effect chain. Only
+    // driven while the UI has asked for it; see `set_analyser_enabled`.
+    let mut analyser = crate::audio::analyser::Analyser::new(device_rate as f32);
 
     // Scratch buffers, sized once. `mix` doubles as voice A's buffer: voice B
     // (when present) is decoded into `scratch_b` and added into `mix` in
@@ -584,8 +824,12 @@ fn worker(
     let mut next_token_gen: u64 = 0;
 
     let mut finished_reported = false;
-    let mut requested_beds: Vec<String> = Vec::new();
+    let mut requested_beds = crate::audio::ambience::BedRequests::new();
     let mut meter_countdown = 0u32;
+    // Blocks of reverb tail still to render after a pause; 0 when not
+    // draining one. See the pause handling in the loop below.
+    let mut tail_blocks = 0usize;
+    let mut was_playing = false;
 
     loop {
         // --- commands ---------------------------------------------------
@@ -631,6 +875,9 @@ fn worker(
                             // track was about to be handed.
                             chains[0].prepare(device_rate as f32);
                             chains[1].prepare(device_rate as f32);
+                            // Which includes a pause tail still ringing out.
+                            tail_blocks = 0;
+                            shared.tail_active.store(false, Ordering::Relaxed);
                             // Whatever was being prepared for a crossfade no
                             // longer applies either.
                             next = None;
@@ -675,6 +922,8 @@ fn worker(
                     next = None;
                     next_wait_token = None;
                     next_declined = false;
+                    tail_blocks = 0;
+                    shared.tail_active.store(false, Ordering::Relaxed);
                     shared.stream_info.store(Arc::new(None));
                     shared.position_ms.store(0, Ordering::Relaxed);
                     shared.duration_ms.store(0, Ordering::Relaxed);
@@ -718,6 +967,27 @@ fn worker(
                         next_declined = true;
                     }
                 }
+                Cmd::Rebind {
+                    producer: rebound,
+                    rate,
+                } => {
+                    producer = rebound;
+                    device_rate = rate;
+                    // Every filter, delay line and reverb comb was designed
+                    // for the old rate, so all of it is rebuilt. Voices are
+                    // dropped too: a decoder resamples to the rate it was
+                    // opened with, and the app reloads the track afterwards.
+                    chains[0].prepare(device_rate as f32);
+                    chains[1].prepare(device_rate as f32);
+                    master_limiter.prepare(device_rate as f32);
+                    ambience.prepare(device_rate as f32);
+                    analyser = crate::audio::analyser::Analyser::new(device_rate as f32);
+                    current = None;
+                    next = None;
+                    next_wait_token = None;
+                    tail_blocks = 0;
+                    shared.tail_active.store(false, Ordering::Relaxed);
+                }
                 Cmd::Shutdown => shutdown = true,
             }
         }
@@ -745,12 +1015,13 @@ fn worker(
                 &[]
             };
             ambience.sync(filters, &bank);
+            let asked_at = Instant::now();
             for id in ambience.missing(filters, &bank) {
-                if !requested_beds.iter().any(|r| r == id) {
-                    requested_beds.push(id.to_string());
+                if requested_beds.due(id, asked_at, BED_RETRY) {
                     let _ = bed_requests.send(id.to_string());
                 }
             }
+            requested_beds.settled(&bank);
 
             let speed = if cur.settings.enabled {
                 cur.settings.pitch.ratio()
@@ -762,10 +1033,82 @@ fn worker(
                 .store((speed * 1000.0) as u64, Ordering::Relaxed);
         }
 
+        // --- pause: start or finish a reverb tail --------------------------
+        let playing = shared.playing.load(Ordering::Relaxed);
+        if was_playing && !playing {
+            // Pause was just pressed. The ring still holds up to `RING_MILLIS`
+            // of *music* that has been processed but not heard; letting that
+            // through would make pause feel late. So it is discarded and the
+            // decoder wound back to exactly what was heard, leaving the chain
+            // free to ring out into a now-empty ring.
+            if let Some(cur) = current.as_mut() {
+                if shared.keep_tail.load(Ordering::Relaxed) && chain_has_tail(&cur.settings) {
+                    let heard = heard_position(&producer, cur, device_rate, &shared);
+                    drain(&shared);
+                    if cur.decoder.seek(heard).is_ok() {
+                        tail_blocks = tail_block_budget(device_rate);
+                        shared.tail_active.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        } else if !was_playing && playing && tail_blocks > 0 {
+            // Resumed mid-tail. Whatever is left of it in the ring belongs to
+            // the moment before the pause, so it is dropped rather than played
+            // in front of the music.
+            tail_blocks = 0;
+            shared.tail_active.store(false, Ordering::Relaxed);
+            drain(&shared);
+        }
+        was_playing = playing;
+
+        // The voice can vanish mid-tail — the queue is cleared, or another
+        // track is loaded — and there is nothing left to ring out when it does.
+        if tail_blocks > 0 && current.is_none() {
+            tail_blocks = 0;
+            shared.tail_active.store(false, Ordering::Relaxed);
+        }
+
+        let draining = tail_blocks > 0;
+        if draining {
+            if producer.slots() >= BLOCK * CHANNELS {
+                let quiet = match current.as_mut() {
+                    Some(voice) => drain_tail_block(
+                        &mut chains,
+                        voice,
+                        &mut master_limiter,
+                        &mut mix,
+                        &mut producer,
+                        device_rate,
+                    ),
+                    None => true,
+                };
+                tail_blocks -= 1;
+                if quiet {
+                    tail_blocks = 0;
+                }
+            }
+            if tail_blocks == 0 {
+                shared.tail_active.store(false, Ordering::Relaxed);
+                // The tail is over; anything left of it must not be sitting in
+                // front of the music when playback resumes.
+                drain(&shared);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+
         // --- idle / backpressure ------------------------------------------
-        let idle = !shared.playing.load(Ordering::Relaxed) || current.is_none();
+        let idle = !playing || current.is_none();
         let room = producer.slots() >= BLOCK * CHANNELS;
         if idle || !room {
+            // Let the spectrum fall away rather than freezing the last frame
+            // on screen for as long as playback is stopped.
+            if idle && shared.analyser_on.load(Ordering::Relaxed) && !analyser.is_silent() {
+                analyser.decay();
+                shared
+                    .analyser_bins
+                    .store(Arc::new(analyser.bins().to_vec()));
+            }
             std::thread::sleep(Duration::from_millis(3));
             continue;
         }
@@ -978,6 +1321,15 @@ fn worker(
         master_limiter.update(&cur.settings.normalisation, device_rate as f32);
         master_limiter.process(&mut mix, frames);
 
+        // Tapped here, at the very end of the master bus, so the spectrum
+        // shows what is actually leaving the app — including the EQ the graph
+        // is drawn on top of.
+        if shared.analyser_on.load(Ordering::Relaxed) && analyser.push(&mix, frames) {
+            shared
+                .analyser_bins
+                .store(Arc::new(analyser.bins().to_vec()));
+        }
+
         for f in 0..frames {
             for ch in 0..CHANNELS {
                 // The room check above guarantees these pushes succeed.
@@ -1012,4 +1364,98 @@ fn worker(
 /// Ask the output callback to throw away anything still queued.
 fn drain(shared: &Shared) {
     shared.flush.store(true, Ordering::Release);
+}
+
+/// Whether this chain has anything that would still be sounding after its
+/// input stops. Without one of these, a tail would be silence and pausing
+/// should stay instant.
+fn chain_has_tail(settings: &Resolved) -> bool {
+    settings.enabled && (settings.reverb.enabled || settings.delay.enabled)
+}
+
+/// Longest tail to render, as a block count. Generous enough for a large
+/// reverb, bounded so a runaway setting cannot hold the output open.
+fn tail_block_budget(device_rate: u32) -> usize {
+    const MAX_TAIL_SECS: f64 = 8.0;
+    ((device_rate as f64 * MAX_TAIL_SECS) / BLOCK as f64).ceil() as usize
+}
+
+/// Where the listener actually got to, in track time.
+///
+/// The same accounting the progress bar uses: what has been decoded, less
+/// what is still sitting unheard in the ring.
+fn heard_position(
+    producer: &rtrb::Producer<f32>,
+    voice: &Voice,
+    device_rate: u32,
+    shared: &Shared,
+) -> f64 {
+    let capacity = producer.buffer().capacity();
+    let queued_frames = (capacity - producer.slots()) / CHANNELS;
+    let speed = f64::from(shared.speed_millis.load(Ordering::Relaxed) as u32) / 1000.0;
+    let queued_secs = queued_frames as f64 / device_rate as f64 * speed.max(0.05);
+    (voice.decoder.decoded_secs() - queued_secs).max(0.0)
+}
+
+/// Render one block of pure tail: silence through the effect chain, so only
+/// what the reverb and delay still hold comes out.
+///
+/// Returns true once the result has decayed into inaudibility, so the caller
+/// can stop early rather than always running the full budget.
+fn drain_tail_block(
+    chains: &mut [Chain; 2],
+    voice: &mut Voice,
+    master_limiter: &mut Limiter,
+    mix: &mut [Vec<f32>],
+    producer: &mut rtrb::Producer<f32>,
+    device_rate: u32,
+) -> bool {
+    /// Below this the tail is inaudible at any sane volume.
+    const SILENCE: f32 = 1e-4;
+
+    for channel in mix.iter_mut() {
+        for sample in channel[..BLOCK].iter_mut() {
+            *sample = 0.0;
+        }
+    }
+
+    let chain = &mut chains[voice.chain_ix];
+    chain.update(&voice.settings, voice.track_gain_db);
+    chain.process_music(mix, BLOCK);
+    chain.apply_gain(mix, BLOCK);
+    master_limiter.update(&voice.settings.normalisation, device_rate as f32);
+    master_limiter.process(mix, BLOCK);
+
+    let mut peak = 0.0f32;
+    for f in 0..BLOCK {
+        for channel in mix.iter() {
+            peak = peak.max(channel[f].abs());
+            let _ = producer.push(channel[f]);
+        }
+    }
+    peak < SILENCE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fade_modes_ramp_only_the_selected_directions() {
+        let ramp = 0.01;
+
+        assert_eq!(fade_step(fade_mode_bits("off"), true, ramp), 1.0);
+        assert_eq!(fade_step(fade_mode_bits("off"), false, ramp), 1.0);
+        assert_eq!(fade_step(fade_mode_bits("play"), true, ramp), ramp);
+        assert_eq!(fade_step(fade_mode_bits("play"), false, ramp), 1.0);
+        assert_eq!(fade_step(fade_mode_bits("pause"), true, ramp), 1.0);
+        assert_eq!(fade_step(fade_mode_bits("pause"), false, ramp), ramp);
+        assert_eq!(fade_step(fade_mode_bits("both"), true, ramp), ramp);
+        assert_eq!(fade_step(fade_mode_bits("both"), false, ramp), ramp);
+    }
+
+    #[test]
+    fn unknown_engine_fade_modes_are_off() {
+        assert_eq!(fade_mode_bits("unexpected"), 0);
+    }
 }

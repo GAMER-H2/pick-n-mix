@@ -21,7 +21,9 @@ const ui = useUiStore();
 const router = useRouter();
 
 const track = computed(() => player.track);
-const backdrop = computed(() => artUrl(track.value?.artworkId));
+// Blown up 1.6x and blurred 64px, so detail beyond this is invisible; no
+// reason to decode the original multi-megapixel picture for it.
+const backdrop = computed(() => artUrl(track.value?.artworkId, 640));
 const subtitle = computed(() => subtitleFor([track.value?.artist, track.value?.album]));
 const items = computed(() => player.queue.items);
 const current = computed(() => player.queue.currentIndex);
@@ -66,7 +68,12 @@ onBeforeUnmount(() => {
   if (curtainFrame !== null) window.cancelAnimationFrame(curtainFrame);
 });
 
+/** Clicking the row that is already playing toggles it instead of restarting. */
 async function jump(index: number) {
+  if (index === current.value && player.playing) {
+    await player.toggle();
+    return;
+  }
   await api.playQueueIndex(index);
 }
 
@@ -94,7 +101,7 @@ function openMenu(index: number, event: MouseEvent) {
     </div>
     <div class="screen__veil" aria-hidden="true" />
 
-    <header class="screen__bar">
+    <header class="screen__bar" data-tauri-drag-region="deep">
       <div class="screen__from clamp clamp-1" :title="player.queue.context?.name ?? 'your library'">
         <span class="screen__from-label">Playing from</span>
         <strong>{{ player.queue.context?.name ?? "your library" }}</strong>
@@ -235,8 +242,9 @@ function openMenu(index: number, event: MouseEvent) {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 18px;
-  -webkit-app-region: drag;
+  /* Leaves room for the window controls, hoisted in `App.vue` to sit above
+     everything at the app's own corner rather than under this bar. */
+  padding: 12px calc(18px + var(--titlebar-controls)) 12px 18px;
 }
 
 .screen__from {
@@ -251,7 +259,6 @@ function openMenu(index: number, event: MouseEvent) {
 
 .screen__close {
   color: inherit;
-  -webkit-app-region: no-drag;
 }
 
 .screen__close:hover {
@@ -277,10 +284,17 @@ function openMenu(index: number, event: MouseEvent) {
 }
 
 .screen__art :deep(.artwork) {
-  /* Scale with both columns and available vertical space. The upper limit keeps
-     the cover visually balanced with the queue on ultrawide displays. */
-  width: clamp(320px, min(46vw, 62vh), 720px) !important;
-  height: clamp(320px, min(46vw, 62vh), 720px) !important;
+  /*
+   * `cqw`, not `vw`: the art sits beside a fixed-ish queue column, so what
+   * matters is the width `.app__main` actually has to give — which shrinks
+   * when the sidebar's advanced mixer or queue panel opens — not the raw
+   * window width. `vw` never saw that shrink, so the art stayed oversized and
+   * ran into the queue column. `.app__main` is the query container; see
+   * `App.vue`. The upper limit keeps the cover visually balanced with the
+   * queue on ultrawide displays.
+   */
+  width: clamp(220px, min(46cqw, 62vh), 720px) !important;
+  height: clamp(220px, min(46cqw, 62vh), 720px) !important;
 }
 
 .screen__meta {
@@ -316,9 +330,11 @@ function openMenu(index: number, event: MouseEvent) {
   max-height: 100%;
   padding: 14px;
   border-radius: var(--radius-lg);
-  /* A translucent card so the backdrop still shows through. */
-  background: rgba(127, 127, 127, 0.14);
-  backdrop-filter: blur(24px) saturate(160%);
+  /* A flat translucent card rather than its own `backdrop-filter`: it already
+     sits on the backdrop image's own 64px blur, so a second blur here was
+     doing nothing but adding a live-scrolling list to a compositor's most
+     expensive filter path. */
+  background: rgba(127, 127, 127, 0.18);
   border: 0.5px solid rgba(127, 127, 127, 0.22);
 }
 
@@ -341,17 +357,33 @@ function openMenu(index: number, event: MouseEvent) {
   opacity: 0.65;
 }
 
-@media (max-width: 980px) {
+/*
+ * A `@container` query against `.app__main` (declared in `App.vue`), not a
+ * `@media` query against the window: it reacts to the space this view
+ * actually has, which shrinks when a side panel (the advanced mixer, the
+ * compact queue) opens, not just when the window itself is resized.
+ *
+ * The threshold is not a rounded guess — it is the two-column grid's own
+ * breaking point, worked backwards from the layout above: 320px + 340px for
+ * the column minimums, 40px for the gap between them, 80px for this
+ * container's own left+right padding. Below that, `minmax()` cannot shrink
+ * the columns any further, so the grid overflows rather than fitting — which
+ * is exactly the crowding this query exists to pre-empt. Anything short of
+ * that true minimum (736px, an earlier approximation from the window-based
+ * breakpoint this replaced, was 44px short of it) leaves a dead zone where
+ * the old two-column layout is still forced on a container too narrow for it.
+ */
+@container app-main (max-width: 780px) {
   .screen__body {
     grid-template-columns: 1fr;
     gap: 20px;
-    padding: 8px 20px 20px;
+    padding: 8px 24px 20px;
   }
 
   .screen__art :deep(.artwork) {
     /* The single-column layout still leaves meaningful room for the queue. */
-    width: clamp(280px, min(54vw, 50vh), 420px) !important;
-    height: clamp(280px, min(54vw, 50vh), 420px) !important;
+    width: clamp(220px, min(54cqw, 50vh), 420px) !important;
+    height: clamp(220px, min(54cqw, 50vh), 420px) !important;
   }
 }
 </style>

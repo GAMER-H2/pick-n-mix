@@ -5,21 +5,31 @@
  * Rows are reordered by dragging a handle rather than the row itself, so a
  * drag can never be mistaken for a click on the song.
  */
-import { computed, nextTick, onMounted, ref } from "vue";
+import { nextTick, onMounted, ref } from "vue";
 import PnmIcon from "./icons/PnmIcon.vue";
 import Artwork from "./Artwork.vue";
 import { formatDuration, subtitleFor } from "@/lib/format";
+import { useDragReorder } from "@/lib/dragReorder";
 import type { Track } from "@/lib/types";
 
 const props = withDefaults(
   defineProps<{
-    items: Track[];
+    items: Array<Track | null>;
     currentIndex: number | null;
     playing?: boolean;
     /** Larger rows for the full-screen view. */
     roomy?: boolean;
+    reorderable?: boolean;
+    removable?: boolean;
+    removeLabel?: string;
   }>(),
-  { playing: false, roomy: false },
+  {
+    playing: false,
+    roomy: false,
+    reorderable: true,
+    removable: true,
+    removeLabel: "Remove from queue",
+  },
 );
 
 const emit = defineEmits<{
@@ -29,11 +39,24 @@ const emit = defineEmits<{
   menu: [index: number, event: MouseEvent];
 }>();
 
-const listEl = ref<HTMLElement | null>(null);
-const dragFrom = ref<number | null>(null);
-const dropAt = ref<number | null>(null);
+defineSlots<{
+  subtitle(props: { track: Track | null; index: number }): unknown;
+  meta(props: { track: Track | null; index: number }): unknown;
+}>();
 
-const isDragging = computed(() => dragFrom.value !== null);
+const listEl = ref<HTMLElement | null>(null);
+const { dragFrom, dropAt, isDragging, onHandleDown, onHandleMove, onHandleUp, onHandleCancel } =
+  useDragReorder(listEl, (from, to) => {
+    if (props.reorderable) emit("move", from, to);
+  });
+
+function play(track: Track | null, index: number) {
+  if (track) emit("play", index);
+}
+
+function openMenu(track: Track | null, index: number, event: MouseEvent) {
+  if (track) emit("menu", index, event);
+}
 
 /** The ancestor that actually scrolls this list. */
 function scrollParent(element: HTMLElement): HTMLElement | null {
@@ -79,62 +102,33 @@ onMounted(async () => {
   centreOnCurrent();
 });
 
-/** Which gap the pointer is currently over, 0..items.length. */
-function gapAt(clientY: number): number {
-  const container = listEl.value;
-  if (!container) return 0;
-  const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-row]"));
-  for (let i = 0; i < rows.length; i += 1) {
-    const rect = rows[i].getBoundingClientRect();
-    if (clientY < rect.top + rect.height / 2) return i;
-  }
-  return rows.length;
-}
-
-function onHandleDown(event: PointerEvent, index: number) {
-  event.preventDefault();
-  dragFrom.value = index;
-  dropAt.value = index;
-  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-}
-
-function onHandleMove(event: PointerEvent) {
-  if (dragFrom.value === null) return;
-  dropAt.value = gapAt(event.clientY);
-}
-
-function onHandleUp(event: PointerEvent) {
-  const from = dragFrom.value;
-  const gap = dropAt.value;
-  (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
-  dragFrom.value = null;
-  dropAt.value = null;
-  if (from === null || gap === null) return;
-
-  // A gap index above the dragged row means the row shifts down by one.
-  const to = gap > from ? gap - 1 : gap;
-  if (to !== from) emit("move", from, to);
-}
-
-function onHandleCancel() {
-  dragFrom.value = null;
-  dropAt.value = null;
-}
 </script>
 
 <template>
-  <div ref="listEl" class="queue-list" :class="{ 'is-roomy': roomy, 'is-dragging': isDragging }">
-    <template v-for="(track, index) in items" :key="`${track.id}-${index}`">
-      <div v-if="dropAt === index && isDragging" class="queue-list__drop" />
+  <div
+    ref="listEl"
+    class="queue-list"
+    :class="{ 'is-roomy': roomy, 'is-dragging': reorderable && isDragging }"
+  >
+    <template v-for="(track, index) in items" :key="`${track?.id ?? 'removed'}-${index}`">
+      <div
+        v-if="reorderable && dropAt === index && isDragging"
+        class="queue-list__drop"
+      />
 
       <div
         data-row
         class="row"
-        :class="{ 'is-current': index === currentIndex, 'is-lifted': dragFrom === index }"
-        @dblclick="emit('play', index)"
-        @contextmenu.prevent="emit('menu', index, $event)"
+        :class="{
+          'is-current': track && index === currentIndex,
+          'is-lifted': reorderable && dragFrom === index,
+          'is-removed': !track,
+        }"
+        @dblclick="play(track, index)"
+        @contextmenu.prevent="openMenu(track, index, $event)"
       >
         <button
+          v-if="reorderable"
           class="row__grip"
           title="Drag to reorder"
           aria-label="Drag to reorder"
@@ -148,12 +142,13 @@ function onHandleCancel() {
 
         <button
           class="row__art"
-          :aria-label="`Play ${track.title}`"
-          :title="`Play ${track.title}`"
-          @click="emit('play', index)"
+          :aria-label="track ? `Play ${track.title}` : 'Removed track'"
+          :title="track ? `Play ${track.title}` : 'Removed track'"
+          :disabled="!track"
+          @click="play(track, index)"
         >
-          <Artwork :artwork-id="track.artworkId" :size="roomy ? 44 : 38" :radius="5" />
-          <span class="row__overlay">
+          <Artwork :artwork-id="track?.artworkId ?? null" :size="roomy ? 44 : 38" :radius="5" />
+          <span v-if="track" class="row__overlay">
             <PnmIcon
               :name="index === currentIndex && playing ? 'pause' : 'play'"
               :size="roomy ? 16 : 14"
@@ -162,23 +157,32 @@ function onHandleCancel() {
         </button>
 
         <div class="row__text">
-          <div class="row__title clamp" :class="{ 'clamp-1': !roomy }" :title="track.title">
-            {{ track.title }}
+          <div
+            class="row__title clamp"
+            :class="{ 'clamp-1': !roomy }"
+            :title="track?.title ?? 'Removed track'"
+          >
+            {{ track?.title ?? "Removed track" }}
           </div>
           <div
             class="row__subtitle clamp clamp-1"
-            :title="subtitleFor([track.artist, track.album])"
+            :title="track ? subtitleFor([track.artist, track.album]) : 'No longer in library'"
           >
-            {{ subtitleFor([track.artist, track.album]) }}
+            <slot name="subtitle" :track="track" :index="index">
+              {{ track ? subtitleFor([track.artist, track.album]) : "No longer in library" }}
+            </slot>
           </div>
         </div>
 
-        <span class="row__duration">{{ formatDuration(track.durationSecs) }}</span>
+        <slot name="meta" :track="track" :index="index">
+          <span v-if="track" class="row__duration">{{ formatDuration(track.durationSecs) }}</span>
+        </slot>
 
         <button
+          v-if="removable"
           class="icon-button row__remove"
-          aria-label="Remove from queue"
-          title="Remove from queue"
+          :aria-label="removeLabel"
+          :title="removeLabel"
           @click.stop="emit('remove', index)"
         >
           <PnmIcon name="close" :size="15" />
@@ -186,7 +190,10 @@ function onHandleCancel() {
       </div>
     </template>
 
-    <div v-if="dropAt === items.length && isDragging" class="queue-list__drop" />
+    <div
+      v-if="reorderable && dropAt === items.length && isDragging"
+      class="queue-list__drop"
+    />
   </div>
 </template>
 
@@ -215,7 +222,7 @@ function onHandleCancel() {
   gap: 9px;
   padding: 5px 6px;
   content-visibility: auto;
-  contain-intrinsic-block-size: 54px;
+  contain-intrinsic-block-size: auto 54px;
   border-radius: var(--radius-sm);
 }
 

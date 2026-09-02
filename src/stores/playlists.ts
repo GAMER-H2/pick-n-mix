@@ -43,5 +43,10 @@ export const usePlaylistStore = defineStore("playlists", () => {
     return added;
   }
 
-  return { summaries, open, loading, refresh, load, create, remove, addTracks };
+  async function move(playlistId: string, from: number, to: number) {
+    await api.moveInPlaylist(playlistId, from, to);
+    await refresh();
+  }
+
+  return { summaries, open, loading, refresh, load, create, remove, addTracks, move };
 });

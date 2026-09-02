@@ -4,12 +4,16 @@ import { ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import PnmIcon from "./icons/PnmIcon.vue";
 import { usePlaylistStore } from "@/stores/playlists";
+import { useHomeStore } from "@/stores/home";
+import { useMixerStore } from "@/stores/mixer";
 import { useUiStore } from "@/stores/ui";
 import { canGoBack, canGoForward } from "@/lib/navigation";
 
 const route = useRoute();
 const router = useRouter();
 const playlists = usePlaylistStore();
+const home = useHomeStore();
+const mixer = useMixerStore();
 const ui = useUiStore();
 
 const creating = ref(false);
@@ -30,12 +34,32 @@ async function create() {
 function isPlaylistOpen(id: string) {
   return route.name === "playlist" && route.params.id === id;
 }
+
+function isMixOpen(kind: string) {
+  return route.name === "mix" && route.params.kind === kind;
+}
+
+function openSettings() {
+  ui.contextMenu = null;
+  ui.infoTrack = null;
+  mixer.popoverOpen = false;
+  ui.settingsOpen = true;
+}
 </script>
 
 <template>
   <nav class="sidebar">
     <!-- Leaves room for the traffic lights under the overlay title bar. -->
     <div class="sidebar__drag" data-tauri-drag-region>
+      <button
+        class="icon-button sidebar__nav-button sidebar__settings-button"
+        type="button"
+        title="Settings"
+        aria-label="Open settings"
+        @click="openSettings"
+      >
+        <PnmIcon name="settings" :size="17" />
+      </button>
       <div class="sidebar__nav">
         <button
           class="icon-button sidebar__nav-button"
@@ -76,7 +100,25 @@ function isPlaylistOpen(id: string) {
     <div class="sidebar__divider" />
 
     <div class="sidebar__playlists scroll-area">
-      <div v-if="playlists.summaries.length === 0 && !creating" class="sidebar__empty">
+      <!-- Pinned mixes sit above real playlists: they are generated, so a
+           listener should be able to tell them apart at a glance. -->
+      <RouterLink
+        v-for="mix in home.pinned"
+        :key="mix.kind"
+        :to="{ name: 'mix', params: { kind: mix.kind } }"
+        class="sidebar__playlist sidebar__playlist--mix"
+        :class="{ 'is-active': isMixOpen(mix.kind) }"
+      >
+        <span class="truncate">{{ mix.name }}</span>
+        <PnmIcon name="shuffle" :size="12" class="sidebar__badge" title="A generated mix" />
+      </RouterLink>
+
+      <div v-if="home.pinned.length" class="sidebar__divider sidebar__divider--inline" />
+
+      <div
+        v-if="playlists.summaries.length === 0 && !creating && home.pinned.length === 0"
+        class="sidebar__empty"
+      >
         No playlists yet
       </div>
 
@@ -143,8 +185,23 @@ function isPlaylistOpen(id: string) {
 .sidebar__nav {
   display: flex;
   gap: 1px;
-  /* Not part of the drag region, or the buttons could not be clicked. */
-  -webkit-app-region: no-drag;
+}
+
+.sidebar__settings-button {
+  margin-left: 1px;
+  order: 2;
+}
+
+/* macOS keeps Settings beside the history buttons, clear of the traffic
+   lights. Linux uses client-side decorations, so Settings moves to the free
+   opposite edge while Back/Forward remain grouped on the right. */
+:global(html.is-custom-titlebar) .sidebar__drag {
+  justify-content: space-between;
+}
+
+:global(html.is-custom-titlebar) .sidebar__settings-button {
+  margin-left: 0;
+  order: 0;
 }
 
 .sidebar__nav-button {
@@ -184,6 +241,15 @@ function isPlaylistOpen(id: string) {
   height: 1px;
   margin: 10px 10px;
   background: var(--separator);
+}
+
+/* Separates pinned mixes from the playlists below them. */
+.sidebar__divider--inline {
+  margin: 6px 8px;
+}
+
+.sidebar__playlist--mix .sidebar__badge {
+  color: var(--text-tertiary);
 }
 
 .sidebar__playlists {

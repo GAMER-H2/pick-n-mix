@@ -8,6 +8,7 @@
 
 import { defaultCrossfade } from "./crossfadeCurve";
 import type {
+  BandKind,
   CrossfadeSettings,
   Delay,
   Eq,
@@ -21,16 +22,39 @@ import type {
   Reverb,
 } from "./types";
 
-/** The six frequencies the simple EQ's sliders drive. */
-export const DEFAULT_EQ_FREQS = [60, 170, 500, 1500, 4000, 10000];
+/**
+ * The eight bands of a Logic-style channel EQ, mirroring `default_bands()` in
+ * `audio/params.rs`.
+ *
+ * The two pass filters ship disabled: unlike a shelf or a peak, a pass filter
+ * has no flat setting — it always cuts — so an enabled one would quietly
+ * change the sound of every existing mix.
+ */
+const DEFAULT_BAND_LAYOUT: readonly { kind: BandKind; freq: number }[] = [
+  { kind: "highPass", freq: 30 },
+  { kind: "lowShelf", freq: 80 },
+  { kind: "peak", freq: 200 },
+  { kind: "peak", freq: 500 },
+  { kind: "peak", freq: 1200 },
+  { kind: "peak", freq: 3500 },
+  { kind: "highShelf", freq: 10000 },
+  { kind: "lowPass", freq: 18000 },
+];
+
+/** Band kinds whose gain does anything; a pass filter's is ignored. */
+export const GAIN_BEARING_KINDS: readonly BandKind[] = ["lowShelf", "peak", "highShelf"];
+
+export function hasGain(kind: BandKind): boolean {
+  return GAIN_BEARING_KINDS.includes(kind);
+}
 
 export function defaultBands(): EqBand[] {
-  return DEFAULT_EQ_FREQS.map((freq, i) => ({
-    kind: i === 0 ? "lowShelf" : i === 5 ? "highShelf" : "peak",
+  return DEFAULT_BAND_LAYOUT.map(({ kind, freq }) => ({
+    kind,
     freq,
     gainDb: 0,
-    q: 0.9,
-    enabled: true,
+    q: 0.71,
+    enabled: hasGain(kind),
   }));
 }
 

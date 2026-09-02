@@ -14,13 +14,16 @@ use crate::audio::crossfade::CrossfadeSettings;
 use crate::audio::decode::StreamInfo;
 use crate::audio::params::{MixerSettings, Resolved};
 use crate::audio::PlaybackSnapshot;
-use crate::library::model::{normalise, stable_id, Album, Artist, ScanReport, Track, TrackFile};
+use crate::library::model::{
+    normalise, stable_id, Album, Artist, HomePick, PlayRecord, ScanReport, Track, TrackFile,
+};
 use crate::library::scan;
 use crate::player::{Context, QueueItem, QueueView, Repeat};
 use crate::playlist::{self, Playlist};
 use crate::presets::{self, Preset};
 use crate::state::{
-    AppState, SETTING_GLOBAL_MIXER, SETTING_REPEAT, SETTING_SHUFFLE, SETTING_VOLUME,
+    load_app_preferences, AppPreferences, AppState, SETTING_APP_PREFERENCES, SETTING_GLOBAL_MIXER,
+    SETTING_REPEAT, SETTING_SHUFFLE, SETTING_VOLUME,
 };
 
 type Cmd<T> = Result<T, String>;
@@ -338,6 +341,7 @@ fn load_current(app: &AppHandle, state: &AppState, position_secs: f64, playing: 
     state.cancel_preview();
     let Some(song_id) = state.player.lock().current().map(|track| track.id.clone()) else {
         state.engine.clear();
+        state.end_play();
         let _ = app.emit("track-changed", Option::<Track>::None);
         return Ok(false);
     };
@@ -347,6 +351,10 @@ fn load_current(app: &AppHandle, state: &AppState, position_secs: f64, playing: 
         .get_track(&song_id)
         .map_err(err)?
         .ok_or_else(|| format!("song not found: {song_id}"))?;
+    // Restarting the song that is already playing is a replay, so this is
+    // deliberately unconditional: the previous listen is banked and a fresh
+    // one begins, rather than the two being silently merged into one.
+    state.begin_play(&song_id, refreshed.duration_secs);
     state.player.lock().refresh_current_track(refreshed.clone());
     let _ = app.emit("track-changed", Some(&refreshed));
     let _ = app.emit("queue-changed", state.player.lock().view());
@@ -534,6 +542,43 @@ pub fn stream_info(state: State<'_, AppState>) -> Cmd<Option<StreamInfo>> {
     Ok(state.engine.snapshot().stream)
 }
 
+/// One frame of the output spectrum, ready to draw.
+///
+/// The axis is described alongside the data rather than duplicated as
+/// constants in the UI, so the two cannot disagree about what a bin means.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyserFrame {
+    /// Magnitudes in dBFS, log-spaced from `min_hz` to `max_hz`.
+    pub bins: Vec<f32>,
+    pub min_hz: f32,
+    pub max_hz: f32,
+    pub floor_db: f32,
+}
+
+/// Turn the spectrum on only while something is drawing it.
+#[tauri::command]
+pub fn set_analyser_enabled(state: State<'_, AppState>, enabled: bool) -> Cmd<()> {
+    state.engine.set_analyser_enabled(enabled);
+    Ok(())
+}
+
+/// Polled by the UI at frame rate while the expanded EQ is open.
+///
+/// Pulled on demand rather than pushed as an event: at 60 Hz an event stream
+/// would be a lot of traffic for data that is only worth anything to a view
+/// that may not even be open.
+#[tauri::command]
+pub fn analyser_frame(state: State<'_, AppState>) -> Cmd<AnalyserFrame> {
+    use crate::audio::analyser;
+    Ok(AnalyserFrame {
+        bins: (*state.engine.analyser_bins()).clone(),
+        min_hz: analyser::MIN_HZ,
+        max_hz: analyser::MAX_HZ,
+        floor_db: analyser::FLOOR_DB,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Queue
 // ---------------------------------------------------------------------------
@@ -635,6 +680,73 @@ pub fn set_repeat(app: AppHandle, state: State<'_, AppState>, mode: Repeat) -> C
 }
 
 // ---------------------------------------------------------------------------
+// App preferences
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn app_preferences(state: State<'_, AppState>) -> Cmd<AppPreferences> {
+    Ok(load_app_preferences(&state.db))
+}
+
+#[tauri::command]
+pub fn set_app_preferences(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    preferences: AppPreferences,
+) -> Cmd<AppPreferences> {
+    let previous = load_app_preferences(&state.db);
+    let preferences = preferences.validated();
+    let raw = serde_json::to_string(&preferences).map_err(err)?;
+    state
+        .db
+        .set_setting(SETTING_APP_PREFERENCES, &raw)
+        .map_err(err)?;
+    state.engine.set_fade_mode(&preferences.fade_mode);
+    state
+        .engine
+        .set_keep_tail(preferences.keep_reverb_on_pause);
+    if preferences.output_device != previous.output_device {
+        apply_output_device(&app, &state, &preferences.output_device)?;
+    }
+    if preferences.recommendation_parameters_differ(&previous) {
+        state.clear_mixes();
+        let _ = app.emit("home-changed", ());
+    }
+    Ok(preferences)
+}
+
+/// Output devices available right now, so the picker can offer them.
+#[tauri::command]
+pub fn output_devices() -> Cmd<Vec<String>> {
+    Ok(crate::audio::AudioEngine::output_devices())
+}
+
+/// Move playback to another output, keeping the listener's place.
+///
+/// Switching device changes the sample rate, and a decoder resamples to the
+/// rate it was opened with — so the current track has to be reopened. The
+/// position and play state are captured first and restored afterwards, which
+/// is what makes this feel like a device change rather than a stop.
+fn apply_output_device(app: &AppHandle, state: &AppState, name: &str) -> Cmd<()> {
+    let snapshot = state.engine.snapshot();
+    let resume_at = snapshot.position_secs;
+    let was_playing = snapshot.playing;
+
+    state
+        .engine
+        .set_output_device(Some(name).filter(|n| !n.is_empty()))
+        .map_err(err)?;
+
+    // The worker dropped its voices with the old ring, so there is nothing
+    // playing to preserve if the queue is empty.
+    if state.player.lock().current().is_some() {
+        load_current(app, state, resume_at, was_playing)?;
+    }
+    let _ = app.emit("playback", &state.engine.snapshot());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Mixer
 // ---------------------------------------------------------------------------
 
@@ -676,12 +788,15 @@ pub fn mixer_state(state: State<'_, AppState>) -> Cmd<MixerState> {
         track: layers.track,
         effective: layers.effective,
         presets: presets::load_all(&state.paths.presets),
-        filters: ambience::catalogue(&state.paths.filters),
+        filters: ambience::catalogue(
+            state.paths.bundled_ambience.as_deref(),
+            &state.paths.filters,
+        ),
     })
 }
 
 /// Just the cascade, with no disk access. Used on every track change, where
-/// the preset list and the filter catalogue cannot have changed.
+/// the preset list and the ambience catalogue cannot have changed.
 #[tauri::command]
 pub fn mixer_layers(state: State<'_, AppState>) -> Cmd<MixerLayers> {
     let player = state.player.lock();
@@ -755,6 +870,16 @@ pub fn save_preset(
     settings: MixerSettings,
 ) -> Cmd<Vec<Preset>> {
     presets::upsert(&state.paths.presets, &name, settings).map_err(err)
+}
+
+#[tauri::command]
+pub fn update_preset(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+    settings: MixerSettings,
+) -> Cmd<Vec<Preset>> {
+    presets::update_user(&state.paths.presets, &id, &name, settings).map_err(err)
 }
 
 #[tauri::command]
@@ -834,20 +959,93 @@ fn persist_global_mixer(state: &AppState) {
 
 #[tauri::command]
 pub fn list_filters(state: State<'_, AppState>) -> Cmd<Vec<FilterInfo>> {
-    Ok(ambience::catalogue(&state.paths.filters))
+    Ok(ambience::catalogue(
+        state.paths.bundled_ambience.as_deref(),
+        &state.paths.filters,
+    ))
 }
 
-/// Where to drop ambience audio files, shown in the mixer's filter section.
+/// Where to drop custom ambience audio files, shown in the mixer.
 #[tauri::command]
 pub fn filters_directory(state: State<'_, AppState>) -> Cmd<String> {
     Ok(state.paths.filters.display().to_string())
+}
+
+#[tauri::command]
+pub fn import_filter(state: State<'_, AppState>, source_path: String) -> Cmd<Vec<FilterInfo>> {
+    let source = Path::new(&source_path)
+        .canonicalize()
+        .with_context(|| format!("reading ambience audio {source_path}"))
+        .map_err(err)?;
+    if !source.is_file() {
+        return Err(format!(
+            "ambience source is not a file: {}",
+            source.display()
+        ));
+    }
+    if !ambience::is_supported_audio(&source) {
+        return Err("unsupported ambience audio format".into());
+    }
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "ambience source has no safe UTF-8 filename".to_string())?;
+    let destination = state.paths.filters.join(file_name);
+    if source
+        != destination
+            .canonicalize()
+            .unwrap_or_else(|_| destination.clone())
+    {
+        std::fs::copy(&source, &destination)
+            .with_context(|| format!("importing ambience to {}", destination.display()))
+            .map_err(err)?;
+    }
+    Ok(ambience::catalogue(
+        state.paths.bundled_ambience.as_deref(),
+        &state.paths.filters,
+    ))
+}
+
+#[tauri::command]
+pub fn delete_filter(state: State<'_, AppState>, id: String) -> Cmd<Vec<FilterInfo>> {
+    let path = ambience::catalogue(
+        state.paths.bundled_ambience.as_deref(),
+        &state.paths.filters,
+    )
+    .into_iter()
+    .find(|filter| filter.id == id)
+    .and_then(|filter| filter.path)
+    .map(PathBuf::from)
+    .ok_or_else(|| format!("ambience not found: {id}"))?;
+    let filters_dir = state
+        .paths
+        .filters
+        .canonicalize()
+        .context("resolving custom ambience directory")
+        .map_err(err)?;
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolving ambience {}", path.display()))
+        .map_err(err)?;
+    if !canonical.starts_with(&filters_dir) || !canonical.is_file() {
+        return Err("refusing to delete ambience outside the custom ambience directory".into());
+    }
+    std::fs::remove_file(&path)
+        .with_context(|| format!("deleting ambience {}", path.display()))
+        .map_err(err)?;
+    state.engine.remove_bed(&id);
+    Ok(ambience::catalogue(
+        state.paths.bundled_ambience.as_deref(),
+        &state.paths.filters,
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // Playlists
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistSummary {
     pub id: String,
@@ -1114,6 +1312,10 @@ pub fn set_playlist_entry_mixer(
             let changed = state.player.lock().set_entry_mixer(&track.id, settings);
             if changed {
                 state.sync_mixer();
+                // A per-song override can turn on an atmosphere the global and
+                // playlist layers never asked for, so its audio has to be
+                // fetched here too — the same as the other two layers do.
+                request_missing_beds(&state);
                 let _ = app.emit("mixer-changed", state.player.lock().effective_mixer());
             }
         }
@@ -1305,6 +1507,295 @@ pub fn queue_playlist_entry(
     }
     state.engine.cancel_next();
     let _ = app.emit("queue-changed", state.player.lock().view());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Home
+// ---------------------------------------------------------------------------
+
+/// The three generated mixes, in the order the home page shows them.
+pub const MIX_KINDS: [&str; 3] = ["replay", "archive", "discover"];
+
+/// Setting holding the ids of mixes pinned into the sidebar.
+const SETTING_PINNED_MIXES: &str = "home.pinnedMixes";
+
+/// A mix as the home page needs to draw it, without its full track list.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixSummary {
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    pub track_count: usize,
+    /// Covers of the first few songs, for the card's artwork.
+    pub artwork_ids: Vec<String>,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeShelves {
+    pub mixes: Vec<MixSummary>,
+    pub picks: Vec<HomePick>,
+    pub recent_playlists: Vec<PlaylistSummary>,
+    /// Total counted plays, so the UI can distinguish "no history yet" from
+    /// "history exists but this shelf came up empty".
+    pub play_total: u32,
+}
+
+fn mix_name(kind: &str) -> &'static str {
+    match kind {
+        "replay" => "Replay Mix",
+        "archive" => "Archive Mix",
+        _ => "Discover Mix",
+    }
+}
+
+fn mix_description(kind: &str) -> &'static str {
+    match kind {
+        "replay" => "Songs you keep coming back to lately",
+        "archive" => "You played these a lot once",
+        _ => "Corners of your library you have barely touched",
+    }
+}
+
+fn pinned_mixes(state: &AppState) -> Vec<String> {
+    state
+        .db
+        .get_setting(SETTING_PINNED_MIXES)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn home_shelves(state: State<'_, AppState>) -> Cmd<HomeShelves> {
+    let pinned = pinned_mixes(&state);
+    let mixes = MIX_KINDS
+        .iter()
+        .map(|kind| {
+            let tracks = state.mix(kind).map_err(err)?;
+            Ok(MixSummary {
+                kind: (*kind).to_string(),
+                name: mix_name(kind).to_string(),
+                description: mix_description(kind).to_string(),
+                track_count: tracks.len(),
+                artwork_ids: tracks
+                    .iter()
+                    .filter_map(|t| t.artwork_id.clone())
+                    .take(4)
+                    .collect(),
+                pinned: pinned.iter().any(|k| k == kind),
+            })
+        })
+        .collect::<Cmd<Vec<_>>>()?;
+
+    let picks = state
+        .db
+        .top_picks(6, crate::library::db::now())
+        .map_err(err)?;
+
+    // Ordered by when each was last played from, then topped up with the rest
+    // so a fresh install still has something on the shelf.
+    let all = list_playlists(state.clone())?;
+    let recent_ids = state.db.recent_playlist_ids(8).map_err(err)?;
+    let mut recent_playlists: Vec<PlaylistSummary> = recent_ids
+        .iter()
+        .filter_map(|id| all.iter().find(|p| &p.id == id).cloned())
+        .collect();
+    for playlist in &all {
+        if recent_playlists.len() >= 8 {
+            break;
+        }
+        if !recent_playlists.iter().any(|p| p.id == playlist.id) {
+            recent_playlists.push(playlist.clone());
+        }
+    }
+
+    Ok(HomeShelves {
+        mixes,
+        picks,
+        recent_playlists,
+        play_total: state.db.counted_play_total().map_err(err)?,
+    })
+}
+
+/// The songs of one mix, for the mix view and for playing it.
+#[tauri::command]
+pub fn mix_tracks(state: State<'_, AppState>, kind: String) -> Cmd<Vec<Track>> {
+    state.mix(&kind).map_err(err)
+}
+
+#[tauri::command]
+pub fn play_mix(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    kind: String,
+    start_index: Option<usize>,
+) -> Cmd<()> {
+    let tracks = state.mix(&kind).map_err(err)?;
+    if tracks.is_empty() {
+        return Ok(());
+    }
+    state.cancel_preview();
+    {
+        let mut player = state.player.lock();
+        player.context = Some(Context {
+            kind: "mix".into(),
+            id: kind.clone(),
+            name: mix_name(&kind).to_string(),
+        });
+        player.context_mixer = None;
+        player.set_queue(tracks, start_index.unwrap_or(0));
+    }
+    start_current(&app, &state)
+}
+
+/// Build a mix again from current history, discarding the held one.
+#[tauri::command]
+pub fn refresh_mixes(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
+    state.clear_mixes();
+    let _ = app.emit("home-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_mix_pinned(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    kind: String,
+    pinned: bool,
+) -> Cmd<Vec<String>> {
+    if !MIX_KINDS.contains(&kind.as_str()) {
+        return Err(format!("unknown mix: {kind}"));
+    }
+    let mut current = pinned_mixes(&state);
+    current.retain(|k| k != &kind);
+    if pinned {
+        current.push(kind);
+    }
+    // Kept in the page's own order rather than the order they were pinned, so
+    // the sidebar does not depend on the sequence the listener clicked in.
+    current.sort_by_key(|k| MIX_KINDS.iter().position(|m| m == k).unwrap_or(usize::MAX));
+
+    let raw = serde_json::to_string(&current).map_err(err)?;
+    state
+        .db
+        .set_setting(SETTING_PINNED_MIXES, &raw)
+        .map_err(err)?;
+    let _ = app.emit("home-changed", ());
+    Ok(current)
+}
+
+#[tauri::command]
+pub fn list_pinned_mixes(state: State<'_, AppState>) -> Cmd<Vec<MixSummary>> {
+    let pinned = pinned_mixes(&state);
+    pinned
+        .iter()
+        .map(|kind| {
+            let tracks = state.mix(kind).map_err(err)?;
+            Ok(MixSummary {
+                kind: kind.clone(),
+                name: mix_name(kind).to_string(),
+                description: mix_description(kind).to_string(),
+                track_count: tracks.len(),
+                artwork_ids: tracks
+                    .iter()
+                    .filter_map(|t| t.artwork_id.clone())
+                    .take(4)
+                    .collect(),
+                pinned: true,
+            })
+        })
+        .collect()
+}
+
+/// Freeze a generated mix into a real playlist.
+///
+/// Saving takes a copy: the playlist keeps these songs even after the mix that
+/// produced them has moved on, which is the entire reason to save one.
+#[tauri::command]
+pub fn save_mix_to_playlist(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    kind: String,
+    playlist_id: Option<String>,
+    name: Option<String>,
+) -> Cmd<PlaylistSummary> {
+    let tracks = state.mix(&kind).map_err(err)?;
+    if tracks.is_empty() {
+        return Err("this mix has no songs to save".into());
+    }
+
+    let (path, mut playlist) = match playlist_id {
+        Some(id) => find_playlist(&state, &id).ok_or_else(|| "playlist not found".to_string())?,
+        None => {
+            let mut created = Playlist {
+                name: name.unwrap_or_else(|| mix_name(&kind).to_string()),
+                ..Default::default()
+            };
+            created.description = format!("Saved from your {}", mix_name(&kind));
+            let path = state
+                .paths
+                .playlists
+                .join(playlist::file_name_for(&created.name, &created.id));
+            (path, created)
+        }
+    };
+
+    for track in &tracks {
+        playlist.add_track(track);
+    }
+    playlist.save(&path).map_err(err)?;
+    let _ = app.emit("playlists-changed", ());
+
+    Ok(PlaylistSummary {
+        id: playlist.id,
+        name: playlist.name,
+        description: playlist.description,
+        track_count: playlist.tracks.len(),
+        artwork: playlist.artwork,
+        has_mixer: playlist.mixer.is_some(),
+        shuffle_only: playlist.shuffle_only,
+        path: path.display().to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Listening history
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn listening_history(state: State<'_, AppState>, limit: Option<usize>) -> Cmd<Vec<PlayRecord>> {
+    state.db.recent_plays(limit.unwrap_or(200)).map_err(err)
+}
+
+/// Erase listening history.
+///
+/// Also drops the held mixes, since every one of them is derived from the
+/// history that has just been deleted — leaving them in place would keep
+/// serving recommendations built from data the listener asked to be rid of.
+#[tauri::command]
+pub fn clear_listening_history(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
+    state.db.clear_history().map_err(err)?;
+    state.plays.reset_progress(None);
+    state.clear_mixes();
+    let _ = app.emit("home-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_listening_history_for_song(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    song_id: String,
+) -> Cmd<()> {
+    state.db.clear_history_for_song(&song_id).map_err(err)?;
+    state.plays.reset_progress(Some(&song_id));
+    state.clear_mixes();
+    let _ = app.emit("home-changed", ());
     Ok(())
 }
 

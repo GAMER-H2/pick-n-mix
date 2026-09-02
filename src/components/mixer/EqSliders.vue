@@ -5,6 +5,7 @@
  * advanced panel.
  */
 import { computed, ref } from "vue";
+import { hasGain } from "@/lib/mixer";
 import type { Eq } from "@/lib/types";
 
 const props = defineProps<{ eq: Eq; height?: number }>();
@@ -13,6 +14,19 @@ const emit = defineEmits<{ change: [eq: Eq] }>();
 const RANGE = 12;
 const height = computed(() => props.height ?? 108);
 const dragging = ref<number | null>(null);
+
+/**
+ * Only the bands a fader can actually move.
+ *
+ * A high- or low-pass band has no gain — it always cuts — so a fader for one
+ * would do nothing. Each entry keeps its index into the full band list, since
+ * that is what edits are addressed by.
+ */
+const faders = computed(() =>
+  props.eq.bands
+    .map((band, index) => ({ band, index }))
+    .filter(({ band }) => hasGain(band.kind)),
+);
 
 function fraction(gainDb: number) {
   return (gainDb + RANGE) / (RANGE * 2);
@@ -67,9 +81,12 @@ function onDoubleClick(index: number) {
 </script>
 
 <template>
-  <div class="eq">
+  <div class="eq" :style="{ '--band-height': `${height}px` }">
+    <!-- One continuous reference line rather than a tick per band, so it
+         reads at a glance whether the whole EQ is flat. -->
+    <div class="eq__zero-line" />
     <div
-      v-for="(band, index) in eq.bands"
+      v-for="{ band, index } in faders"
       :key="index"
       class="eq__band"
       :style="{ height: `${height}px` }"
@@ -80,7 +97,6 @@ function onDoubleClick(index: number) {
       @dblclick="onDoubleClick(index)"
     >
       <div class="eq__track">
-        <div class="eq__zero" />
         <div
           class="eq__fill"
           :style="{
@@ -98,6 +114,7 @@ function onDoubleClick(index: number) {
 
 <style scoped>
 .eq {
+  position: relative;
   display: flex;
   justify-content: space-between;
   gap: 4px;
@@ -107,7 +124,28 @@ function onDoubleClick(index: number) {
   border: 0.5px solid var(--separator);
 }
 
+/*
+ * Spans every band's own zero point, which sits at the vertical centre of
+ * the track. `--footer-height` is the label + value block below the track
+ * (6px margin + two 12px text lines, both pinned to that line-height below so
+ * this stays exact rather than an eyeballed guess); subtracting it from the
+ * band's own height and halving what remains lands exactly on the track's
+ * midpoint, matching where each fader already sits at gain 0.
+ */
+.eq__zero-line {
+  --footer-height: 30px;
+  position: absolute;
+  z-index: 0;
+  left: 10px;
+  right: 10px;
+  top: calc(12px + (var(--band-height) - var(--footer-height)) / 2);
+  border-top: 1px dashed var(--separator-strong);
+  pointer-events: none;
+}
+
 .eq__band {
+  position: relative;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -122,16 +160,6 @@ function onDoubleClick(index: number) {
   width: 4px;
   border-radius: 999px;
   background: var(--control-track);
-}
-
-/* The flat line, so a boost and a cut are visually distinguishable. */
-.eq__zero {
-  position: absolute;
-  left: -3px;
-  right: -3px;
-  top: 50%;
-  height: 1px;
-  background: var(--separator-strong);
 }
 
 .eq__fill {
@@ -153,14 +181,18 @@ function onDoubleClick(index: number) {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.32);
 }
 
+/* Line-heights are pinned to fixed pixels, not left to the font's default,
+   because `.eq__zero-line` above calculates its position from them. */
 .eq__label {
   margin-top: 6px;
   font-size: 9.5px;
+  line-height: 12px;
   color: var(--text-tertiary);
 }
 
 .eq__value {
   font-size: 9.5px;
+  line-height: 12px;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }

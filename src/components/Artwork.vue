@@ -10,7 +10,12 @@ const props = withDefaults(
 );
 
 const failed = ref(false);
-const src = computed(() => (failed.value ? null : artUrl(props.artworkId)));
+// Ask for pixels, not CSS size, so retina displays still look sharp — the
+// backend rounds this up to its nearest cached bucket anyway.
+const requestWidth = computed(() => Math.round(props.size * (window.devicePixelRatio || 1)));
+const src = computed(() =>
+  failed.value ? null : artUrl(props.artworkId, requestWidth.value),
+);
 
 // A new track means a new chance for the image to work.
 watch(

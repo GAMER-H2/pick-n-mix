@@ -597,8 +597,12 @@ mod mixer_reaches_audio {
 
     #[test]
     fn normalisation_gain_reaches_the_audio() {
-        let Some((engine, _rx)) = engine() else { return };
-        engine.load(fixture("mixer-gain", 8.0), 0.0, 0.0).expect("loading");
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine
+            .load(fixture("mixer-gain", 8.0), 0.0, 0.0)
+            .expect("loading");
 
         // +24 dB against a 0.4-amplitude tone is far past the ceiling, so the
         // limiter must respond. Left at unity, it has nothing to do.
@@ -623,8 +627,12 @@ mod mixer_reaches_audio {
 
     #[test]
     fn eq_gain_reaches_the_audio() {
-        let Some((engine, _rx)) = engine() else { return };
-        engine.load(fixture("mixer-eq", 8.0), 0.0, 0.0).expect("loading");
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine
+            .load(fixture("mixer-eq", 8.0), 0.0, 0.0)
+            .expect("loading");
 
         let mut eq = Eq::default();
         for band in eq.bands.iter_mut() {
@@ -652,8 +660,12 @@ mod mixer_reaches_audio {
     /// Guards against the test above passing for the wrong reason.
     #[test]
     fn a_flat_chain_leaves_the_limiter_idle() {
-        let Some((engine, _rx)) = engine() else { return };
-        engine.load(fixture("mixer-flat", 4.0), 0.0, 0.0).expect("loading");
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine
+            .load(fixture("mixer-flat", 4.0), 0.0, 0.0)
+            .expect("loading");
         engine.set_settings(boosted(MixerSettings {
             enabled: Some(true),
             ..Default::default()
@@ -661,7 +673,8 @@ mod mixer_reaches_audio {
         engine.play();
 
         assert!(
-            wait_for(Duration::from_secs(2), || engine.snapshot().position_secs > 0.5),
+            wait_for(Duration::from_secs(2), || engine.snapshot().position_secs
+                > 0.5),
             "playback never started"
         );
         assert!(
@@ -674,8 +687,12 @@ mod mixer_reaches_audio {
     /// when the track was loaded.
     #[test]
     fn a_setting_changed_during_playback_takes_effect() {
-        let Some((engine, _rx)) = engine() else { return };
-        engine.load(fixture("mixer-live", 10.0), 0.0, 0.0).expect("loading");
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine
+            .load(fixture("mixer-live", 10.0), 0.0, 0.0)
+            .expect("loading");
         engine.set_settings(boosted(MixerSettings {
             enabled: Some(true),
             ..Default::default()
@@ -683,10 +700,14 @@ mod mixer_reaches_audio {
         engine.play();
 
         assert!(
-            wait_for(Duration::from_secs(3), || engine.snapshot().position_secs > 0.4),
+            wait_for(Duration::from_secs(3), || engine.snapshot().position_secs
+                > 0.4),
             "playback never started"
         );
-        assert!(engine.snapshot().limiter_reduction_db < 0.5, "should start idle");
+        assert!(
+            engine.snapshot().limiter_reduction_db < 0.5,
+            "should start idle"
+        );
 
         engine.set_settings(boosted(MixerSettings {
             enabled: Some(true),
@@ -702,6 +723,220 @@ mod mixer_reaches_audio {
         assert!(
             limiter_engages(&engine),
             "turning a control up mid-track had no effect on the audio"
+        );
+    }
+}
+
+/// Pausing with a reverb tail must not cost the listener their place.
+///
+/// The tail is produced by discarding the audio already queued for the output
+/// and winding the decoder back to what was actually heard, so the interesting
+/// property is that resume continues from there rather than skipping the
+/// discarded stretch or repeating it.
+mod reverb_tail {
+    use super::*;
+
+    fn reverb_on() -> MixerSettings {
+        MixerSettings {
+            reverb: Some(Reverb {
+                enabled: true,
+                mix: 0.6,
+                size: 0.8,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn started(engine: &AudioEngine) -> bool {
+        wait_for(Duration::from_secs(3), || {
+            engine.snapshot().position_secs > 0.4
+        })
+    }
+
+    #[test]
+    fn a_tail_keeps_the_position_where_the_listener_heard_it() {
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine.set_settings(MixerSettings::resolve(&[&reverb_on()]));
+        engine.set_keep_tail(true);
+        engine
+            .load(fixture("tail-position", 8.0), 0.0, 0.0)
+            .expect("loading");
+        engine.play();
+        assert!(started(&engine), "playback never started");
+
+        engine.pause();
+        // Long enough for the tail to have rendered and finished.
+        std::thread::sleep(Duration::from_millis(700));
+        let at_pause = engine.snapshot().position_secs;
+        std::thread::sleep(Duration::from_millis(500));
+        let later = engine.snapshot().position_secs;
+
+        assert!(
+            (later - at_pause).abs() < 0.15,
+            "the position drifted while the tail rang out: {at_pause} then {later}"
+        );
+        assert!(!engine.is_playing());
+    }
+
+    #[test]
+    fn playback_resumes_from_where_it_was_paused() {
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine.set_settings(MixerSettings::resolve(&[&reverb_on()]));
+        engine.set_keep_tail(true);
+        engine
+            .load(fixture("tail-resume", 8.0), 0.0, 0.0)
+            .expect("loading");
+        engine.play();
+        assert!(started(&engine), "playback never started");
+
+        engine.pause();
+        std::thread::sleep(Duration::from_millis(700));
+        let at_pause = engine.snapshot().position_secs;
+
+        engine.play();
+        std::thread::sleep(Duration::from_millis(250));
+        let resumed = engine.snapshot().position_secs;
+
+        // Forwards, but not by a jump: winding the decoder back for the tail
+        // must not have lost or repeated a chunk of the track.
+        assert!(
+            resumed >= at_pause - 0.15,
+            "resume went backwards: paused at {at_pause}, resumed at {resumed}"
+        );
+        assert!(
+            resumed - at_pause < 0.9,
+            "resume skipped ahead: paused at {at_pause}, resumed at {resumed}"
+        );
+    }
+
+    /// With the setting off, pause stays exactly as instant as it always was.
+    #[test]
+    fn without_the_setting_pause_is_unchanged() {
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine.set_settings(MixerSettings::resolve(&[&reverb_on()]));
+        engine.set_keep_tail(false);
+        engine
+            .load(fixture("tail-off", 8.0), 0.0, 0.0)
+            .expect("loading");
+        engine.play();
+        assert!(started(&engine), "playback never started");
+
+        engine.pause();
+        std::thread::sleep(Duration::from_millis(300));
+        let at_pause = engine.snapshot().position_secs;
+        std::thread::sleep(Duration::from_millis(500));
+
+        assert!(
+            (engine.snapshot().position_secs - at_pause).abs() < 0.1,
+            "position moved while paused with the tail disabled"
+        );
+    }
+
+    /// A dry chain has nothing to ring out, so the tail path must not engage
+    /// and hold the output open for no reason.
+    #[test]
+    fn a_dry_chain_pauses_immediately_even_with_the_setting_on() {
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine.set_keep_tail(true);
+        engine
+            .load(fixture("tail-dry", 8.0), 0.0, 0.0)
+            .expect("loading");
+        engine.play();
+        assert!(started(&engine), "playback never started");
+
+        engine.pause();
+        std::thread::sleep(Duration::from_millis(300));
+        let at_pause = engine.snapshot().position_secs;
+        std::thread::sleep(Duration::from_millis(500));
+
+        assert!(
+            (engine.snapshot().position_secs - at_pause).abs() < 0.1,
+            "position moved while paused on a dry chain"
+        );
+    }
+}
+
+mod output_device {
+    use super::*;
+
+    #[test]
+    fn the_machines_output_devices_can_be_listed() {
+        if engine().is_none() {
+            return;
+        }
+        // The default device the engine just opened has to appear in the list,
+        // or the picker would not be able to show what is already selected.
+        assert!(
+            !AudioEngine::output_devices().is_empty(),
+            "no output devices were listed on a machine that has one"
+        );
+    }
+
+    #[test]
+    fn switching_back_to_the_default_keeps_playing() {
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine
+            .load(fixture("device-default", 8.0), 0.0, 0.0)
+            .expect("loading");
+        engine.play();
+        assert!(
+            wait_for(Duration::from_secs(3), || engine.snapshot().position_secs
+                > 0.3),
+            "playback never started"
+        );
+
+        let rate = engine
+            .set_output_device(None)
+            .expect("reopening the default device");
+        assert!(rate >= 8000, "implausible sample rate reported: {rate}");
+    }
+
+    #[test]
+    fn moving_to_each_available_device_reports_its_rate() {
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        for name in AudioEngine::output_devices() {
+            // A device can be listed and still refuse to open — exclusive
+            // mode, a disconnected interface — so a failure here is only
+            // interesting if it leaves the engine unusable, which the
+            // fallback to the default prevents.
+            if let Ok(rate) = engine.set_output_device(Some(&name)) {
+                assert!(rate >= 8000, "{name} reported an implausible rate: {rate}");
+            }
+        }
+        // Whatever happened above, the engine still works.
+        assert!(engine.set_output_device(None).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_device_is_refused_and_the_default_still_works() {
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        assert!(
+            engine
+                .set_output_device(Some("a device that does not exist"))
+                .is_err(),
+            "a made-up device name was accepted"
+        );
+        // The output thread falls back rather than leaving the app silent.
+        assert!(
+            wait_for(Duration::from_secs(3), || engine
+                .set_output_device(None)
+                .is_ok()),
+            "the engine did not recover after a failed device switch"
         );
     }
 }

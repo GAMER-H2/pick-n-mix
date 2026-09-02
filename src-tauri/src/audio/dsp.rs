@@ -159,6 +159,15 @@ impl Biquad {
         self.a2 = a2 / a0;
     }
 
+    /// The normalised coefficients, as `[b0, b1, b2, a1, a2]`.
+    ///
+    /// The EQ graph in the UI re-derives these in TypeScript so it can redraw
+    /// while a node is dragged; `tests/eq_parity.rs` uses this to pin the two
+    /// implementations to a shared fixture.
+    pub fn coefficients(&self) -> [f32; 5] {
+        [self.b0, self.b1, self.b2, self.a1, self.a2]
+    }
+
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
@@ -183,7 +192,7 @@ impl Biquad {
 // EQ
 // ---------------------------------------------------------------------------
 
-const MAX_BANDS: usize = 12;
+pub const MAX_BANDS: usize = 12;
 
 pub struct EqChain {
     filters: [[Biquad; MAX_BANDS]; CHANNELS],

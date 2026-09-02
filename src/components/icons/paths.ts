@@ -123,13 +123,31 @@ const DEFS = {
     d: ["M3.6 6.4h11.2", "M3.6 12h11.2", "M3.6 17.6h7"],
     circles: [{ cx: 18.6, cy: 16.2, r: 2.6 }],
   },
+  // The top line is the short one: it stands for the new "next" slot, and the
+  // hook curves up from below to point straight at it — inserted right after
+  // what's currently playing, not appended at the end.
   playNext: {
     mode: "stroke",
-    d: ["M3.6 7.6h8.4", "M3.6 12.6h8.4", "M3.6 17.6h5.6", "M14.6 5.6h4.4a1.8 1.8 0 0 1 1.8 1.8v4", "M18.4 8.6 20.8 11.4 18.4 14.2"],
+    d: [
+      "M3.6 7.6h5.6",
+      "M3.6 12.6h8.4",
+      "M3.6 17.6h8.4",
+      "M20.6 17.4v-8a1.8 1.8 0 0 0 -1.8-1.8h-4",
+      "M17.2 4.8 14.8 7.6 17.2 10.4",
+    ],
   },
+  // The mirror image of `playNext`: the short bottom line stands for the
+  // newly appended slot, and the hook curves down from above to point
+  // straight at it.
   addToQueue: {
     mode: "stroke",
-    d: ["M3.6 6.4h8.4", "M3.6 11.4h8.4", "M3.6 16.4h5.6", "M12.6 19.4h6.2a1.8 1.8 0 0 0 1.8-1.8v-4", "M18.2 10.8 20.6 13.6 18.2 16.4"],
+    d: [
+      "M3.6 6.4h8.4",
+      "M3.6 11.4h8.4",
+      "M3.6 16.4h5.6",
+      "M20.6 6.6v8a1.8 1.8 0 0 1 -1.8 1.8h-4",
+      "M17.2 13.6 14.8 16.4 17.2 19.2",
+    ],
   },
   addToPlaylist: {
     mode: "stroke",
@@ -150,6 +168,23 @@ const DEFS = {
   },
 
   // -- utility --------------------------------------------------------------
+  settings: {
+    mode: "stroke",
+    d: [
+      "M12 3.2v2.2",
+      "M12 18.6v2.2",
+      "M3.2 12h2.2",
+      "M18.6 12h2.2",
+      "M5.8 5.8l1.6 1.6",
+      "M16.6 16.6l1.6 1.6",
+      "M18.2 5.8l-1.6 1.6",
+      "M7.4 16.6l-1.6 1.6",
+    ],
+    circles: [
+      { cx: 12, cy: 12, r: 6.6 },
+      { cx: 12, cy: 12, r: 2.7 },
+    ],
+  },
   info: { mode: "stroke", d: ["M12 11v5.4", "M12 7.9v.1"], circles: [{ cx: 12, cy: 12, r: 8.6 }] },
   warningCircle: {
     mode: "stroke",

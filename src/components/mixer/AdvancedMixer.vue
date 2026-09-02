@@ -12,105 +12,127 @@ import AppSlider from "../AppSlider.vue";
 import AppKnob from "../AppKnob.vue";
 import AppToggle from "../AppToggle.vue";
 import EqSliders from "./EqSliders.vue";
+import EqModal from "./EqModal.vue";
 import PresetSelect from "./PresetSelect.vue";
 import FilterGrid from "./FilterGrid.vue";
 import SectionHeader from "./SectionHeader.vue";
 import CrossfadeGraph from "./CrossfadeGraph.vue";
-import { audibleMix, DEFAULT_EQ_FREQS, tempoPercent } from "@/lib/mixer";
+import { audibleMix, defaultBands, tempoPercent } from "@/lib/mixer";
 import { formatHz, semitonesLabel } from "@/lib/format";
 import { formatSeconds } from "@/lib/crossfadeCurve";
 import { withCrossfadeLength } from "@/lib/crossfadeCurve";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
-import type { BandKind, CrossfadeCurve, Eq } from "@/lib/types";
+import { usePresetEditorStore } from "@/stores/presetEditor";
+import { useUiStore } from "@/stores/ui";
+import type { Section } from "@/lib/mixer";
+import type { CrossfadeCurve, Eq, MixerSettings } from "@/lib/types";
 
+const props = withDefaults(defineProps<{ mode?: "live" | "preset" }>(), { mode: "live" });
 const mixer = useMixerStore();
 const player = usePlayerStore();
+const presetEditor = usePresetEditorStore();
+const ui = useUiStore();
 
+const isPreset = computed(() => props.mode === "preset");
 const eqExpanded = ref(false);
-const fx = computed(() => mixer.effective);
-const canOverride = computed(() => mixer.target.kind !== "global");
+const fx = computed(() => isPreset.value ? presetEditor.effective : mixer.effective);
+const targetLabel = computed(() => isPreset.value
+  ? `Preset · ${presetEditor.session?.name ?? "Untitled"}`
+  : mixer.targetLabel,
+);
+const canOverride = computed(() => isPreset.value || mixer.target.kind !== "global");
 // Crossfades apply between playlist entries, not to an individual entry's
 // mixer override. Keep the global and playlist controls available, but do not
 // offer a misleading per-song crossfade editor.
-const canEditCrossfade = computed(() => mixer.target.kind !== "entry");
+const canEditCrossfade = computed(() => isPreset.value || mixer.target.kind !== "entry");
 
 const MAX_CROSSFADE_SECS = 12;
 const crossfadeSettings = computed(() => fx.value.crossfade);
 
+function setSection<K extends Section>(section: K, value: MixerSettings[K]) {
+  if (isPreset.value) presetEditor.setSection(section, value);
+  else void mixer.setSection(section, value);
+}
+
+function clearSection(section: Section) {
+  if (isPreset.value) presetEditor.clearSection(section);
+  else void mixer.clearSection(section);
+}
+
+function setEnabled(enabled: boolean) {
+  if (isPreset.value) presetEditor.setEnabled(enabled);
+  else void mixer.setEnabled(enabled);
+}
+
+function closePanel() {
+  if (isPreset.value) presetEditor.close();
+  else mixer.panelOpen = false;
+}
+
+async function savePresetDraft() {
+  try {
+    await presetEditor.save();
+    ui.notify("Preset saved");
+  } catch (error) {
+    ui.notify(`Could not save preset: ${error instanceof Error ? error.message : String(error)}`, "error");
+  }
+}
+
 function onCrossfadeLength(lengthSecs: number) {
-  mixer.setSection("crossfade", withCrossfadeLength(crossfadeSettings.value, lengthSecs));
+  setSection("crossfade", withCrossfadeLength(crossfadeSettings.value, lengthSecs));
 }
 
 function onCrossfadeCurve(curve: CrossfadeCurve) {
-  mixer.setSection("crossfade", { ...crossfadeSettings.value, curve });
+  setSection("crossfade", { ...crossfadeSettings.value, curve });
 }
 
-function overridden(section: string) {
-  return mixer.overriddenSections.includes(section as never);
+function overridden(section: Section) {
+  if (isPreset.value) {
+    const value = presetEditor.session?.draft[section];
+    return value !== null && value !== undefined;
+  }
+  return mixer.overriddenSections.includes(section);
 }
 
 // -- pitch -------------------------------------------------------------------
 const semitones = computed({
   get: () => fx.value.pitch.semitones,
-  set: (semitones: number) => mixer.setSection("pitch", { ...fx.value.pitch, semitones }),
+  set: (semitones: number) => setSection("pitch", { ...fx.value.pitch, semitones }),
 });
 const cents = computed({
   get: () => fx.value.pitch.cents,
-  set: (cents: number) => mixer.setSection("pitch", { ...fx.value.pitch, cents }),
+  set: (cents: number) => setSection("pitch", { ...fx.value.pitch, cents }),
 });
 
 // -- reverb ------------------------------------------------------------------
 function setReverb(patch: Partial<typeof fx.value.reverb>) {
-  mixer.setSection("reverb", { ...fx.value.reverb, ...patch });
+  setSection("reverb", { ...fx.value.reverb, ...patch });
 }
 
 // -- delay -------------------------------------------------------------------
 function setDelay(patch: Partial<typeof fx.value.delay>) {
-  mixer.setSection("delay", { ...fx.value.delay, ...patch });
+  setSection("delay", { ...fx.value.delay, ...patch });
 }
 
 // -- normalisation -----------------------------------------------------------
 function setNorm(patch: Partial<typeof fx.value.normalisation>) {
-  mixer.setSection("normalisation", { ...fx.value.normalisation, ...patch });
+  setSection("normalisation", { ...fx.value.normalisation, ...patch });
 }
 
 // -- lo-fi -------------------------------------------------------------------
 function setLofi(patch: Partial<typeof fx.value.lofi>) {
-  mixer.setSection("lofi", { ...fx.value.lofi, ...patch });
+  setSection("lofi", { ...fx.value.lofi, ...patch });
 }
 
 // -- eq ----------------------------------------------------------------------
 function onEq(eq: Eq) {
-  mixer.setSection("eq", eq);
-}
-
-function setBand(index: number, patch: Record<string, unknown>) {
-  const bands = fx.value.eq.bands.map((b, i) => (i === index ? { ...b, ...patch } : b));
-  onEq({ ...fx.value.eq, bands });
+  setSection("eq", eq);
 }
 
 function resetEq() {
-  onEq({
-    enabled: true,
-    preampDb: 0,
-    bands: DEFAULT_EQ_FREQS.map((freq, i) => ({
-      kind: (i === 0 ? "lowShelf" : i === 5 ? "highShelf" : "peak") as BandKind,
-      freq,
-      gainDb: 0,
-      q: 0.9,
-      enabled: true,
-    })),
-  });
+  onEq({ enabled: true, preampDb: 0, bands: defaultBands() });
 }
-
-const BAND_KINDS: { value: BandKind; label: string }[] = [
-  { value: "lowShelf", label: "Low Shelf" },
-  { value: "peak", label: "Peak" },
-  { value: "highShelf", label: "High Shelf" },
-  { value: "lowPass", label: "Low Pass" },
-  { value: "highPass", label: "High Pass" },
-];
 
 const deviceRate = computed(() => player.snapshot.deviceSampleRate);
 </script>
@@ -123,7 +145,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         <p class="panel__target truncate">
           <PnmIcon
             :name="
-              mixer.target.kind === 'global'
+              isPreset || mixer.target.kind === 'global'
                 ? 'mixer'
                 : mixer.target.kind === 'playlist'
                   ? 'addToPlaylist'
@@ -131,10 +153,10 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
             "
             :size="12"
           />
-          <span>{{ mixer.targetLabel }}</span>
+          <span>{{ targetLabel }}</span>
         </p>
       </div>
-      <button class="icon-button" aria-label="Close mixer" @click="mixer.panelOpen = false">
+      <button class="icon-button" aria-label="Close mixer" @click="closePanel">
         <PnmIcon name="close" :size="18" />
       </button>
     </header>
@@ -145,14 +167,31 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         <AppToggle
           :model-value="fx.enabled"
           label="Enable effects"
-          @update:model-value="mixer.setEnabled($event)"
+          @update:model-value="setEnabled($event)"
         />
       </div>
 
-      <PresetSelect />
+      <PresetSelect v-if="!isPreset" />
 
-      <p v-if="canOverride" class="panel__scope">
-        Changes here apply only to <strong>{{ mixer.targetLabel }}</strong
+      <div v-if="isPreset && presetEditor.session" class="panel__preset-save">
+        <label>
+          <span>Preset name</span>
+          <input v-model="presetEditor.session.name" class="text-field" maxlength="60" />
+        </label>
+        <button
+          class="pill-button"
+          :disabled="presetEditor.saving || !presetEditor.session.name.trim()"
+          @click="savePresetDraft"
+        >
+          {{ presetEditor.session.sourceBuiltIn ? "Save as Custom" : "Save" }}
+        </button>
+      </div>
+
+      <p v-if="isPreset" class="panel__scope">
+        This is an isolated preset draft. Playback does not change while you edit it.
+      </p>
+      <p v-else-if="canOverride" class="panel__scope">
+        Changes here apply only to <strong>{{ targetLabel }}</strong
         >. Untouched sections follow your global mixer.
       </p>
 
@@ -162,72 +201,21 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           title="EQ"
           :overridden="overridden('eq')"
           :can-override="canOverride"
-          @clear="mixer.clearSection('eq')"
+          @clear="clearSection('eq')"
         >
           <div class="panel__spacer" />
           <button class="panel__link" @click="resetEq">Reset</button>
           <button
             class="icon-button"
-            :aria-label="eqExpanded ? 'Collapse EQ' : 'Expand EQ'"
-            @click="eqExpanded = !eqExpanded"
+            aria-label="Expand EQ"
+            title="Expand EQ"
+            @click="eqExpanded = true"
           >
-            <PnmIcon :name="eqExpanded ? 'collapse' : 'expand'" :size="16" />
+            <PnmIcon name="expand" :size="16" />
           </button>
         </SectionHeader>
 
-        <EqSliders :eq="fx.eq" :height="eqExpanded ? 130 : 96" @change="onEq" />
-
-        <div v-if="eqExpanded" class="bands">
-          <div class="bands__head">
-            <span>Band</span><span>Type</span><span>Freq</span><span>Q</span>
-          </div>
-          <div v-for="(band, index) in fx.eq.bands" :key="index" class="bands__row">
-            <AppToggle
-              :model-value="band.enabled"
-              :label="`Band ${index + 1}`"
-              @update:model-value="setBand(index, { enabled: $event })"
-            />
-            <select
-              class="bands__select"
-              :value="band.kind"
-              @change="setBand(index, { kind: ($event.target as HTMLSelectElement).value })"
-            >
-              <option v-for="k in BAND_KINDS" :key="k.value" :value="k.value">{{ k.label }}</option>
-            </select>
-            <input
-              class="bands__number"
-              type="number"
-              :value="Math.round(band.freq)"
-              min="20"
-              max="20000"
-              @change="
-                setBand(index, { freq: Number(($event.target as HTMLInputElement).value) })
-              "
-            />
-            <input
-              class="bands__number"
-              type="number"
-              :value="band.q.toFixed(2)"
-              min="0.1"
-              max="12"
-              step="0.1"
-              @change="setBand(index, { q: Number(($event.target as HTMLInputElement).value) })"
-            />
-          </div>
-
-          <div class="row">
-            <label>Preamp</label>
-            <AppSlider
-              :model-value="fx.eq.preampDb"
-              :min="-12"
-              :max="12"
-              :step="0.5"
-              :origin="0"
-              @update:model-value="onEq({ ...fx.eq, preampDb: $event })"
-            />
-            <span class="row__value">{{ fx.eq.preampDb.toFixed(1) }} dB</span>
-          </div>
-        </div>
+        <EqSliders :eq="fx.eq" @change="onEq" />
       </section>
 
       <!-- Pitch ------------------------------------------------------------->
@@ -236,7 +224,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           title="Pitch"
           :overridden="overridden('pitch')"
           :can-override="canOverride"
-          @clear="mixer.clearSection('pitch')"
+          @clear="clearSection('pitch')"
         />
         <div class="row">
           <label>Semitones</label>
@@ -260,7 +248,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           title="Reverb"
           :overridden="overridden('reverb')"
           :can-override="canOverride"
-          @clear="mixer.clearSection('reverb')"
+          @clear="clearSection('reverb')"
         >
           <div class="panel__spacer" />
           <AppToggle
@@ -316,7 +304,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           title="Delay"
           :overridden="overridden('delay')"
           :can-override="canOverride"
-          @clear="mixer.clearSection('delay')"
+          @clear="clearSection('delay')"
         >
           <div class="panel__spacer" />
           <AppToggle
@@ -375,7 +363,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           title="Normalisation"
           :overridden="overridden('normalisation')"
           :can-override="canOverride"
-          @clear="mixer.clearSection('normalisation')"
+          @clear="clearSection('normalisation')"
         >
           <div class="panel__spacer" />
           <AppToggle
@@ -455,10 +443,10 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           title="Crossfade"
           :overridden="overridden('crossfade')"
           :can-override="canOverride"
-          @clear="mixer.clearSection('crossfade')"
+          @clear="clearSection('crossfade')"
         >
           <div class="panel__spacer" />
-          <span v-if="mixer.target.kind === 'playlist'" class="panel__global-note">
+          <span v-if="!isPreset && mixer.target.kind === 'playlist'" class="panel__global-note">
             Applies to this playlist
           </span>
         </SectionHeader>
@@ -489,15 +477,20 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         </p>
       </section>
 
-      <!-- Filters ----------------------------------------------------------->
+      <!-- Atmospheres ------------------------------------------------------->
       <section class="panel__section">
         <SectionHeader
-          title="Filters"
+          title="Atmospheres"
           :overridden="overridden('filters')"
           :can-override="canOverride"
-          @clear="mixer.clearSection('filters')"
+          @clear="clearSection('filters')"
         />
-        <FilterGrid show-volumes />
+        <FilterGrid
+          show-volumes
+          :settings="isPreset ? fx.filters : undefined"
+          @toggle="presetEditor.toggleFilter"
+          @volume="presetEditor.setFilterVolume"
+        />
       </section>
 
       <!-- Sample rate ------------------------------------------------------->
@@ -506,7 +499,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           title="Sample Rate"
           :overridden="overridden('lofi')"
           :can-override="canOverride"
-          @clear="mixer.clearSection('lofi')"
+          @clear="clearSection('lofi')"
         >
           <div class="panel__spacer" />
           <AppToggle
@@ -558,6 +551,17 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         </p>
       </section>
     </div>
+
+    <!-- Edits whichever layer this panel is pointed at, like every other
+         section here. -->
+    <EqModal
+      v-if="eqExpanded"
+      :eq="fx.eq"
+      :target-label="targetLabel"
+      :sample-rate="deviceRate"
+      @change="onEq"
+      @close="eqExpanded = false"
+    />
   </aside>
 </template>
 
@@ -610,6 +614,24 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   justify-content: space-between;
   font-size: 13px;
   font-weight: 600;
+}
+
+.panel__preset-save {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.panel__preset-save label {
+  flex: 1;
+  min-width: 0;
+}
+
+.panel__preset-save label > span {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 10.5px;
+  color: var(--text-tertiary);
 }
 
 .panel__scope {
@@ -687,52 +709,6 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   flex-wrap: wrap;
   gap: 12px 6px;
   justify-content: space-between;
-}
-
-.bands {
-  margin-top: 10px;
-}
-
-.bands__head,
-.bands__row {
-  display: grid;
-  grid-template-columns: 40px 1fr 58px 46px;
-  align-items: center;
-  gap: 6px;
-}
-
-.bands__head {
-  margin-bottom: 4px;
-  font-size: 9.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-tertiary);
-}
-
-.bands__row {
-  margin-bottom: 5px;
-}
-
-.bands__select,
-.bands__number {
-  height: 24px;
-  padding: 0 5px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--separator);
-  background: var(--bg-elevated);
-  font-size: 11px;
-  outline: none;
-  min-width: 0;
-}
-
-.bands__number {
-  font-variant-numeric: tabular-nums;
-  user-select: text;
-}
-
-.bands__select:focus,
-.bands__number:focus {
-  border-color: var(--accent);
 }
 
 .meter {

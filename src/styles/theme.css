@@ -34,6 +34,18 @@
   --ease: cubic-bezier(0.32, 0.72, 0, 1);
   --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
+
+  /* Space reserved for the client-side-decoration window controls. Zero on
+     platforms with server-side decorations (macOS, Windows), so the rules
+     that use these are inert there. */
+  --titlebar-height: 0px;
+  --titlebar-controls: 0px;
+}
+
+/* Set once, in `App.vue`, once the window is confirmed undecorated. */
+html.is-custom-titlebar {
+  --titlebar-height: 30px;
+  --titlebar-controls: 90px;
 }
 
 /* Light */
@@ -103,7 +115,6 @@ body {
   color: var(--text);
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
   overflow: hidden;
   /* A desktop app should not feel like a web page. */
   user-select: none;
@@ -267,6 +278,17 @@ textarea {
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: content-box;
+}
+
+/*
+ * The window controls are pinned to the app's own top-right corner (see
+ * `App.vue`), independent of the sidebar or any side panel's width. Whichever
+ * panel actually sits at that corner needs to leave room under them instead of
+ * running its own header underneath.
+ */
+.app__body > :last-child .queue__head,
+.app__body > :last-child .panel__head {
+  padding-top: calc(14px + var(--titlebar-height));
 }
 
 .scroll-area:hover::-webkit-scrollbar-thumb {

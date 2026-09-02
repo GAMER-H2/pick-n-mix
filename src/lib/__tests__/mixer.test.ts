@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { symmetricCurve } from "../crossfadeCurve";
-import { overlay, pitchRatio, presetSections, resolve, tempoPercent } from "../mixer";
+import {
+  defaultBands,
+  hasGain,
+  overlay,
+  pitchRatio,
+  presetSections,
+  resolve,
+  tempoPercent,
+} from "../mixer";
 import type { MixerSettings } from "../types";
 
 /**
@@ -42,9 +50,28 @@ describe("mixer cascade", () => {
   it("fills in defaults when no layer mentions a section", () => {
     const fx = resolve([]);
     expect(fx.enabled).toBe(true);
-    expect(fx.eq.bands).toHaveLength(6);
+    expect(fx.eq.bands).toHaveLength(8);
     expect(fx.reverb.enabled).toBe(false);
     expect(fx.filters).toEqual([]);
+  });
+
+  /**
+   * Mirrors `the_default_pass_filters_ship_disabled` in `audio/params.rs`. A
+   * pass filter has no flat setting, so an enabled one in the defaults would
+   * change the sound of every existing mix.
+   */
+  it("ships the eight Logic bands with the pass filters disabled", () => {
+    const bands = defaultBands();
+    expect(bands).toHaveLength(8);
+
+    for (const band of bands) {
+      if (!hasGain(band.kind)) expect(band.enabled).toBe(false);
+    }
+    expect(bands.filter((b) => b.enabled).every((b) => b.gainDb === 0)).toBe(true);
+
+    // The simple mixer draws a fader per gain-bearing band, so it still shows
+    // the six it always did.
+    expect(bands.filter((b) => hasGain(b.kind))).toHaveLength(6);
   });
 
   it("treats null and undefined as absent rather than as a value", () => {

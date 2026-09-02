@@ -32,6 +32,20 @@ function currentPosition(): number {
 }
 
 /**
+ * The position we are currently sitting on, cached rather than re-read from
+ * `window.history.state` inside `beforeEach`.
+ *
+ * On a back/forward navigation the browser updates `history.state` to the
+ * *destination* entry before `popstate` fires, i.e. before any guard runs. A
+ * `beforeEach` that re-read `currentPosition()` would therefore save the
+ * outgoing page's scroll offset under the *incoming* page's key, clobbering
+ * whatever was saved for it. This is only ever advanced in `afterEach`, once
+ * a navigation has actually completed and `history.state` is trustworthy for
+ * both push and pop alike.
+ */
+let currentPos = currentPosition();
+
+/**
  * Restore an offset once the view has rendered enough content to reach it.
  *
  * Lists here use `content-visibility`, so the scroll height grows over the
@@ -60,14 +74,15 @@ function restore(target: number, attempt = 0) {
  */
 export function trackScrollPositions(router: Router) {
   router.beforeEach((_to, _from, next) => {
-    if (scroller) offsets.set(currentPosition(), scroller.scrollTop);
+    if (scroller) offsets.set(currentPos, scroller.scrollTop);
     next();
   });
 
   router.afterEach(() => {
+    currentPos = currentPosition();
     // A brand-new page has no saved offset and should start at the top, which
     // is also what the router's own `scrollBehavior` asks for.
-    restore(offsets.get(currentPosition()) ?? 0);
+    restore(offsets.get(currentPos) ?? 0);
   });
 }
 
@@ -75,6 +90,7 @@ export function trackScrollPositions(router: Router) {
 export function resetScrollPositions() {
   offsets.clear();
   scroller = null;
+  currentPos = currentPosition();
   if (pending !== null) cancelAnimationFrame(pending);
   pending = null;
 }

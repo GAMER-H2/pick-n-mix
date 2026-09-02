@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{
@@ -365,7 +365,8 @@ pub fn save_user(path: &Path, presets: &[Preset]) -> Result<()> {
 }
 
 /// Add or replace a user preset by name.
-pub fn upsert(path: &Path, name: &str, settings: MixerSettings) -> Result<Vec<Preset>> {
+pub fn upsert(path: &Path, name: &str, mut settings: MixerSettings) -> Result<Vec<Preset>> {
+    settings.preset = None;
     let mut user = load_user(path);
     let id = crate::library::model::stable_id("ps", &crate::library::model::normalise(name));
     match user.iter_mut().find(|p| p.id == id) {
@@ -380,6 +381,34 @@ pub fn upsert(path: &Path, name: &str, settings: MixerSettings) -> Result<Vec<Pr
             settings,
         }),
     }
+    save_user(path, &user)?;
+    let mut all = built_ins();
+    all.extend(user);
+    Ok(all)
+}
+
+/// Update an existing user preset by its stable ID.
+pub fn update_user(
+    path: &Path,
+    id: &str,
+    name: &str,
+    mut settings: MixerSettings,
+) -> Result<Vec<Preset>> {
+    if name.trim().is_empty() {
+        bail!("preset name cannot be empty");
+    }
+    if built_ins().iter().any(|preset| preset.id == id) {
+        bail!("cannot update built-in preset: {id}");
+    }
+
+    let mut user = load_user(path);
+    let Some(existing) = user.iter_mut().find(|preset| preset.id == id) else {
+        bail!("user preset not found: {id}");
+    };
+    settings.preset = None;
+    existing.name = name.to_string();
+    existing.settings = settings;
+
     save_user(path, &user)?;
     let mut all = built_ins();
     all.extend(user);
@@ -472,6 +501,7 @@ mod tests {
             },
         };
         let settings = MixerSettings {
+            preset: Some("runtime display value".into()),
             reverb: Some(Reverb {
                 enabled: true,
                 mix: 0.66,
@@ -485,6 +515,7 @@ mod tests {
         let all = load_all(&path);
         let mine = all.iter().find(|p| p.name == "My Mix").unwrap();
         assert!(!mine.built_in);
+        assert_eq!(mine.settings.preset, None);
         assert_eq!(mine.settings.reverb.as_ref().unwrap().mix, 0.66);
         assert_eq!(mine.settings.crossfade, Some(crossfade));
     }
@@ -523,6 +554,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all.iter().filter(|p| p.name == "My Mix").count(), 1);
+    }
+
+    #[test]
+    fn updating_a_user_preset_preserves_its_id_and_replaces_its_contents() {
+        let path = tempfile();
+        let created = upsert(&path, "Original", MixerSettings::default()).unwrap();
+        let id = created
+            .iter()
+            .find(|preset| preset.name == "Original")
+            .unwrap()
+            .id
+            .clone();
+
+        let updated = update_user(
+            &path,
+            &id,
+            "Renamed",
+            MixerSettings {
+                preset: Some("runtime display value".into()),
+                reverb: Some(Reverb {
+                    enabled: true,
+                    mix: 0.42,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let renamed = updated.iter().find(|preset| preset.id == id).unwrap();
+
+        assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.settings.preset, None);
+        assert_eq!(renamed.settings.reverb.as_ref().unwrap().mix, 0.42);
+        assert!(!updated.iter().any(|preset| preset.name == "Original"));
+    }
+
+    #[test]
+    fn updating_a_user_preset_rejects_empty_names_and_non_user_ids() {
+        let path = tempfile();
+        let created = upsert(&path, "Mine", MixerSettings::default()).unwrap();
+        let id = created
+            .iter()
+            .find(|preset| preset.name == "Mine")
+            .unwrap()
+            .id
+            .clone();
+
+        assert_eq!(
+            update_user(&path, &id, "  ", MixerSettings::default())
+                .unwrap_err()
+                .to_string(),
+            "preset name cannot be empty"
+        );
+        assert_eq!(
+            update_user(&path, "flat", "Changed", MixerSettings::default())
+                .unwrap_err()
+                .to_string(),
+            "cannot update built-in preset: flat"
+        );
+        assert_eq!(
+            update_user(&path, "missing", "Changed", MixerSettings::default())
+                .unwrap_err()
+                .to_string(),
+            "user preset not found: missing"
+        );
     }
 
     #[test]

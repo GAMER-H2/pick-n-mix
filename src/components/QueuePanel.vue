@@ -13,7 +13,12 @@ const ui = useUiStore();
 const current = computed(() => player.queue.currentIndex);
 const items = computed(() => player.queue.items);
 
+/** Clicking the row that is already playing toggles it instead of restarting. */
 async function jump(index: number) {
+  if (index === current.value && player.playing) {
+    await player.toggle();
+    return;
+  }
   await api.playQueueIndex(index);
 }
 

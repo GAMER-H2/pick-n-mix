@@ -3,12 +3,18 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Album,
+  AnalyserFrame,
+  AppPreferences,
   Artist,
   CrossfadeCurve,
   CrossfadeSettings,
   FilterInfo,
+  HomeShelves,
   MixerSettings,
   MixerState,
+  MixKind,
+  MixSummary,
+  PlayRecord,
   PlaybackSnapshot,
   PlayContext,
   PlaylistSummary,
@@ -73,6 +79,11 @@ export const setVolume = (volume: number) => invoke<void>("set_volume", { volume
 export const playbackState = () => invoke<PlaybackSnapshot>("playback_state");
 export const streamInfo = () => invoke<StreamInfo | null>("stream_info");
 
+/** The spectrum is only maintained while something is drawing it. */
+export const setAnalyserEnabled = (enabled: boolean) =>
+  invoke<void>("set_analyser_enabled", { enabled });
+export const analyserFrame = () => invoke<AnalyserFrame>("analyser_frame");
+
 // -- queue -----------------------------------------------------------------
 export const queueState = () => invoke<QueueView>("queue_state");
 export const currentTrack = () => invoke<Track | null>("current_track");
@@ -84,6 +95,13 @@ export const moveInQueue = (from: number, to: number) =>
 export const clearQueue = () => invoke<void>("clear_queue");
 export const setShuffle = (enabled: boolean) => invoke<void>("set_shuffle", { enabled });
 export const setRepeat = (mode: Repeat) => invoke<void>("set_repeat", { mode });
+
+// -- settings --------------------------------------------------------------
+export const appPreferences = () => invoke<AppPreferences>("app_preferences");
+export const setAppPreferences = (preferences: AppPreferences) =>
+  invoke<AppPreferences>("set_app_preferences", { preferences });
+/** Output devices available right now, by name. */
+export const outputDevices = () => invoke<string[]>("output_devices");
 
 // -- mixer -----------------------------------------------------------------
 export const mixerState = () => invoke<MixerState>("mixer_state");
@@ -98,8 +116,13 @@ export const listPresets = () => invoke<Preset[]>("list_presets");
 export const savePreset = (name: string, settings: MixerSettings) =>
   invoke<Preset[]>("save_preset", { name, settings });
 export const deletePreset = (id: string) => invoke<Preset[]>("delete_preset", { id });
+export const updatePreset = (id: string, name: string, settings: MixerSettings) =>
+  invoke<Preset[]>("update_preset", { id, name, settings });
 export const listFilters = () => invoke<FilterInfo[]>("list_filters");
 export const filtersDirectory = () => invoke<string>("filters_directory");
+export const importFilter = (sourcePath: string) =>
+  invoke<FilterInfo[]>("import_filter", { sourcePath });
+export const deleteFilter = (id: string) => invoke<FilterInfo[]>("delete_filter", { id });
 
 // -- crossfade ---------------------------------------------------------------
 // Global only, never part of the mixer cascade above.
@@ -108,6 +131,26 @@ export const setCrossfadeLength = (lengthSecs: number) =>
   invoke<CrossfadeSettings>("set_crossfade_length", { lengthSecs });
 export const setCrossfadeCurve = (curve: CrossfadeCurve) =>
   invoke<CrossfadeSettings>("set_crossfade_curve", { curve });
+
+// -- home ------------------------------------------------------------------
+export const homeShelves = () => invoke<HomeShelves>("home_shelves");
+export const mixTracks = (kind: MixKind) => invoke<Track[]>("mix_tracks", { kind });
+export const playMix = (kind: MixKind, startIndex?: number) =>
+  invoke<void>("play_mix", { kind, startIndex });
+/** Discard the held mixes so the next request builds them from fresh history. */
+export const refreshMixes = () => invoke<void>("refresh_mixes");
+export const listPinnedMixes = () => invoke<MixSummary[]>("list_pinned_mixes");
+export const setMixPinned = (kind: MixKind, pinned: boolean) =>
+  invoke<MixKind[]>("set_mix_pinned", { kind, pinned });
+/** Freeze a mix into a playlist: a new one when `playlistId` is omitted. */
+export const saveMixToPlaylist = (kind: MixKind, playlistId?: string, name?: string) =>
+  invoke<PlaylistSummary>("save_mix_to_playlist", { kind, playlistId, name });
+
+export const listeningHistory = (limit?: number) =>
+  invoke<PlayRecord[]>("listening_history", { limit });
+export const clearListeningHistory = () => invoke<void>("clear_listening_history");
+export const clearListeningHistoryForSong = (songId: string) =>
+  invoke<void>("clear_listening_history_for_song", { songId });
 
 // -- playlists -------------------------------------------------------------
 export const listPlaylists = () => invoke<PlaylistSummary[]>("list_playlists");

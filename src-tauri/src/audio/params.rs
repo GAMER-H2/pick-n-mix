@@ -171,24 +171,36 @@ impl Default for Eq {
     }
 }
 
-/// The six bands the simple mixer's sliders drive, in the classic
-/// low-to-high spread. The advanced panel edits the same list but can
-/// change frequency, Q and band type as well.
+/// The eight bands of a Logic-style channel EQ: a high-pass, a low shelf,
+/// four peaks, a high shelf and a low-pass.
+///
+/// The two pass filters ship **disabled**. Unlike a shelf or a peak, a
+/// pass filter has no flat setting — it always cuts — so an enabled one
+/// would quietly change the sound of every existing mix the moment this
+/// default grew from six bands to eight.
+///
+/// The simple mixer draws a fader per gain-bearing band, so it still shows
+/// six. The expanded EQ edits the whole list and can add up to
+/// `dsp::MAX_BANDS` of them.
 pub fn default_bands() -> Vec<EqBand> {
-    const FREQS: [f32; 6] = [60.0, 170.0, 500.0, 1500.0, 4000.0, 10000.0];
-    FREQS
+    const BANDS: [(BandKind, f32); 8] = [
+        (BandKind::HighPass, 30.0),
+        (BandKind::LowShelf, 80.0),
+        (BandKind::Peak, 200.0),
+        (BandKind::Peak, 500.0),
+        (BandKind::Peak, 1200.0),
+        (BandKind::Peak, 3500.0),
+        (BandKind::HighShelf, 10000.0),
+        (BandKind::LowPass, 18000.0),
+    ];
+    BANDS
         .iter()
-        .enumerate()
-        .map(|(i, &freq)| EqBand {
-            kind: match i {
-                0 => BandKind::LowShelf,
-                5 => BandKind::HighShelf,
-                _ => BandKind::Peak,
-            },
+        .map(|&(kind, freq)| EqBand {
+            kind,
             freq,
             gain_db: 0.0,
-            q: 0.9,
-            enabled: true,
+            q: 0.71,
+            enabled: !matches!(kind, BandKind::HighPass | BandKind::LowPass),
         })
         .collect()
 }
@@ -387,8 +399,26 @@ mod tests {
         let r = MixerSettings::resolve(&[&MixerSettings::default()]);
         assert!(r.enabled);
         assert_eq!(r.pitch.ratio(), 1.0);
-        assert_eq!(r.eq.bands.len(), 6);
+        assert_eq!(r.eq.bands.len(), 8);
         assert_eq!(r.crossfade, CrossfadeSettings::default());
+    }
+
+    /// A pass filter has no flat setting — it always cuts — so shipping one
+    /// enabled by default would change the sound of every existing mix.
+    #[test]
+    fn the_default_pass_filters_ship_disabled() {
+        let bands = default_bands();
+        for band in &bands {
+            if matches!(band.kind, BandKind::HighPass | BandKind::LowPass) {
+                assert!(
+                    !band.enabled,
+                    "{:?} at {} Hz is enabled",
+                    band.kind, band.freq
+                );
+            }
+        }
+        // Every other band is flat, so the default chain is transparent.
+        assert!(bands.iter().filter(|b| b.enabled).all(|b| b.gain_db == 0.0));
     }
 
     #[test]

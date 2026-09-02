@@ -247,8 +247,8 @@ pub fn store_artwork(dir: &Path, picture: &Picture) -> Result<String> {
 /// the same way embedded covers are. The copy is what everything refers to
 /// afterwards, so moving or deleting the original cannot break the reference.
 pub fn store_artwork_file(dir: &Path, source: &Path) -> Result<String> {
-    let data = std::fs::read(source)
-        .with_context(|| format!("reading image {}", source.display()))?;
+    let data =
+        std::fs::read(source).with_context(|| format!("reading image {}", source.display()))?;
 
     let ext = match source
         .extension()

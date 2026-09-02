@@ -28,7 +28,7 @@ const CHUNK: usize = 1024;
 const MAX_RATIO_SWING: f64 = 4.0;
 
 /// Facts about a track that the UI's info panel shows.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamInfo {
     pub sample_rate: u32,

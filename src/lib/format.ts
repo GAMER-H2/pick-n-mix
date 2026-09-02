@@ -39,10 +39,19 @@ export function formatHz(hz: number | null): string {
   return hz >= 1000 ? `${(hz / 1000).toFixed(hz % 1000 === 0 ? 0 : 1)} kHz` : `${hz} Hz`;
 }
 
-/** URL for a cached cover, served by the app's `art://` handler. */
-export function artUrl(artworkId: string | null | undefined): string | null {
+/**
+ * URL for a cached cover, served by the app's `art://` handler.
+ *
+ * `width` asks the backend for a downscaled copy sized for where it is
+ * actually displayed — the embedded picture in a file can be several
+ * megapixels, and decoding that for every row of a long list is expensive
+ * enough to visibly stutter scrolling. Omit it for the rare case the full
+ * original is wanted (e.g. a backdrop that is blown up past its own size).
+ */
+export function artUrl(artworkId: string | null | undefined, width?: number): string | null {
   if (!artworkId) return null;
-  return `art://localhost/${encodeURIComponent(artworkId)}`;
+  const query = width ? `?w=${width}` : "";
+  return `art://localhost/${encodeURIComponent(artworkId)}${query}`;
 }
 
 /** "Album - Artist - Year", skipping whatever is missing. */

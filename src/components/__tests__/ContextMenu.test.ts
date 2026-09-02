@@ -141,6 +141,46 @@ describe("context menu actions", () => {
     expect(labelsOf(wrapper)).not.toContain("Show duplicate files");
   });
 
+  it("clears the menu and calls onSelect before running the chosen action", async () => {
+    const ui = useUiStore();
+    const wrapper = mount(ContextMenu);
+    const order: string[] = [];
+    const onSelect = vi.fn(() => {
+      expect(ui.contextMenu).toBeNull();
+      order.push("select");
+    });
+    playNext.mockImplementationOnce(async () => {
+      order.push("action");
+    });
+
+    ui.openContextMenu({ x: 0, y: 0, tracks: [track("t1", "One")], onSelect });
+    await wrapper.vm.$nextTick();
+    const button = wrapper.findAll("button").find((item) => item.text().includes("Play Next"));
+    if (!button) throw new Error("Expected the Play Next action");
+
+    await button.trigger("click");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(order).toEqual(["select", "action"]);
+    wrapper.unmount();
+  });
+
+  it("does not call onSelect when the menu is dismissed", async () => {
+    const ui = useUiStore();
+    const wrapper = mount(ContextMenu);
+    const onSelect = vi.fn();
+    ui.openContextMenu({ x: 0, y: 0, tracks: [track("t1", "One")], onSelect });
+    await wrapper.vm.$nextTick();
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await wrapper.vm.$nextTick();
+
+    expect(ui.contextMenu).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
   it("uses warning styling when one of the duplicate files is missing", async () => {
     const ui = useUiStore();
     const wrapper = mount(ContextMenu);

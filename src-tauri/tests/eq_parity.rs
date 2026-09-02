@@ -1,0 +1,215 @@
+//! Pins the EQ's coefficient maths against a fixture shared with the frontend.
+//!
+//! The EQ graph has to redraw while a node is being dragged, so it re-derives
+//! the same RBJ cookbook designs in TypeScript (`src/lib/eqCurve.ts`) rather
+//! than asking the engine. That is a genuine duplication of the formulas in
+//! `audio/dsp.rs`, and if the two ever drift the graph would draw a curve the
+//! engine is not playing.
+//!
+//! Both sides assert against `src/lib/__tests__/fixtures/eq-coefficients.json`.
+//! This side is authoritative — it is what actually processes audio — so the
+//! fixture is regenerated from here:
+//!
+//! ```sh
+//! PNM_WRITE_FIXTURES=1 cargo test --test eq_parity
+//! ```
+
+use pick_n_mix_lib::audio::dsp::Biquad;
+use pick_n_mix_lib::audio::params::BandKind;
+
+const FIXTURE: &str = "../src/lib/__tests__/fixtures/eq-coefficients.json";
+
+struct Case {
+    name: &'static str,
+    kind: BandKind,
+    sample_rate: f32,
+    freq: f32,
+    gain_db: f32,
+    q: f32,
+}
+
+fn kind_name(kind: BandKind) -> &'static str {
+    match kind {
+        BandKind::Peak => "peak",
+        BandKind::LowShelf => "lowShelf",
+        BandKind::HighShelf => "highShelf",
+        BandKind::LowPass => "lowPass",
+        BandKind::HighPass => "highPass",
+    }
+}
+
+/// Deliberately includes the clamped inputs — a frequency under 10 Hz, one
+/// above Nyquist, and a Q below the floor — since those clamps live in
+/// `Biquad::set` and are the easiest thing for a reimplementation to miss.
+fn cases() -> Vec<Case> {
+    vec![
+        Case {
+            name: "peak flat",
+            kind: BandKind::Peak,
+            sample_rate: 48000.0,
+            freq: 1000.0,
+            gain_db: 0.0,
+            q: 0.71,
+        },
+        Case {
+            name: "peak boost",
+            kind: BandKind::Peak,
+            sample_rate: 48000.0,
+            freq: 1000.0,
+            gain_db: 6.0,
+            q: 1.4,
+        },
+        Case {
+            name: "peak cut",
+            kind: BandKind::Peak,
+            sample_rate: 48000.0,
+            freq: 3500.0,
+            gain_db: -9.5,
+            q: 0.5,
+        },
+        Case {
+            name: "low shelf boost",
+            kind: BandKind::LowShelf,
+            sample_rate: 48000.0,
+            freq: 80.0,
+            gain_db: 4.5,
+            q: 0.71,
+        },
+        Case {
+            name: "low shelf cut",
+            kind: BandKind::LowShelf,
+            sample_rate: 44100.0,
+            freq: 120.0,
+            gain_db: -7.0,
+            q: 0.9,
+        },
+        Case {
+            name: "high shelf boost",
+            kind: BandKind::HighShelf,
+            sample_rate: 48000.0,
+            freq: 10000.0,
+            gain_db: 3.0,
+            q: 0.71,
+        },
+        Case {
+            name: "high shelf cut",
+            kind: BandKind::HighShelf,
+            sample_rate: 96000.0,
+            freq: 12000.0,
+            gain_db: -5.0,
+            q: 1.2,
+        },
+        Case {
+            name: "low pass",
+            kind: BandKind::LowPass,
+            sample_rate: 48000.0,
+            freq: 18000.0,
+            gain_db: 0.0,
+            q: 0.71,
+        },
+        Case {
+            name: "high pass",
+            kind: BandKind::HighPass,
+            sample_rate: 48000.0,
+            freq: 30.0,
+            gain_db: 0.0,
+            q: 0.71,
+        },
+        Case {
+            name: "clamped below minimum frequency",
+            kind: BandKind::Peak,
+            sample_rate: 48000.0,
+            freq: 1.0,
+            gain_db: 3.0,
+            q: 0.71,
+        },
+        Case {
+            name: "clamped above nyquist",
+            kind: BandKind::Peak,
+            sample_rate: 48000.0,
+            freq: 40000.0,
+            gain_db: 3.0,
+            q: 0.71,
+        },
+        Case {
+            name: "clamped q floor",
+            kind: BandKind::Peak,
+            sample_rate: 48000.0,
+            freq: 1000.0,
+            gain_db: 3.0,
+            q: 0.0,
+        },
+    ]
+}
+
+fn compute(case: &Case) -> [f32; 5] {
+    let mut biquad = Biquad::default();
+    biquad.set(case.kind, case.sample_rate, case.freq, case.gain_db, case.q);
+    biquad.coefficients()
+}
+
+#[test]
+fn coefficients_match_the_shared_fixture() {
+    let cases = cases();
+
+    if std::env::var("PNM_WRITE_FIXTURES").is_ok() {
+        let entries: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|case| {
+                let c = compute(case);
+                serde_json::json!({
+                    "name": case.name,
+                    "kind": kind_name(case.kind),
+                    "sampleRate": case.sample_rate,
+                    "freq": case.freq,
+                    "gainDb": case.gain_db,
+                    "q": case.q,
+                    "coefficients": { "b0": c[0], "b1": c[1], "b2": c[2], "a1": c[3], "a2": c[4] },
+                })
+            })
+            .collect();
+
+        let doc = serde_json::json!({
+            "comment": "Generated by src-tauri/tests/eq_parity.rs. Regenerate with PNM_WRITE_FIXTURES=1 cargo test --test eq_parity.",
+            "cases": entries,
+        });
+        std::fs::create_dir_all(
+            std::path::Path::new(FIXTURE)
+                .parent()
+                .expect("has a parent"),
+        )
+        .expect("creating the fixture directory");
+        std::fs::write(
+            FIXTURE,
+            format!("{}\n", serde_json::to_string_pretty(&doc).unwrap()),
+        )
+        .expect("writing the fixture");
+        return;
+    }
+
+    let raw = std::fs::read_to_string(FIXTURE).unwrap_or_else(|e| {
+        panic!("could not read {FIXTURE}: {e}. Regenerate with PNM_WRITE_FIXTURES=1.")
+    });
+    let doc: serde_json::Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
+    let entries = doc["cases"].as_array().expect("cases is an array");
+    assert_eq!(
+        entries.len(),
+        cases.len(),
+        "fixture is stale; regenerate it"
+    );
+
+    for (case, entry) in cases.iter().zip(entries) {
+        assert_eq!(entry["name"], case.name, "fixture case order changed");
+        let got = compute(case);
+        let want = &entry["coefficients"];
+        for (i, key) in ["b0", "b1", "b2", "a1", "a2"].iter().enumerate() {
+            let expected = want[key].as_f64().expect("coefficient is a number") as f32;
+            assert!(
+                (got[i] - expected).abs() <= 1e-6,
+                "{}: {key} was {} but the fixture says {expected}",
+                case.name,
+                got[i],
+            );
+        }
+    }
+}

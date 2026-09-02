@@ -19,6 +19,7 @@ import { usePlaylistStore } from "@/stores/playlists";
 import { usePlayerStore } from "@/stores/player";
 import { useMixerStore } from "@/stores/mixer";
 import { useUiStore } from "@/stores/ui";
+import { useDragReorder } from "@/lib/dragReorder";
 import type { ResolvedEntry } from "@/lib/types";
 
 const route = useRoute();
@@ -85,6 +86,13 @@ async function playEntry(item: ResolvedEntry) {
   }
   await play(item.index);
 }
+
+const listEl = ref<HTMLElement | null>(null);
+const { dragFrom, dropAt, isDragging, onHandleDown, onHandleMove, onHandleUp, onHandleCancel } =
+  useDragReorder(listEl, async (from, to) => {
+    const p = playlist.value;
+    if (p) await playlists.move(p.id, from, to);
+  });
 
 async function toggleShuffleOnly() {
   const p = playlist.value;
@@ -220,31 +228,54 @@ async function saveDescription() {
       </p>
     </div>
 
-    <div v-else class="playlist__list">
-      <TrackRow
-        v-for="item in items"
-        :key="item.index"
-        :track="item.track"
-        show-mixer
-        :fallback-title="item.entry.title"
-        :fallback-subtitle="`${item.entry.album} · ${item.entry.artist}`"
-        show-artwork
-        :current="isCurrent(item)"
-        :playing="player.playing"
-        :has-mixer-override="!!item.entry.mixer"
-        @play="playEntry(item)"
-        @mixer="openEntryMixer(item)"
-        @menu="
-          item.track &&
-            ui.openContextMenu({
-              x: $event.clientX,
-              y: $event.clientY,
-              tracks: [item.track],
-              playlistId: playlist!.id,
-              entryIndex: item.index,
-            })
-        "
-      />
+    <div v-else ref="listEl" class="playlist__list" :class="{ 'is-dragging': isDragging }">
+      <template v-for="item in items" :key="item.index">
+        <div v-if="dropAt === item.index && isDragging" class="playlist__drop" />
+
+        <div
+          data-row
+          class="playlist__row"
+          :class="{ 'is-lifted': dragFrom === item.index }"
+        >
+          <button
+            class="playlist__grip"
+            title="Drag to reorder"
+            aria-label="Drag to reorder"
+            @pointerdown="onHandleDown($event, item.index)"
+            @pointermove="onHandleMove"
+            @pointerup="onHandleUp"
+            @pointercancel="onHandleCancel"
+          >
+            <PnmIcon name="grip" :size="15" />
+          </button>
+
+          <TrackRow
+            class="playlist__row-track"
+            :track="item.track"
+            show-mixer
+            :fallback-title="item.entry.title"
+            :fallback-subtitle="`${item.entry.album} · ${item.entry.artist}`"
+            show-artwork
+            :current="isCurrent(item)"
+            :playing="player.playing"
+            :has-mixer-override="!!item.entry.mixer"
+            @play="playEntry(item)"
+            @mixer="openEntryMixer(item)"
+            @menu="
+              item.track &&
+                ui.openContextMenu({
+                  x: $event.clientX,
+                  y: $event.clientY,
+                  tracks: [item.track],
+                  playlistId: playlist!.id,
+                  entryIndex: item.index,
+                })
+            "
+          />
+        </div>
+      </template>
+
+      <div v-if="dropAt === items.length && isDragging" class="playlist__drop" />
     </div>
   </div>
 
@@ -305,5 +336,54 @@ async function saveDescription() {
   text-align: center;
   font-size: 13px;
   color: var(--text-tertiary);
+}
+
+.playlist__list.is-dragging {
+  cursor: grabbing;
+}
+
+/* Insertion marker, rather than animating every row out of the way. */
+.playlist__drop {
+  height: 2px;
+  margin: 1px 8px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.playlist__row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.playlist__row.is-lifted {
+  opacity: 0.4;
+}
+
+.playlist__row-track {
+  flex: 1;
+  min-width: 0;
+}
+
+.playlist__grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  flex: none;
+  color: var(--text-tertiary);
+  cursor: grab;
+  opacity: 0;
+  touch-action: none;
+  transition: opacity 0.12s var(--ease);
+}
+
+.playlist__row:hover .playlist__grip,
+.playlist__grip:focus-visible {
+  opacity: 1;
+}
+
+.playlist__grip:active {
+  cursor: grabbing;
 }
 </style>

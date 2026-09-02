@@ -222,8 +222,10 @@ const items = computed<Item[]>(() => {
 });
 
 async function run(item: Item) {
+  const onSelect = menu.value?.onSelect;
   ui.closeContextMenu();
   try {
+    await onSelect?.();
     await item.action();
   } catch (e) {
     ui.notify(`${item.label} failed: ${e}`, "error");
@@ -278,7 +280,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .menu {
   position: fixed;
-  z-index: 400;
+  z-index: 540;
   min-width: 214px;
   padding: 5px;
   border-radius: var(--radius);

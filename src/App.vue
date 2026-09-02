@@ -15,12 +15,15 @@ import AdvancedMixer from "./components/mixer/AdvancedMixer.vue";
 import ContextMenu from "./components/ContextMenu.vue";
 import AddToPlaylistDialog from "./components/AddToPlaylistDialog.vue";
 import DuplicateFilesDialog from "./components/DuplicateFilesDialog.vue";
+import SettingsModal from "./components/settings/SettingsModal.vue";
 import { usePlayerStore } from "./stores/player";
 import { useLibraryStore } from "./stores/library";
 import { usePlaylistStore } from "./stores/playlists";
 import { useMixerStore } from "./stores/mixer";
 import { useCrossfadeStore } from "./stores/crossfade";
+import { useHomeStore } from "./stores/home";
 import { useUiStore } from "./stores/ui";
+import { useSettingsStore } from "./stores/settings";
 import { installShortcuts } from "./lib/keyboard";
 import { registerScroller } from "./lib/viewState";
 import type { PlaybackSnapshot, QueueView, ResolvedMixer, Track } from "./lib/types";
@@ -30,7 +33,9 @@ const library = useLibraryStore();
 const playlists = usePlaylistStore();
 const mixer = useMixerStore();
 const crossfade = useCrossfadeStore();
+const home = useHomeStore();
 const ui = useUiStore();
+const settings = useSettingsStore();
 const route = useRoute();
 const router = useRouter();
 
@@ -115,12 +120,7 @@ let unlistenResize: UnlistenFn | null = null;
 let unlistenFocus: UnlistenFn | null = null;
 
 onMounted(async () => {
-  // Follow the system appearance.
-  const media = window.matchMedia("(prefers-color-scheme: dark)");
-  const applyTheme = () =>
-    document.documentElement.setAttribute("data-theme", media.matches ? "dark" : "light");
-  applyTheme();
-  media.addEventListener("change", applyTheme);
+  await settings.initialise();
 
   if (await usesClientSideDecorations()) {
     usesCustomTitlebar.value = true;
@@ -158,6 +158,9 @@ onMounted(async () => {
     listen("queue-ended", () => player.refresh()),
     listen("library-changed", () => library.refresh()),
     listen("playlists-changed", () => playlists.refresh()),
+    // Only the sidebar's pinned list: rebuilding the whole home page here
+    // would fight with whatever the listener is looking at.
+    listen("home-changed", () => home.refreshPinned()),
     listen<ResolvedMixer>("mixer-changed", () => mixer.refresh()),
     listen<{ count: number; path: string }>(
       "scan-progress",
@@ -172,6 +175,7 @@ onMounted(async () => {
   await Promise.all([
     library.refresh(),
     playlists.refresh(),
+    home.refreshPinned(),
     player.refresh(),
     mixer.refresh(),
     crossfade.refresh(),
@@ -200,38 +204,9 @@ onBeforeUnmount(() => {
     <div class="app__body">
       <Sidebar />
 
-      <main ref="mainEl" class="app__main" :class="{ 'is-screen': isNowPlaying }">
-        <div v-if="!isNowPlaying || usesCustomTitlebar" class="app__titlebar">
+      <main ref="mainEl" class="app__main scroll-area" :class="{ 'is-screen': isNowPlaying }">
+        <div v-if="!isNowPlaying" class="app__titlebar">
           <div class="app__drag-region" data-tauri-drag-region />
-          <div v-if="usesCustomTitlebar" class="app__window-controls">
-            <button
-              class="icon-button app__window-control"
-              type="button"
-              title="Minimize"
-              aria-label="Minimize window"
-              @click="minimizeWindow().catch(reportWindowControlError)"
-            >
-              <PnmIcon name="minimize" :size="16" />
-            </button>
-            <button
-              class="icon-button app__window-control"
-              type="button"
-              title="Maximize or restore"
-              aria-label="Maximize or restore window"
-              @click="toggleMaximizeWindow().catch(reportWindowControlError)"
-            >
-              <PnmIcon name="maximize" :size="15" />
-            </button>
-            <button
-              class="icon-button app__window-control app__window-control--close"
-              type="button"
-              title="Close"
-              aria-label="Close window"
-              @click="closeWindow().catch(reportWindowControlError)"
-            >
-              <PnmIcon name="close" :size="16" />
-            </button>
-          </div>
         </div>
         <!-- The full-screen player owns its lightweight curtain fade. Keeping
              the blurred view outside a route-level opacity transition avoids
@@ -250,6 +225,39 @@ onBeforeUnmount(() => {
 
     <NowPlayingBar />
 
+    <!-- A direct child of `.app` rather than of `.app__main`, so the buttons
+         stay pinned to the window's own corner: unmoved by the sidebar or any
+         side panel's width, and never crossed by `.app__main`'s scrollbar. -->
+    <div v-if="usesCustomTitlebar" class="app__window-controls">
+      <button
+        class="icon-button app__window-control"
+        type="button"
+        title="Minimize"
+        aria-label="Minimize window"
+        @click="minimizeWindow().catch(reportWindowControlError)"
+      >
+        <PnmIcon name="minimize" :size="16" />
+      </button>
+      <button
+        class="icon-button app__window-control"
+        type="button"
+        title="Maximize or restore"
+        aria-label="Maximize or restore window"
+        @click="toggleMaximizeWindow().catch(reportWindowControlError)"
+      >
+        <PnmIcon name="maximize" :size="15" />
+      </button>
+      <button
+        class="icon-button app__window-control app__window-control--close"
+        type="button"
+        title="Close"
+        aria-label="Close window"
+        @click="closeWindow().catch(reportWindowControlError)"
+      >
+        <PnmIcon name="close" :size="16" />
+      </button>
+    </div>
+
     <div
       v-if="library.scanning"
       class="app__scan"
@@ -264,6 +272,9 @@ onBeforeUnmount(() => {
     <ContextMenu />
     <AddToPlaylistDialog />
     <DuplicateFilesDialog />
+    <Transition name="fade">
+      <SettingsModal v-if="ui.settingsOpen" />
+    </Transition>
 
     <!-- Only meaningful without server-side decorations; on every other
          platform these would be invisible strips swallowing clicks along the
@@ -294,6 +305,7 @@ onBeforeUnmount(() => {
 }
 
 .app {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -355,6 +367,12 @@ onBeforeUnmount(() => {
   position: relative;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* Lets a routed view's layout react to the space it actually has — which
+     shrinks when a side panel opens — rather than only to the window's own
+     width. Sizing containment costs nothing here: this element's own size was
+     already fully determined by `flex: 1`, never by its content. */
+  container-type: inline-size;
+  container-name: app-main;
 }
 
 /* The full-screen player manages its own layout and must not scroll. */
@@ -375,11 +393,16 @@ onBeforeUnmount(() => {
   flex: 1;
 }
 
+/* Pinned to `.app`'s own corner (not `.app__main`'s), so it is unaffected by
+   the sidebar, an open side panel, or `.app__main`'s scrollbar. `.app--framed`
+   already clips to `border-radius: 11px` and squares off when maximised, so
+   the close button's hover fill lands flush with the corner for free. */
 .app__window-controls {
-  position: relative;
-  z-index: 6;
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 100;
   display: flex;
-  padding-right: 3px;
 }
 
 .app__window-control {

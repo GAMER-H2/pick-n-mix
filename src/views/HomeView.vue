@@ -1,52 +1,316 @@
 <script setup lang="ts">
-/** Placeholder until the home experience is designed. */
+/**
+ * The landing page: three generated mixes across the top, then a grid of
+ * explainable recommendations, then the playlists most recently played from.
+ *
+ * Every shelf here is derived from listening history, so on a fresh library
+ * there is nothing honest to show. Rather than filling the space with
+ * placeholder cards, the page says so and points at the library.
+ */
+import { computed, onMounted } from "vue";
+import { useRouter } from "vue-router";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
+import Artwork from "@/components/Artwork.vue";
+import MixCard from "@/components/home/MixCard.vue";
+import * as api from "@/lib/api";
+import { useHomeStore } from "@/stores/home";
+import { usePlayerStore } from "@/stores/player";
+import type { HomePick, MixSummary } from "@/lib/types";
+
+const router = useRouter();
+const home = useHomeStore();
+const player = usePlayerStore();
+
+onMounted(() => home.refresh());
+
+/** Nothing to show at all: no history, and no playlists to fall back on. */
+const isBare = computed(
+  () => home.isEmpty && home.recentPlaylists.length === 0 && home.picks.length === 0,
+);
+
+function openMix(mix: MixSummary) {
+  router.push({ name: "mix", params: { kind: mix.kind } });
+}
+
+async function playMix(mix: MixSummary) {
+  await api.playMix(mix.kind);
+}
+
+async function playPick(pick: HomePick) {
+  if (pick.trackIds.length === 0) return;
+  await player.playTracks(pick.trackIds, 0, {
+    kind: pick.kind === "album" ? "album" : "library",
+    id: pick.id,
+    name: pick.title,
+  });
+}
+
+function openPick(pick: HomePick) {
+  if (pick.kind === "album") {
+    router.push({ name: "album", params: { id: pick.id } });
+    return;
+  }
+  void playPick(pick);
+}
+
 </script>
 
 <template>
   <div class="home">
-    <PnmIcon name="home" :size="44" class="home__icon" />
-    <h1>Home</h1>
-    <p>
-      This is where recently played music, new additions and mixes will live.
-      For now, head to your Library or pick a playlist from the sidebar.
-    </p>
-    <RouterLink to="/library" class="pill-button">Open Library</RouterLink>
+    <div v-if="isBare && !home.loading" class="home__bare">
+      <PnmIcon name="home" :size="44" class="home__bare-icon" />
+      <h1>Nothing to go on yet</h1>
+      <p>
+        Mixes and recommendations are built from what you actually listen to, so this page
+        fills in as you play things.
+      </p>
+      <RouterLink to="/library" class="pill-button">Open Library</RouterLink>
+    </div>
+
+    <template v-else>
+      <!-- Mixes ------------------------------------------------------------>
+      <section class="shelf shelf--mixes">
+        <MixCard
+          v-for="mix in home.mixes"
+          :key="mix.kind"
+          :mix="mix"
+          :ready="home.isReady(mix)"
+          @open="openMix(mix)"
+          @play="playMix(mix)"
+          @pin="home.setPinned(mix.kind, !mix.pinned)"
+        />
+      </section>
+
+      <!-- Top picks -------------------------------------------------------->
+      <section v-if="home.picks.length" class="shelf">
+        <header class="shelf__head">
+          <h2>Top Picks</h2>
+          <button class="shelf__link" title="Build these again" @click="home.regenerate()">
+            Refresh
+          </button>
+        </header>
+
+        <div class="picks">
+          <button
+            v-for="pick in home.picks"
+            :key="`${pick.kind}-${pick.id}`"
+            class="pick"
+            :title="pick.reason"
+            @click="openPick(pick)"
+          >
+            <div class="pick__art">
+              <Artwork :artwork-id="pick.artworkId" :size="44" :radius="5" />
+              <span class="pick__play" @click.stop="playPick(pick)">
+                <PnmIcon name="play" :size="13" />
+              </span>
+            </div>
+            <div class="pick__text">
+              <div class="pick__title truncate">{{ pick.title }}</div>
+              <div class="pick__reason truncate">{{ pick.reason }}</div>
+            </div>
+          </button>
+        </div>
+      </section>
+
+      <!-- Recent playlists -------------------------------------------------->
+      <section v-if="home.recentPlaylists.length" class="shelf">
+        <header class="shelf__head">
+          <h2>Recent Playlists</h2>
+        </header>
+
+        <div class="playlists">
+          <button
+            v-for="playlist in home.recentPlaylists"
+            :key="playlist.id"
+            class="card"
+            @click="router.push({ name: 'playlist', params: { id: playlist.id } })"
+          >
+            <Artwork :artwork-id="playlist.artwork" :size="140" :radius="7" shadow />
+            <div class="card__title truncate">{{ playlist.name }}</div>
+            <div class="card__subtitle truncate">
+              {{ playlist.trackCount }} {{ playlist.trackCount === 1 ? "song" : "songs" }}
+            </div>
+          </button>
+        </div>
+      </section>
+    </template>
   </div>
 </template>
 
 <style scoped>
 .home {
+  padding: 6px 26px 40px;
+}
+
+.home__bare {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 10px;
   height: 100%;
+  min-height: 60vh;
   text-align: center;
   color: var(--text-secondary);
 }
 
-.home__icon {
+.home__bare-icon {
   color: var(--text-tertiary);
 }
 
-h1 {
+.home__bare h1 {
   margin: 4px 0 0;
   font-size: 22px;
   font-weight: 600;
   color: var(--text);
 }
 
-p {
+.home__bare p {
   margin: 0;
-  max-width: 380px;
+  max-width: 400px;
   font-size: 13px;
   line-height: 1.55;
 }
 
-.pill-button {
+.home__bare .pill-button {
   margin-top: 8px;
   text-decoration: none;
+}
+
+/* -- shelves --------------------------------------------------------------- */
+
+.shelf {
+  padding-top: 18px;
+}
+
+/* The three mixes sit above the first rule, as their own banner row. */
+.shelf--mixes {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 192px));
+  justify-content: center;
+  column-gap: clamp(28px, 8vw, 112px);
+  padding: 14px 0 24px;
+}
+
+.shelf + .shelf {
+  border-top: 1px solid var(--separator);
+}
+
+.shelf__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.shelf__head h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.shelf__link {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+/* -- top picks ------------------------------------------------------------- */
+
+.picks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 8px 18px;
+}
+
+.pick {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  min-width: 0;
+}
+
+.pick:hover {
+  background: var(--bg-hover);
+}
+
+.pick__art {
+  position: relative;
+  flex: none;
+}
+
+/* The play affordance sits over the cover, so a pick can be started without
+   first opening it. */
+.pick__play {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transition: opacity 0.12s var(--ease);
+}
+
+.pick:hover .pick__play {
+  opacity: 1;
+}
+
+.pick__text {
+  min-width: 0;
+}
+
+.pick__title {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.pick__reason {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  margin-top: 1px;
+}
+
+/* -- playlists ------------------------------------------------------------- */
+
+.playlists {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 20px 18px;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  min-width: 0;
+}
+
+.card :deep(.artwork) {
+  width: 100% !important;
+  height: auto !important;
+  aspect-ratio: 1;
+  margin-bottom: 8px;
+  transition: transform 0.18s var(--ease);
+}
+
+.card:hover :deep(.artwork) {
+  transform: translateY(-2px);
+}
+
+.card__title {
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.card__subtitle {
+  font-size: 11.5px;
+  color: var(--text-secondary);
 }
 </style>

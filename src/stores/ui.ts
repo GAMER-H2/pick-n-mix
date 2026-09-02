@@ -27,12 +27,15 @@ export interface ContextMenuState {
   entryIndex?: number;
   /** Set when the menu was opened from a playlist header. */
   playlistOptions?: PlaylistMenuOptions;
+  /** Called after a menu action is chosen, before that action runs. */
+  onSelect?: () => unknown;
 }
 
 export const useUiStore = defineStore("ui", () => {
   const contextMenu = ref<ContextMenuState | null>(null);
   const infoTrack = ref<Track | null>(null);
   const duplicateTrack = ref<Track | null>(null);
+  const settingsOpen = ref(false);
   const queueOpen = ref(false);
   const addToPlaylistFor = ref<Track[] | null>(null);
   const toast = ref<{ message: string; kind: "info" | "error" } | null>(null);
@@ -56,6 +59,7 @@ export const useUiStore = defineStore("ui", () => {
     contextMenu,
     infoTrack,
     duplicateTrack,
+    settingsOpen,
     queueOpen,
     addToPlaylistFor,
     toast,

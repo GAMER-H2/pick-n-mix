@@ -475,11 +475,11 @@ onMounted(() => {
   text-align: left;
   min-width: 0;
   content-visibility: auto;
-  contain-intrinsic-block-size: 196px;
+  contain-intrinsic-block-size: auto 196px;
 }
 
 .grid--artists .card {
-  contain-intrinsic-block-size: 178px;
+  contain-intrinsic-block-size: auto 178px;
 }
 
 .grid__empty {

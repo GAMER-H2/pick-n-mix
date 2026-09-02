@@ -166,6 +166,51 @@ pub struct Artist {
     pub artwork_id: Option<String>,
 }
 
+/// One finished listen, as written to the `plays` table.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Play {
+    pub song_id: String,
+    pub played_at: i64,
+    /// Seconds actually heard — accumulated only while playing, so pausing or
+    /// seeking around cannot inflate it.
+    pub seconds_played: f64,
+    /// How far through the song that reached, 0..1.
+    pub fraction: f64,
+    /// Whether this passed the bar to count as a play rather than a skip.
+    pub counted: bool,
+    pub context_kind: Option<String>,
+    pub context_id: Option<String>,
+}
+
+/// A history row joined back to the song it refers to, for the history view.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayRecord {
+    pub play: Play,
+    /// `None` once the song has left the library — history outlives it.
+    pub track: Option<Track>,
+}
+
+/// One recommendation on the home page.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomePick {
+    /// `"song"` or `"album"`, which decides where clicking it goes.
+    pub kind: String,
+    /// Song id, or the stable album id the album view routes by.
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub artwork_id: Option<String>,
+    /// Why this was picked, in words, shown next to it. A recommendation
+    /// that cannot explain itself is indistinguishable from a random one,
+    /// and reads as broken the moment it suggests something unwanted.
+    pub reason: String,
+    /// What to enqueue when it is played.
+    pub track_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanReport {
