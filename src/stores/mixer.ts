@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as api from "@/lib/api";
 import { DEFAULTS, clone, resolve, type Section } from "@/lib/mixer";
-import type { FilterInfo, MixerSettings, Preset, ResolvedMixer } from "@/lib/types";
+import type { Eq, FilterInfo, MixerSettings, Preset, ResolvedMixer } from "@/lib/types";
 
 /**
  * Which layer of the cascade the mixer UI is editing.
@@ -173,7 +173,11 @@ export const useMixerStore = defineStore("mixer", () => {
   }
 
   async function saveAsPreset(name: string) {
-    presets.value = await api.savePreset(name, clone(targetLayer.value));
+    presets.value = await api.savePreset(name, clone(targetLayer.value), "mixer");
+  }
+
+  async function saveEqPreset(name: string, eq: Eq) {
+    presets.value = await api.savePreset(name, { eq: clone(eq) }, "eq");
   }
 
   async function removePreset(id: string) {
@@ -223,6 +227,7 @@ export const useMixerStore = defineStore("mixer", () => {
     resetLayer,
     applyPreset,
     saveAsPreset,
+    saveEqPreset,
     removePreset,
     toggleFilter,
     setFilterVolume,

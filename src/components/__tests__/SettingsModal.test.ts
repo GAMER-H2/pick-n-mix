@@ -3,6 +3,7 @@ import { mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import SettingsModal from "../settings/SettingsModal.vue";
 import { useSettingsStore } from "@/stores/settings";
+import { usePresetEditorStore } from "@/stores/presetEditor";
 import { useUiStore } from "@/stores/ui";
 import type { Track } from "@/lib/types";
 
@@ -252,7 +253,7 @@ describe("SettingsModal", () => {
   });
 
   it("opens presets in the isolated advanced mixer and persists built-in hiding", async () => {
-    const builtIn = { id: "flat", name: "Flat", builtIn: true, settings: {} };
+    const builtIn = { id: "flat", name: "Flat", builtIn: true, kind: "mixer", settings: {} };
     mixerState.mockResolvedValue({ global: {}, context: null, track: null, effective: {}, presets: [builtIn], filters: [] });
     const wrapper = mount(SettingsModal);
     const mixerButton = buttonWithText(wrapper, "Mixer");
@@ -272,6 +273,52 @@ describe("SettingsModal", () => {
     expect(setAppPreferences).toHaveBeenLastCalledWith(expect.objectContaining({
       hiddenBuiltInPresetIds: ["flat"],
     }));
+  });
+
+  it("manages EQ presets separately and opens an EQ-only editor", async () => {
+    const customEq = {
+      id: "eq-custom",
+      name: "My EQ",
+      builtIn: false,
+      kind: "eq",
+      settings: {
+        eq: {
+          enabled: true,
+          preampDb: 0,
+          bands: [{ kind: "peak", freq: 1000, gainDb: 3, q: 0.71, enabled: true }],
+        },
+      },
+    };
+    mixerState.mockResolvedValue({
+      global: {}, context: null, track: null, effective: {}, presets: [customEq], filters: [],
+    });
+    savePreset.mockResolvedValue([customEq]);
+    const wrapper = mount(SettingsModal);
+    const mixerButton = buttonWithText(wrapper, "Mixer");
+    if (!mixerButton) throw new Error("Missing Mixer navigation button");
+    await mixerButton.trigger("click");
+    await settle();
+
+    expect(wrapper.text()).toContain("EQ presets");
+    expect(wrapper.text()).toContain("My EQ");
+    const customItem = wrapper.findAll(".item-main").find((item) => item.text().includes("My EQ"));
+    await customItem!.trigger("click");
+    expect(wrapper.text()).toContain("EQ Preset Editor");
+    expect(wrapper.text()).not.toContain("Pitch");
+
+    usePresetEditorStore().close();
+    await wrapper.vm.$nextTick();
+    await wrapper.get("[aria-label='EQ preset name']").setValue("Saved Curve");
+    const eqForm = wrapper.findAll("form").find((form) =>
+      form.find("[aria-label='EQ preset name']").exists(),
+    );
+    await eqForm!.trigger("submit");
+    await settle();
+    expect(savePreset).toHaveBeenCalledWith(
+      "Saved Curve",
+      expect.objectContaining({ eq: expect.any(Object) }),
+      "eq",
+    );
   });
 
   it("labels the remote-library controls honestly", async () => {

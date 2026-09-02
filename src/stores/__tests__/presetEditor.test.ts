@@ -24,6 +24,7 @@ describe("preset editor", () => {
       id: "custom-1",
       name: "My Preset",
       builtIn: false,
+      kind: "mixer" as const,
       settings: { enabled: true, preset: "display-only" },
     };
     editor.open(preset);
@@ -41,12 +42,13 @@ describe("preset editor", () => {
 
   it("saves an edited built-in as a custom copy", async () => {
     const editor = usePresetEditorStore();
-    editor.open({ id: "flat", name: "Flat", builtIn: true, settings: { enabled: true } });
+    editor.open({ id: "flat", name: "Flat", builtIn: true, kind: "mixer", settings: { enabled: true } });
     editor.setSection("pitch", { semitones: 2, cents: 0 });
     savePreset.mockResolvedValue([{
       id: "custom-flat",
       name: "Flat Custom",
       builtIn: false,
+      kind: "mixer",
       settings: { enabled: true, pitch: { semitones: 2, cents: 0 } },
     }]);
 
@@ -55,7 +57,7 @@ describe("preset editor", () => {
     expect(savePreset).toHaveBeenCalledWith("Flat Custom", {
       enabled: true,
       pitch: { semitones: 2, cents: 0 },
-    });
+    }, "mixer");
     expect(updatePreset).not.toHaveBeenCalled();
     expect(editor.session?.sourceBuiltIn).toBe(false);
   });

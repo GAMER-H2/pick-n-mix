@@ -10,6 +10,8 @@ import type {
   CrossfadeSettings,
   FilterInfo,
   HomeShelves,
+  MasterMix,
+  MasterMixView,
   MixerSettings,
   MixerState,
   MixKind,
@@ -19,6 +21,7 @@ import type {
   PlayContext,
   PlaylistSummary,
   Preset,
+  PresetKind,
   QueueView,
   Repeat,
   ResolvedMixer,
@@ -27,6 +30,7 @@ import type {
   StreamInfo,
   Track,
   TrackFile,
+  Waveform,
 } from "./types";
 
 // -- library ---------------------------------------------------------------
@@ -113,8 +117,11 @@ export const setGlobalMixer = (settings: MixerSettings) =>
 export const setPlaylistMixer = (playlistId: string, settings: MixerSettings | null) =>
   invoke<void>("set_playlist_mixer", { playlistId, settings });
 export const listPresets = () => invoke<Preset[]>("list_presets");
-export const savePreset = (name: string, settings: MixerSettings) =>
-  invoke<Preset[]>("save_preset", { name, settings });
+export const savePreset = (
+  name: string,
+  settings: MixerSettings,
+  kind: PresetKind = "mixer",
+) => invoke<Preset[]>("save_preset", { name, settings, kind });
 export const deletePreset = (id: string) => invoke<Preset[]>("delete_preset", { id });
 export const updatePreset = (id: string, name: string, settings: MixerSettings) =>
   invoke<Preset[]>("update_preset", { id, name, settings });
@@ -185,3 +192,25 @@ export const exportPlaylist = (id: string, destination: string) =>
   invoke<void>("export_playlist", { id, destination });
 export const playPlaylist = (id: string, startIndex?: number) =>
   invoke<void>("play_playlist", { id, startIndex });
+
+// -- master mix ------------------------------------------------------------
+// The timeline is edited whole: the modal owns the arrangement while it is
+// open and hands it back, rather than there being a command per drag.
+export const masterMix = (playlistId: string) =>
+  invoke<MasterMixView>("master_mix", { playlistId });
+export const setMasterMix = (playlistId: string, mix: MasterMix) =>
+  invoke<MasterMixView>("set_master_mix", { playlistId, mix });
+export const setMasterMixEnabled = (playlistId: string, enabled: boolean) =>
+  invoke<MasterMixView>("set_master_mix_enabled", { playlistId, enabled });
+export const resetMasterMix = (playlistId: string) =>
+  invoke<MasterMixView>("reset_master_mix", { playlistId });
+/** Peaks for one song, cached on disk; slow only the first time. */
+export const entryWaveform = (playlistId: string, index: number) =>
+  invoke<Waveform>("entry_waveform", { playlistId, index });
+/** Audition the arrangement, including edits that have not been saved yet. */
+export const playMasterMix = (
+  playlistId: string,
+  mix: MasterMix | null,
+  positionSecs: number,
+) => invoke<number>("play_master_mix", { playlistId, mix, positionSecs });
+export const stopMasterMix = () => invoke<void>("stop_master_mix");

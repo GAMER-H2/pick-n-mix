@@ -230,10 +230,13 @@ export interface ResolvedMixer {
   filters: FilterSetting[];
 }
 
+export type PresetKind = "mixer" | "eq";
+
 export interface Preset {
   id: string;
   name: string;
   builtIn: boolean;
+  kind: PresetKind;
   settings: MixerSettings;
 }
 
@@ -296,9 +299,95 @@ export interface PlaylistSummary {
   trackCount: number;
   artwork: string | null;
   hasMixer: boolean;
+  /** Whether a timeline has ever been built for this playlist. */
+  hasMasterMix: boolean;
+  /** Whether that timeline is what plays. */
+  masterMixEnabled: boolean;
   /** Ignore the stored order and reshuffle on every play. */
   shuffleOnly: boolean;
   path: string;
+}
+
+// -- master mix ---------------------------------------------------------------
+//
+// The Logic-style timeline behind a playlist. Mirrors `src-tauri/src/master_mix.rs`;
+// see that file for what each field means and what keeps it in range.
+
+/** Where a block's audio comes from: a playlist entry, or an imported file. */
+export type BlockSource =
+  | { kind: "entry"; index: number }
+  | { kind: "asset"; file: string };
+
+export interface AutomationPoint {
+  /** Seconds from the start of the block, so a point survives a drag. */
+  atSecs: number;
+  gainDb: number;
+  /** Shape of the segment leaving this point; 1 is linear. */
+  curve: number;
+}
+
+export interface MixBlock {
+  id: string;
+  source: BlockSource;
+  /** Absolute position on the timeline. */
+  startSecs: number;
+  /** How far into the source this block begins. */
+  offsetSecs: number;
+  durationSecs: number;
+  gainDb: number;
+  fadeInSecs: number;
+  fadeOutSecs: number;
+  mixer: MixerSettings | null;
+  automation: AutomationPoint[];
+  [extra: string]: unknown;
+}
+
+export interface MixLane {
+  id: string;
+  name: string;
+  muted: boolean;
+  soloed: boolean;
+  gainDb: number;
+  blocks: MixBlock[];
+  [extra: string]: unknown;
+}
+
+export interface MasterMix {
+  enabled: boolean;
+  /** Bumped on every saved edit, so caches can tell they are stale. */
+  revision: number;
+  lanes: MixLane[];
+  [extra: string]: unknown;
+}
+
+/** One playlist entry as the timeline needs it. */
+export interface MixEntry {
+  index: number;
+  title: string;
+  artist: string;
+  artworkId: string | null;
+  /** The song's full length: the longest a block of it can be. */
+  durationSecs: number;
+  /** False when nothing in this library matched; its blocks are silent. */
+  available: boolean;
+}
+
+export interface MasterMixView {
+  playlistId: string;
+  playlistName: string;
+  mix: MasterMix;
+  entries: MixEntry[];
+  durationSecs: number;
+  /** False for the default arrangement of a playlist never mixed before. */
+  saved: boolean;
+}
+
+/** Peak magnitudes for drawing one song's waveform. */
+export interface Waveform {
+  /** 0-255, one per 1/peaksPerSec of audio. */
+  peaks: number[];
+  peaksPerSec: number;
+  durationSecs: number;
 }
 
 // -- home ---------------------------------------------------------------------
@@ -385,6 +474,8 @@ export interface ResolvedPlaylist {
   updatedAt: number;
   shuffleOnly: boolean;
   mixer: MixerSettings | null;
+  /** Null until the master mixer has been opened for this playlist. */
+  masterMix: MasterMix | null;
   items: ResolvedEntry[];
   missingCount: number;
 }

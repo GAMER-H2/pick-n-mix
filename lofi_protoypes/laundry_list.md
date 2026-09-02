@@ -1,11 +1,6 @@
 Small Tasks:
-- Add presets for advanced EQ
-- Fix the effects knobs not having their their pointer facing the bar around them
-- Shift-clicking the mixer button doesn't close the advanced mixer
-- Context menu on all home page items
-- Atmospheres vinyl crackle needs re-encoding to 48kHz
-- Atmospheres shaders need more refinement
-- Atmospheres volume knobs need a more dedicated place to not jerk around the mixer pop-up
+- Atmospheres shaders need more refinement (human task, all agents ignore)
+- Add panning to mixer
 
 Medium Tasks:
 - Duplicate song handling - (working but needs some refinement as there are a lot of true negatives)

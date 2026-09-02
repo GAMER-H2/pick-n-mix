@@ -16,6 +16,7 @@ import ContextMenu from "./components/ContextMenu.vue";
 import AddToPlaylistDialog from "./components/AddToPlaylistDialog.vue";
 import DuplicateFilesDialog from "./components/DuplicateFilesDialog.vue";
 import SettingsModal from "./components/settings/SettingsModal.vue";
+import MasterMixModal from "./components/mastermix/MasterMixModal.vue";
 import { usePlayerStore } from "./stores/player";
 import { useLibraryStore } from "./stores/library";
 import { usePlaylistStore } from "./stores/playlists";
@@ -23,6 +24,7 @@ import { useMixerStore } from "./stores/mixer";
 import { useCrossfadeStore } from "./stores/crossfade";
 import { useHomeStore } from "./stores/home";
 import { useUiStore } from "./stores/ui";
+import { useMasterMixStore } from "./stores/masterMix";
 import { useSettingsStore } from "./stores/settings";
 import { installShortcuts } from "./lib/keyboard";
 import { registerScroller } from "./lib/viewState";
@@ -35,6 +37,7 @@ const mixer = useMixerStore();
 const crossfade = useCrossfadeStore();
 const home = useHomeStore();
 const ui = useUiStore();
+const masterMix = useMasterMixStore();
 const settings = useSettingsStore();
 const route = useRoute();
 const router = useRouter();
@@ -156,6 +159,7 @@ onMounted(async () => {
     listen<QueueView>("queue-changed", (e) => (player.queue = e.payload)),
     listen<boolean>("playing-changed", () => player.refresh()),
     listen("queue-ended", () => player.refresh()),
+    listen("master-mix-ended", () => masterMix.previewEnded()),
     listen("library-changed", () => library.refresh()),
     listen("playlists-changed", () => playlists.refresh()),
     // Only the sidebar's pinned list: rebuilding the whole home page here
@@ -274,6 +278,7 @@ onBeforeUnmount(() => {
     <DuplicateFilesDialog />
     <Transition name="fade">
       <SettingsModal v-if="ui.settingsOpen" />
+      <MasterMixModal v-if="masterMix.open" />
     </Transition>
 
     <!-- Only meaningful without server-side decorations; on every other

@@ -18,6 +18,7 @@ import * as api from "@/lib/api";
 import { usePlaylistStore } from "@/stores/playlists";
 import { usePlayerStore } from "@/stores/player";
 import { useMixerStore } from "@/stores/mixer";
+import { useMasterMixStore } from "@/stores/masterMix";
 import { useUiStore } from "@/stores/ui";
 import { useDragReorder } from "@/lib/dragReorder";
 import type { ResolvedEntry } from "@/lib/types";
@@ -26,6 +27,7 @@ const route = useRoute();
 const playlists = usePlaylistStore();
 const player = usePlayerStore();
 const mixer = useMixerStore();
+const masterMix = useMasterMixStore();
 const ui = useUiStore();
 
 const editingDescription = ref(false);
@@ -46,6 +48,7 @@ const meta = computed(() => {
   if (!p) return "";
   const parts = [`${p.items.length} songs`, formatTotal(totalDuration.value)];
   if (p.missingCount > 0) parts.push(`${p.missingCount} not in your library`);
+  if (p.masterMix?.enabled) parts.push("mixed");
   return parts.join(" · ");
 });
 
@@ -144,6 +147,19 @@ async function openPlaylistMixer() {
 }
 
 /**
+ * The master mixer: this playlist as a timeline rather than a list.
+ *
+ * Opened on the playlist rather than on a song because an arrangement is a
+ * property of the whole playlist — a crossfade lives in the join between two
+ * songs, not in either one.
+ */
+async function openMasterMix() {
+  const p = playlist.value;
+  if (!p) return;
+  await masterMix.openFor(p.id);
+}
+
+/**
  * Per-entry override. It is written into this playlist's file, so the same
  * song in another playlist, or played from the library, is unaffected.
  */
@@ -195,6 +211,18 @@ async function saveDescription() {
         })
       "
     >
+      <template #actions>
+        <button
+          class="icon-button"
+          :class="{ 'is-active': playlist!.masterMix?.enabled }"
+          title="Master mixer: arrange this playlist on a timeline"
+          aria-label="Open the master mixer"
+          :disabled="available.length === 0"
+          @click="openMasterMix"
+        >
+          <PnmIcon name="timeline" :size="18" />
+        </button>
+      </template>
     </CollectionHeader>
 
     <div class="playlist__description">

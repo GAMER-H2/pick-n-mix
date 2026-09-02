@@ -62,6 +62,9 @@ const emit = defineEmits<{ play: []; shuffle: []; mixer: []; menu: [event: Mouse
         >
           <PnmIcon name="mixer" :size="18" />
         </button>
+        <!-- Actions only one kind of collection has; playlists use it for the
+             master mixer, which means nothing on an album or artist page. -->
+        <slot name="actions" />
         <button
           class="icon-button"
           title="More"

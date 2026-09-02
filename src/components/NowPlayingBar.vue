@@ -116,12 +116,13 @@ function onQueueButton(event: MouseEvent) {
   else router.push({ name: "nowPlaying" });
 }
 
-/** Shift skips the compact bubble and opens the full panel. */
+/** Shift skips the compact bubble and toggles the full panel. */
 async function openMixer(event: MouseEvent) {
+  const panelWasOpen = mixer.panelOpen;
   await mixer.editGlobal();
   if (event.shiftKey) {
     mixer.popoverOpen = false;
-    mixer.panelOpen = true;
+    mixer.panelOpen = !panelWasOpen;
     return;
   }
   mixer.popoverOpen = !mixer.popoverOpen;

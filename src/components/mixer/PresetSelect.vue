@@ -16,7 +16,8 @@ const draftName = ref("");
 
 const current = computed(() => mixer.targetLayer.preset as string | undefined);
 const visiblePresets = computed(() => mixer.presets.filter((preset) =>
-  !preset.builtIn || !settings.preferences.hiddenBuiltInPresetIds.includes(preset.id),
+  preset.kind === "mixer"
+  && (!preset.builtIn || !settings.preferences.hiddenBuiltInPresetIds.includes(preset.id)),
 ));
 
 async function choose(id: string) {

@@ -12,7 +12,7 @@ import Artwork from "../Artwork.vue";
 import type { MixSummary } from "@/lib/types";
 
 const props = defineProps<{ mix: MixSummary; ready: boolean }>();
-defineEmits<{ open: []; play: []; pin: [] }>();
+defineEmits<{ open: []; play: []; pin: []; menu: [event: MouseEvent] }>();
 
 /**
  * Up to four covers, as a quilt. Fewer than four is drawn as a single cover
@@ -23,7 +23,11 @@ const isQuilt = computed(() => covers.value.length >= 4);
 </script>
 
 <template>
-  <div class="mix" :class="{ 'is-empty': !ready }">
+  <div
+    class="mix"
+    :class="{ 'is-empty': !ready }"
+    @contextmenu.prevent="ready && $emit('menu', $event)"
+  >
     <button
       class="mix__art"
       :disabled="!ready"

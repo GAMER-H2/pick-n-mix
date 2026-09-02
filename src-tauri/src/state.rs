@@ -28,6 +28,9 @@ pub struct Paths {
     /// Packaged ambience files, if they are available in this runtime.
     pub bundled_ambience: Option<PathBuf>,
     pub presets: PathBuf,
+    /// Cached waveform peaks, keyed by file identity. Safe to delete: the
+    /// next request recomputes whatever is missing.
+    pub waveforms: PathBuf,
 }
 
 impl Paths {
@@ -40,6 +43,7 @@ impl Paths {
             filters: data_dir.join("filters"),
             bundled_ambience,
             presets: crate::presets::presets_path(data_dir),
+            waveforms: crate::audio::peaks::cache_dir(data_dir),
         }
     }
 
@@ -49,6 +53,7 @@ impl Paths {
             &self.artwork,
             &self.playlists,
             &self.filters,
+            &self.waveforms,
         ] {
             std::fs::create_dir_all(dir)?;
         }
@@ -76,6 +81,10 @@ pub struct AppState {
     pub paths: Paths,
     /// The first preview captures normal playback here; later previews retain it.
     pub(crate) preview: Mutex<Option<PreviewSession>>,
+    /// Id of the playlist whose master mix is being auditioned in the editor,
+    /// if any. While this is set the engine is playing a timeline rather than
+    /// the queue, so queue-advancing events have to be ignored.
+    pub(crate) master_mix_preview: Mutex<Option<String>>,
     /// Handed to the background pump in `lib.rs`.
     pub engine_events: Mutex<Option<Receiver<EngineEvent>>>,
     /// Guards MusicBrainz lookups so only one runs at a time.
@@ -270,6 +279,7 @@ impl AppState {
             player: Mutex::new(player),
             paths,
             preview: Mutex::new(None),
+            master_mix_preview: Mutex::new(None),
             engine_events: Mutex::new(Some(rx)),
             metadata: Mutex::new(None),
             media: crate::media::MediaBridge::new(),
@@ -405,7 +415,15 @@ impl AppState {
     }
 
     pub(crate) fn is_previewing(&self) -> bool {
-        self.preview.lock().is_some()
+        self.preview.lock().is_some() || self.master_mix_previewing()
+    }
+
+    /// Whether the engine is currently playing a master mix rather than the
+    /// queue. Distinct from [`AppState::is_previewing`] because the end of a
+    /// mix is worth telling the interface about, whereas the end of a
+    /// duplicate-file audition is not.
+    pub(crate) fn master_mix_previewing(&self) -> bool {
+        self.master_mix_preview.lock().is_some()
     }
 
     /// Load one exact physical version while preserving the first normal
@@ -479,8 +497,11 @@ impl AppState {
     /// End preview without restoring it. Normal transport commands call this
     /// before loading or manipulating their intended logical queue item.
     pub(crate) fn cancel_preview(&self) -> Option<PreviewSession> {
+        // A master mix audition ends the moment anything else asks to play,
+        // which is every caller of this function.
+        let mix = self.master_mix_preview.lock().take();
         let preview = self.preview.lock().take();
-        if preview.is_some() {
+        if preview.is_some() || mix.is_some() {
             self.engine.cancel_next();
             self.engine.clear();
         }

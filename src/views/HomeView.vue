@@ -15,11 +15,13 @@ import MixCard from "@/components/home/MixCard.vue";
 import * as api from "@/lib/api";
 import { useHomeStore } from "@/stores/home";
 import { usePlayerStore } from "@/stores/player";
-import type { HomePick, MixSummary } from "@/lib/types";
+import { useUiStore } from "@/stores/ui";
+import type { HomePick, MixSummary, PlaylistSummary, Track } from "@/lib/types";
 
 const router = useRouter();
 const home = useHomeStore();
 const player = usePlayerStore();
+const ui = useUiStore();
 
 onMounted(() => home.refresh());
 
@@ -53,6 +55,43 @@ function openPick(pick: HomePick) {
   void playPick(pick);
 }
 
+function showMenu(event: MouseEvent, tracks: Track[]) {
+  if (tracks.length === 0) {
+    ui.notify("No available songs in this item", "error");
+    return;
+  }
+  ui.openContextMenu({ x: event.clientX, y: event.clientY, tracks });
+}
+
+async function openPickMenu(pick: HomePick, event: MouseEvent) {
+  try {
+    const resolved = await Promise.all(pick.trackIds.map((id) => api.getTrack(id)));
+    showMenu(event, resolved.filter((track): track is Track => track !== null));
+  } catch (error) {
+    ui.notify(`Could not open that menu: ${error}`, "error");
+  }
+}
+
+async function openMixMenu(mix: MixSummary, event: MouseEvent) {
+  try {
+    showMenu(event, await api.mixTracks(mix.kind));
+  } catch (error) {
+    ui.notify(`Could not open that menu: ${error}`, "error");
+  }
+}
+
+async function openPlaylistMenu(playlist: PlaylistSummary, event: MouseEvent) {
+  try {
+    const resolved = await api.getPlaylist(playlist.id);
+    const tracks = resolved?.items
+      .map((item) => item.track)
+      .filter((track): track is Track => track !== null) ?? [];
+    showMenu(event, tracks);
+  } catch (error) {
+    ui.notify(`Could not open that menu: ${error}`, "error");
+  }
+}
+
 </script>
 
 <template>
@@ -78,6 +117,7 @@ function openPick(pick: HomePick) {
           @open="openMix(mix)"
           @play="playMix(mix)"
           @pin="home.setPinned(mix.kind, !mix.pinned)"
+          @menu="openMixMenu(mix, $event)"
         />
       </section>
 
@@ -97,6 +137,7 @@ function openPick(pick: HomePick) {
             class="pick"
             :title="pick.reason"
             @click="openPick(pick)"
+            @contextmenu.prevent="openPickMenu(pick, $event)"
           >
             <div class="pick__art">
               <Artwork :artwork-id="pick.artworkId" :size="44" :radius="5" />
@@ -124,6 +165,7 @@ function openPick(pick: HomePick) {
             :key="playlist.id"
             class="card"
             @click="router.push({ name: 'playlist', params: { id: playlist.id } })"
+            @contextmenu.prevent="openPlaylistMenu(playlist, $event)"
           >
             <Artwork :artwork-id="playlist.artwork" :size="140" :radius="7" shadow />
             <div class="card__title truncate">{{ playlist.name }}</div>

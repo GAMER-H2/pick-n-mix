@@ -20,7 +20,7 @@ use crate::library::model::{
 use crate::library::scan;
 use crate::player::{Context, QueueItem, QueueView, Repeat};
 use crate::playlist::{self, Playlist};
-use crate::presets::{self, Preset};
+use crate::presets::{self, Preset, PresetKind};
 use crate::state::{
     load_app_preferences, AppPreferences, AppState, SETTING_APP_PREFERENCES, SETTING_GLOBAL_MIXER,
     SETTING_REPEAT, SETTING_SHUFFLE, SETTING_VOLUME,
@@ -702,9 +702,7 @@ pub fn set_app_preferences(
         .set_setting(SETTING_APP_PREFERENCES, &raw)
         .map_err(err)?;
     state.engine.set_fade_mode(&preferences.fade_mode);
-    state
-        .engine
-        .set_keep_tail(preferences.keep_reverb_on_pause);
+    state.engine.set_keep_tail(preferences.keep_reverb_on_pause);
     if preferences.output_device != previous.output_device {
         apply_output_device(&app, &state, &preferences.output_device)?;
     }
@@ -868,8 +866,15 @@ pub fn save_preset(
     state: State<'_, AppState>,
     name: String,
     settings: MixerSettings,
+    kind: Option<PresetKind>,
 ) -> Cmd<Vec<Preset>> {
-    presets::upsert(&state.paths.presets, &name, settings).map_err(err)
+    presets::upsert_with_kind(
+        &state.paths.presets,
+        &name,
+        kind.unwrap_or_default(),
+        settings,
+    )
+    .map_err(err)
 }
 
 #[tauri::command]
@@ -1054,6 +1059,10 @@ pub struct PlaylistSummary {
     pub track_count: usize,
     pub artwork: Option<String>,
     pub has_mixer: bool,
+    /// Whether a timeline has ever been built for this playlist.
+    pub has_master_mix: bool,
+    /// Whether that timeline is the thing that plays.
+    pub master_mix_enabled: bool,
     pub shuffle_only: bool,
     pub path: String,
 }
@@ -1069,6 +1078,8 @@ pub fn list_playlists(state: State<'_, AppState>) -> Cmd<Vec<PlaylistSummary>> {
             track_count: p.tracks.len(),
             artwork: p.artwork,
             has_mixer: p.mixer.is_some(),
+            has_master_mix: p.master_mix.is_some(),
+            master_mix_enabled: p.master_mix.as_ref().is_some_and(|m| m.enabled),
             shuffle_only: p.shuffle_only,
             path: path.display().to_string(),
         })
@@ -1109,6 +1120,8 @@ pub fn create_playlist(
         track_count: 0,
         artwork: p.artwork,
         has_mixer: false,
+        has_master_mix: false,
+        master_mix_enabled: false,
         shuffle_only: p.shuffle_only,
         path: path.display().to_string(),
     })
@@ -1229,8 +1242,7 @@ pub fn remove_from_playlist(
     let Some((path, mut p)) = find_playlist(&state, &playlist_id) else {
         return Err("playlist not found".into());
     };
-    if index < p.tracks.len() {
-        p.tracks.remove(index);
+    if p.remove_entry(index) {
         p.save(&path).map_err(err)?;
         let _ = app.emit("playlists-changed", ());
     }
@@ -1249,9 +1261,7 @@ pub fn move_in_playlist(
     let Some((path, mut p)) = find_playlist(&state, &playlist_id) else {
         return Err("playlist not found".into());
     };
-    if from < p.tracks.len() && to < p.tracks.len() {
-        let entry = p.tracks.remove(from);
-        p.tracks.insert(to, entry);
+    if p.move_entry(from, to) {
         p.save(&path).map_err(err)?;
         let _ = app.emit("playlists-changed", ());
     }
@@ -1758,6 +1768,8 @@ pub fn save_mix_to_playlist(
         track_count: playlist.tracks.len(),
         artwork: playlist.artwork,
         has_mixer: playlist.mixer.is_some(),
+        has_master_mix: playlist.master_mix.is_some(),
+        master_mix_enabled: playlist.master_mix.as_ref().is_some_and(|m| m.enabled),
         shuffle_only: playlist.shuffle_only,
         path: path.display().to_string(),
     })
@@ -1912,6 +1924,345 @@ fn request_missing_beds(state: &AppState) {
         if !state.engine.has_bed(&filter.id) {
             state.engine.request_bed(&filter.id);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Master mix
+// ---------------------------------------------------------------------------
+//
+// The timeline behind a playlist's master mixer. Editing is coarse on purpose:
+// the webview owns the arrangement while the modal is open and hands the whole
+// document back, rather than there being a command per drag. That keeps undo,
+// multi-block moves and the blade tool entirely on the side that has the mouse,
+// and leaves exactly one place — `MasterMix::normalise` — where anything the
+// interface sends is checked before it can reach the audio engine.
+
+/// One playlist entry, as the timeline needs to know it: enough to label a
+/// block, bound a trim, and grey out a song that is not in this library.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixEntry {
+    pub index: usize,
+    pub title: String,
+    pub artist: String,
+    pub artwork_id: Option<String>,
+    /// The song's full length, which is the longest a block of it can be.
+    pub duration_secs: f64,
+    /// False when nothing in this library matched. Its blocks still draw, so
+    /// the arrangement is visible, but they are silent.
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterMixView {
+    pub playlist_id: String,
+    pub playlist_name: String,
+    pub mix: crate::master_mix::MasterMix,
+    pub entries: Vec<MixEntry>,
+    pub duration_secs: f64,
+    /// False when this is the default arrangement offered for a playlist that
+    /// has never been mixed — nothing is written to the file until an edit.
+    pub saved: bool,
+}
+
+/// The mix for a playlist, building the default arrangement if there is none.
+#[tauri::command]
+pub fn master_mix(state: State<'_, AppState>, playlist_id: String) -> Cmd<MasterMixView> {
+    let Some((_, p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    view_of(&state, p).map_err(err)
+}
+
+fn view_of(state: &AppState, p: Playlist) -> anyhow::Result<MasterMixView> {
+    let saved = p.master_mix.is_some();
+    let playlist_id = p.id.clone();
+    let playlist_name = p.name.clone();
+    let mut mix = p.master_mix_or_default(&state.db)?;
+    mix.normalise(p.tracks.len());
+
+    let resolved = p.resolve(&state.db)?;
+    let entries = resolved
+        .items
+        .iter()
+        .map(|item| MixEntry {
+            index: item.index,
+            title: item
+                .track
+                .as_ref()
+                .map(|t| t.title.clone())
+                .unwrap_or_else(|| item.entry.title.clone()),
+            artist: item
+                .track
+                .as_ref()
+                .map(|t| t.artist.clone())
+                .unwrap_or_else(|| item.entry.artist.clone()),
+            artwork_id: item.track.as_ref().and_then(|t| t.artwork_id.clone()),
+            duration_secs: item
+                .track
+                .as_ref()
+                .map(|t| t.duration_secs)
+                .filter(|d| *d > 0.0)
+                .unwrap_or(item.entry.duration_secs),
+            available: item.track.is_some(),
+        })
+        .collect();
+
+    Ok(MasterMixView {
+        playlist_id,
+        playlist_name,
+        duration_secs: mix.duration_secs(),
+        mix,
+        entries,
+        saved,
+    })
+}
+
+/// Replace the whole arrangement.
+///
+/// Validated here and nowhere else: everything downstream — the renderer, the
+/// engine — is entitled to assume a mix it is handed is playable.
+#[tauri::command]
+pub fn set_master_mix(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    playlist_id: String,
+    mix: crate::master_mix::MasterMix,
+) -> Cmd<MasterMixView> {
+    let Some((path, mut p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    let mut mix = mix;
+    mix.normalise(p.tracks.len());
+    mix.touch();
+    p.master_mix = Some(mix);
+    p.save(&path).map_err(err)?;
+    let _ = app.emit("playlists-changed", ());
+    view_of(&state, p).map_err(err)
+}
+
+/// Turn the master mix on or off without discarding it.
+///
+/// Off, the playlist plays as an ordinary list again; the arrangement stays in
+/// the file so it is still there when it is switched back on.
+#[tauri::command]
+pub fn set_master_mix_enabled(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    playlist_id: String,
+    enabled: bool,
+) -> Cmd<MasterMixView> {
+    let Some((path, mut p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    let mut mix = p.master_mix_or_default(&state.db).map_err(err)?;
+    mix.normalise(p.tracks.len());
+    mix.enabled = enabled;
+    mix.touch();
+    p.master_mix = Some(mix);
+    p.save(&path).map_err(err)?;
+    let _ = app.emit("playlists-changed", ());
+    view_of(&state, p).map_err(err)
+}
+
+/// Throw the arrangement away and start again from the playlist's own order.
+#[tauri::command]
+pub fn reset_master_mix(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    playlist_id: String,
+) -> Cmd<MasterMixView> {
+    let Some((path, mut p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    p.master_mix = None;
+    let mut fresh = p.master_mix_or_default(&state.db).map_err(err)?;
+    fresh.normalise(p.tracks.len());
+    p.master_mix = Some(fresh);
+    p.save(&path).map_err(err)?;
+    let _ = app.emit("playlists-changed", ());
+    view_of(&state, p).map_err(err)
+}
+
+/// Waveform peaks for one playlist entry.
+///
+/// One waveform per *song*, not per block: splitting a block or dragging its
+/// edges only changes which slice of the same waveform is drawn, so there is
+/// nothing to recompute. Decoding is slow, so this runs on a blocking thread
+/// and its result is cached on disk between runs.
+#[tauri::command]
+pub async fn entry_waveform(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    index: usize,
+) -> Cmd<crate::audio::peaks::Waveform> {
+    let Some((_, p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    let resolved = p.resolve(&state.db).map_err(err)?;
+    let Some(item) = resolved.items.get(index) else {
+        return Err("that playlist entry no longer exists".into());
+    };
+    let Some(track) = item.track.as_ref() else {
+        // Not an error: a song this library does not have simply has no shape
+        // to draw, and the block is shown as an outline instead.
+        return Ok(crate::audio::peaks::Waveform {
+            peaks: Vec::new(),
+            peaks_per_sec: crate::audio::peaks::PEAKS_PER_SEC,
+            duration_secs: item.entry.duration_secs,
+        });
+    };
+    let files = state.playback_files(&track.id).map_err(err)?;
+    let Some(file) = files.into_iter().next() else {
+        return Err("that song has no readable file".into());
+    };
+    let cache = state.paths.waveforms.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::audio::peaks::waveform(Path::new(&file.location), &cache)
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)
+}
+
+/// Audition the arrangement, from `position_secs`.
+///
+/// The mix takes over playback entirely while the editor is open: the engine
+/// plays a timeline instead of a queue entry, and the queue is left exactly as
+/// it was so closing the editor can put it back.
+#[tauri::command]
+pub fn play_master_mix(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    playlist_id: String,
+    mix: Option<crate::master_mix::MasterMix>,
+    position_secs: Option<f64>,
+) -> Cmd<f64> {
+    let Some((path, p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    // Unsaved edits are auditioned as they are: the whole point of a preview
+    // is to hear the move you just made before deciding to keep it.
+    let mut mix = match mix {
+        Some(mix) => mix,
+        None => p.master_mix_or_default(&state.db).map_err(err)?,
+    };
+    mix.normalise(p.tracks.len());
+
+    let plan = build_plan(&state, &p, &mix, &path).map_err(err)?;
+    if plan.is_empty() {
+        return Err("there is nothing in this mix to play".into());
+    }
+    let duration = plan.duration_secs;
+
+    // Ends any duplicate-file audition and stops the queue's own playback
+    // before the timeline replaces it.
+    state.cancel_preview();
+    *state.master_mix_preview.lock() = Some(playlist_id);
+
+    let rate = state.engine.device_sample_rate();
+    let mut source = crate::audio::timeline::TimelineSource::new(plan, rate);
+    if let Some(position) = position_secs.filter(|p| *p > 0.0) {
+        source.seek(position).map_err(err)?;
+    }
+    state.engine.load_timeline(source).map_err(err)?;
+    state.engine.play();
+    let _ = app.emit("playing-changed", true);
+    Ok(duration)
+}
+
+/// Stop auditioning and hand the engine back to the queue.
+#[tauri::command]
+pub fn stop_master_mix(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
+    if state.master_mix_preview.lock().take().is_none() {
+        return Ok(());
+    }
+    state.engine.clear();
+    let _ = app.emit("playing-changed", false);
+    Ok(())
+}
+
+/// Resolve a mix against this library: every audible block paired with a file
+/// on this machine and the mixer cascade that applies to it.
+///
+/// A block whose song is not here is dropped rather than failing the whole
+/// mix — the roadmap's open question, answered the way that keeps a shared
+/// playlist usable: you hear what you have.
+fn build_plan(
+    state: &AppState,
+    p: &Playlist,
+    mix: &crate::master_mix::MasterMix,
+    playlist_path: &Path,
+) -> anyhow::Result<crate::audio::timeline::Plan> {
+    use crate::master_mix::BlockSource;
+
+    let resolved = p.clone().resolve(&state.db)?;
+    let global = state.player.lock().global_mixer.clone();
+    let playlist_layer = p.mixer.clone().unwrap_or_default();
+    let assets = Playlist::assets_dir(playlist_path);
+
+    let mut blocks = Vec::new();
+    for lane in mix.lanes.iter() {
+        if !mix.lane_audible(lane) {
+            continue;
+        }
+        let lane_gain = db_to_gain(lane.gain_db);
+        for block in lane.blocks.iter() {
+            let (path, entry_layer, track_gain_db) = match &block.source {
+                BlockSource::Entry { index } => {
+                    let Some(item) = resolved.items.get(*index) else {
+                        continue;
+                    };
+                    let Some(track) = item.track.as_ref() else {
+                        continue;
+                    };
+                    let Some(file) = state.playback_files(&track.id)?.into_iter().next() else {
+                        continue;
+                    };
+                    (
+                        PathBuf::from(file.location),
+                        item.entry.mixer.clone().unwrap_or_default(),
+                        file.gain_db.unwrap_or(0.0),
+                    )
+                }
+                BlockSource::Asset { file } => {
+                    let path = assets.join(file);
+                    if !path.is_file() {
+                        continue;
+                    }
+                    // An imported file is the user's own audio, already at the
+                    // level they chose. Nothing to normalise against.
+                    (path, MixerSettings::default(), 0.0)
+                }
+            };
+
+            let block_layer = block.mixer.clone().unwrap_or_default();
+            let settings = MixerSettings::resolve(&[
+                &global,
+                &playlist_layer,
+                &entry_layer,
+                &block_layer,
+            ]);
+            blocks.push(crate::audio::timeline::PlanBlock {
+                path,
+                block: block.clone(),
+                lane_gain,
+                settings: std::sync::Arc::new(settings),
+                track_gain_db,
+            });
+        }
+    }
+    Ok(crate::audio::timeline::Plan::new(blocks))
+}
+
+fn db_to_gain(db: f32) -> f32 {
+    if db <= crate::master_mix::SILENT_DB {
+        0.0
+    } else {
+        10f32.powf(db / 20.0)
     }
 }
 

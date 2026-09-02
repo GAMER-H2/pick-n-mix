@@ -35,6 +35,7 @@ const presetEditor = usePresetEditorStore();
 const ui = useUiStore();
 
 const isPreset = computed(() => props.mode === "preset");
+const isEqPreset = computed(() => isPreset.value && presetEditor.session?.sourceKind === "eq");
 const eqExpanded = ref(false);
 const fx = computed(() => isPreset.value ? presetEditor.effective : mixer.effective);
 const targetLabel = computed(() => isPreset.value
@@ -141,7 +142,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   <aside class="panel" role="complementary" aria-label="DJ Advanced Mixer">
     <header class="panel__head">
       <div class="panel__heading">
-        <h2>DJ Advanced Mixer</h2>
+        <h2>{{ isEqPreset ? "EQ Preset Editor" : "DJ Advanced Mixer" }}</h2>
         <p class="panel__target truncate">
           <PnmIcon
             :name="
@@ -162,7 +163,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
     </header>
 
     <div class="panel__body scroll-area">
-      <div class="panel__bypass">
+      <div v-if="!isEqPreset" class="panel__bypass">
         <span>Effects</span>
         <AppToggle
           :model-value="fx.enabled"
@@ -188,7 +189,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </div>
 
       <p v-if="isPreset" class="panel__scope">
-        This is an isolated preset draft. Playback does not change while you edit it.
+        This is an isolated {{ isEqPreset ? "EQ " : "" }}preset draft. Playback does not change while you edit it.
       </p>
       <p v-else-if="canOverride" class="panel__scope">
         Changes here apply only to <strong>{{ targetLabel }}</strong
@@ -200,7 +201,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         <SectionHeader
           title="EQ"
           :overridden="overridden('eq')"
-          :can-override="canOverride"
+          :can-override="canOverride && !isEqPreset"
           @clear="clearSection('eq')"
         >
           <div class="panel__spacer" />
@@ -218,6 +219,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         <EqSliders :eq="fx.eq" @change="onEq" />
       </section>
 
+      <template v-if="!isEqPreset">
       <!-- Pitch ------------------------------------------------------------->
       <section class="panel__section">
         <SectionHeader
@@ -550,6 +552,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           {{ formatHz(deviceRate) }}.
         </p>
       </section>
+      </template>
     </div>
 
     <!-- Edits whichever layer this panel is pointed at, like every other

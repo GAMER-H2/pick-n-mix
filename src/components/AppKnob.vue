@@ -14,6 +14,8 @@ const props = withDefaults(
     min?: number;
     max?: number;
     label: string;
+    /** Accessible name when the visible label is intentionally shorter. */
+    ariaLabel?: string;
     /** Formatted readout under the knob. */
     display?: string;
     size?: number;
@@ -90,7 +92,7 @@ function clamp(value: number) {
       class="knob__dial"
       :style="{ width: `${size}px`, height: `${size}px` }"
       role="slider"
-      :aria-label="label"
+      :aria-label="ariaLabel ?? label"
       :aria-valuemin="min"
       :aria-valuemax="max"
       :aria-valuenow="modelValue"
@@ -133,7 +135,7 @@ function clamp(value: number) {
           stroke="var(--text)"
           stroke-width="2"
           stroke-linecap="round"
-          :transform="`rotate(${angle - 90} ${size / 2} ${size / 2})`"
+          :transform="`rotate(${angle + 90} ${size / 2} ${size / 2})`"
         />
       </svg>
     </div>

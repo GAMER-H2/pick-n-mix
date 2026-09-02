@@ -6,6 +6,7 @@ import QueueList from "../QueueList.vue";
 import SelectMenu from "../SelectMenu.vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import AdvancedMixer from "../mixer/AdvancedMixer.vue";
+import { EQ_PRESETS } from "@/lib/eqPresets";
 import * as api from "@/lib/api";
 import type { AppPreferences, FadeMode, Preset, ThemePreference } from "@/lib/types";
 import { useHomeStore } from "@/stores/home";
@@ -53,6 +54,7 @@ const dialog = ref<HTMLElement | null>(null);
 const activePane = ref<Pane>("theme");
 const clearHistoryArmed = ref(false);
 const presetName = ref("");
+const eqPresetName = ref("");
 const busy = ref<string | null>(null);
 const pendingFilterDelete = ref<string | null>(null);
 const pendingFolderRemove = ref<string | null>(null);
@@ -101,9 +103,29 @@ const fadeModeOptions = [
   { id: "both", label: "Starting and pausing" },
 ];
 const visiblePresets = computed(() => mixer.presets.filter((preset) =>
-  !preset.builtIn || !settings.preferences.hiddenBuiltInPresetIds.includes(preset.id),
+  preset.kind === "mixer"
+  && (!preset.builtIn || !settings.preferences.hiddenBuiltInPresetIds.includes(preset.id)),
 ));
 const hiddenPresets = computed(() => mixer.presets.filter((preset) =>
+  preset.kind === "mixer"
+  && preset.builtIn
+  && settings.preferences.hiddenBuiltInPresetIds.includes(preset.id),
+));
+const builtInEqPresets: Preset[] = EQ_PRESETS.map((preset) => ({
+  id: preset.id,
+  name: preset.name,
+  builtIn: true,
+  kind: "eq",
+  settings: { eq: preset.eq },
+}));
+const eqPresets = computed(() => [
+  ...builtInEqPresets,
+  ...mixer.presets.filter((preset) => preset.kind === "eq" && !preset.builtIn),
+]);
+const visibleEqPresets = computed(() => eqPresets.value.filter((preset) =>
+  !preset.builtIn || !settings.preferences.hiddenBuiltInPresetIds.includes(preset.id),
+));
+const hiddenEqPresets = computed(() => eqPresets.value.filter((preset) =>
   preset.builtIn && settings.preferences.hiddenBuiltInPresetIds.includes(preset.id),
 ));
 const visibleFilters = computed(() => mixer.filters.filter((filter) =>
@@ -260,6 +282,18 @@ async function savePreset() {
   try {
     await reportFailure("Could not save preset", () => mixer.saveAsPreset(name));
     presetName.value = "";
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function saveEqPreset() {
+  const name = eqPresetName.value.trim();
+  if (!name) return;
+  busy.value = "eq-preset-save";
+  try {
+    await reportFailure("Could not save EQ preset", () => mixer.saveEqPreset(name, mixer.effective.eq));
+    eqPresetName.value = "";
   } finally {
     busy.value = null;
   }
@@ -635,6 +669,45 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
             <details v-if="hiddenPresets.length" class="hidden-builtins">
               <summary>Hidden built-in presets ({{ hiddenPresets.length }})</summary>
               <div v-for="preset in hiddenPresets" :key="preset.id">
+                <span>{{ preset.name }}</span>
+                <button class="text-button" @click="setBuiltInHidden('preset', preset.id, false)">Show</button>
+              </div>
+            </details>
+
+            <div class="section-heading filters-heading">
+              <div>
+                <h4>EQ presets</h4>
+                <p>Save and manage curves used by the expanded equaliser.</p>
+              </div>
+            </div>
+            <form class="inline-form" @submit.prevent="saveEqPreset">
+              <input v-model="eqPresetName" maxlength="60" placeholder="EQ preset name" aria-label="EQ preset name" />
+              <button class="primary-button" type="submit" :disabled="!eqPresetName.trim() || busy !== null">Save current EQ</button>
+            </form>
+            <ul class="item-list preset-list">
+              <li v-for="preset in visibleEqPresets" :key="preset.id">
+                <button class="item-main" type="button" @click="editPreset(preset)">
+                  <strong>{{ preset.name }}</strong>
+                  <span>{{ preset.builtIn ? "Built in · click to edit a custom copy" : "Custom · click to edit" }}</span>
+                </button>
+                <button
+                  v-if="preset.builtIn"
+                  class="text-button"
+                  type="button"
+                  @click.stop="setBuiltInHidden('preset', preset.id, true)"
+                >Hide</button>
+                <button
+                  v-else
+                  class="text-button danger-text"
+                  type="button"
+                  :disabled="busy !== null"
+                  @click.stop="removePreset(preset.id)"
+                >Delete</button>
+              </li>
+            </ul>
+            <details v-if="hiddenEqPresets.length" class="hidden-builtins">
+              <summary>Hidden built-in EQ presets ({{ hiddenEqPresets.length }})</summary>
+              <div v-for="preset in hiddenEqPresets" :key="preset.id">
                 <span>{{ preset.name }}</span>
                 <button class="text-button" @click="setBuiltInHidden('preset', preset.id, false)">Show</button>
               </div>

@@ -2,6 +2,7 @@ pub mod audio;
 pub mod commands;
 pub mod history;
 pub mod library;
+pub mod master_mix;
 pub mod media;
 pub mod player;
 pub mod playlist;
@@ -194,6 +195,15 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                 };
                 match event {
                     EngineEvent::TrackFinished => {
+                        // A master mix ends where its arrangement ends. There
+                        // is no queue to advance into, but the editor does
+                        // need to know the playhead has stopped.
+                        if state.master_mix_previewing() {
+                            state.engine.pause();
+                            let _ = app.emit("playing-changed", false);
+                            let _ = app.emit("master-mix-ended", ());
+                            continue;
+                        }
                         if state.is_previewing() {
                             continue;
                         }
@@ -563,6 +573,13 @@ pub fn run() {
             commands::import_playlist,
             commands::export_playlist,
             commands::play_playlist,
+            commands::master_mix,
+            commands::set_master_mix,
+            commands::set_master_mix_enabled,
+            commands::reset_master_mix,
+            commands::entry_waveform,
+            commands::play_master_mix,
+            commands::stop_master_mix,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Pick n Mix");

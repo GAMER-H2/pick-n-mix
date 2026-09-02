@@ -36,6 +36,7 @@ use crate::audio::crossfade::CrossfadeSettings;
 use crate::audio::decode::{StreamInfo, TrackDecoder};
 use crate::audio::dsp::{Chain, Limiter, CHANNELS};
 use crate::audio::params::Resolved;
+use crate::audio::timeline::TimelineSource;
 
 /// Frames processed per DSP block.
 const BLOCK: usize = 512;
@@ -191,11 +192,73 @@ struct QueueRef {
     track_id: String,
 }
 
+/// Where a voice's audio comes from.
+///
+/// Both variants answer the same handful of questions — how far in are you,
+/// have you run out, give me some audio — so the worker below does not care
+/// which it is holding. A master mix is a [`TimelineSource`]: many overlapping
+/// blocks, each with its own file and effect chain, already summed by the time
+/// the worker sees it.
+enum Source {
+    Track(TrackDecoder),
+    Timeline(Box<TimelineSource>),
+}
+
+impl Source {
+    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        match self {
+            Source::Track(decoder) => decoder.read(out),
+            Source::Timeline(timeline) => timeline.read(out),
+        }
+    }
+
+    fn seek(&mut self, secs: f64) -> Result<()> {
+        match self {
+            Source::Track(decoder) => decoder.seek(secs),
+            Source::Timeline(timeline) => timeline.seek(secs),
+        }
+    }
+
+    fn set_speed(&mut self, speed: f64) -> Result<()> {
+        match self {
+            Source::Track(decoder) => decoder.set_speed(speed),
+            Source::Timeline(timeline) => timeline.set_speed(speed),
+        }
+    }
+
+    fn decoded_secs(&self) -> f64 {
+        match self {
+            Source::Track(decoder) => decoder.decoded_secs(),
+            Source::Timeline(timeline) => timeline.decoded_secs(),
+        }
+    }
+
+    fn is_eof(&self) -> bool {
+        match self {
+            Source::Track(decoder) => decoder.is_eof(),
+            Source::Timeline(timeline) => timeline.is_eof(),
+        }
+    }
+
+    fn info(&self) -> &StreamInfo {
+        match self {
+            Source::Track(decoder) => &decoder.info,
+            Source::Timeline(timeline) => timeline.info(),
+        }
+    }
+
+    /// A master mix is never crossfaded into the next queue entry: it *is* the
+    /// arrangement, and its own ending is part of it.
+    fn is_timeline(&self) -> bool {
+        matches!(self, Source::Timeline(_))
+    }
+}
+
 /// One decoded, effects-processed audio source. The worker holds at most two
 /// at once: `current` (always playing) and `next` (being pre-mixed in ahead
 /// of a crossfade).
 struct Voice {
-    decoder: TrackDecoder,
+    source: Source,
     /// This voice's resolved mixer cascade. Note that its `crossfade` field is
     /// *not* what governs the transition — a crossfade belongs to the join
     /// between two tracks, not to either one, so the worker always reads
@@ -213,6 +276,13 @@ enum Cmd {
         path: PathBuf,
         start_secs: f64,
         gain_db: f32,
+        reply: Sender<Result<StreamInfo>>,
+    },
+    /// Play a whole master mix in place of a single track. Built on the app
+    /// side, like a decoder, because resolving it touches the library and the
+    /// filesystem.
+    LoadTimeline {
+        source: Box<TimelineSource>,
         reply: Sender<Result<StreamInfo>>,
     },
     Seek(f64),
@@ -365,6 +435,20 @@ impl AudioEngine {
                 path,
                 start_secs,
                 gain_db,
+                reply,
+            })
+            .map_err(|_| anyhow!("audio worker is gone"))?;
+        rx.recv()
+            .map_err(|_| anyhow!("audio worker dropped the request"))?
+    }
+
+    /// Play a whole master mix. Replaces whatever was loaded, exactly as
+    /// [`AudioEngine::load`] does.
+    pub fn load_timeline(&self, source: TimelineSource) -> Result<StreamInfo> {
+        let (reply, rx) = bounded(1);
+        self.cmd_tx
+            .send(Cmd::LoadTimeline {
+                source: Box::new(source),
                 reply,
             })
             .map_err(|_| anyhow!("audio worker is gone"))?;
@@ -861,7 +945,7 @@ fn worker(
                                 .store((d.decoded_secs() * 1000.0) as u64, Ordering::Relaxed);
                             shared.stream_info.store(Arc::new(Some(info.clone())));
                             current = Some(Voice {
-                                decoder: d,
+                                source: Source::Track(d),
                                 settings: shared.settings.load_full(),
                                 track_gain_db: gain_db,
                                 chain_ix: 0,
@@ -896,9 +980,43 @@ fn worker(
                         }
                     }
                 }
+                Cmd::LoadTimeline { source, reply } => {
+                    let info = source.info().clone();
+                    shared
+                        .duration_ms
+                        .store((info.duration_secs * 1000.0) as u64, Ordering::Relaxed);
+                    shared.position_ms.store(0, Ordering::Relaxed);
+                    shared.stream_info.store(Arc::new(Some(info.clone())));
+                    shared.track_gain_db.store(0.0f32.to_bits(), Ordering::Relaxed);
+                    current = Some(Voice {
+                        source: Source::Timeline(source),
+                        // Every block in a mix carries its own resolved
+                        // cascade and runs through its own chain inside the
+                        // timeline, so the voice-level chain is bypassed
+                        // rather than applying the mixer a second time. The
+                        // master limiter after it still runs.
+                        settings: Arc::new(Resolved {
+                            enabled: false,
+                            ..Resolved::default()
+                        }),
+                        track_gain_db: 0.0,
+                        chain_ix: 0,
+                        queue_ref: None,
+                    });
+                    chains[0].prepare(device_rate as f32);
+                    chains[1].prepare(device_rate as f32);
+                    tail_blocks = 0;
+                    shared.tail_active.store(false, Ordering::Relaxed);
+                    next = None;
+                    next_wait_token = None;
+                    next_declined = false;
+                    finished_reported = false;
+                    drain(&shared);
+                    let _ = reply.send(Ok(info));
+                }
                 Cmd::Seek(secs) => {
                     if let Some(cur) = current.as_mut() {
-                        if let Err(e) = cur.decoder.seek(secs) {
+                        if let Err(e) = cur.source.seek(secs) {
                             let _ = events.send(EngineEvent::Error {
                                 message: e.to_string(),
                             });
@@ -912,7 +1030,7 @@ fn worker(
                         drain(&shared);
                         finished_reported = false;
                         shared.position_ms.store(
-                            (cur.decoder.decoded_secs() * 1000.0) as u64,
+                            (cur.source.decoded_secs() * 1000.0) as u64,
                             Ordering::Relaxed,
                         );
                     }
@@ -942,7 +1060,7 @@ fn worker(
                     if next_wait_token == Some(token) {
                         let chain_ix = current.as_ref().map(|c| 1 - c.chain_ix).unwrap_or(1);
                         next = Some(Voice {
-                            decoder: *decoder,
+                            source: Source::Track(*decoder),
                             settings,
                             track_gain_db: gain_db,
                             chain_ix,
@@ -1001,8 +1119,14 @@ fn worker(
         // the queued-up next track. The next voice keeps the settings it was
         // resolved with at prepare time until it is promoted.
         if let Some(cur) = current.as_mut() {
-            cur.settings = shared.settings.load_full();
-            cur.track_gain_db = f32::from_bits(shared.track_gain_db.load(Ordering::Relaxed));
+            // A master mix is deliberately left alone here: its blocks were
+            // resolved when the mix was built, and pushing the live cascade
+            // over the top would apply the playlist's mixer to the sum as
+            // well as to every block inside it.
+            if !cur.source.is_timeline() {
+                cur.settings = shared.settings.load_full();
+                cur.track_gain_db = f32::from_bits(shared.track_gain_db.load(Ordering::Relaxed));
+            }
         }
 
         let crossfade = shared.crossfade.load_full();
@@ -1045,7 +1169,7 @@ fn worker(
                 if shared.keep_tail.load(Ordering::Relaxed) && chain_has_tail(&cur.settings) {
                     let heard = heard_position(&producer, cur, device_rate, &shared);
                     drain(&shared);
-                    if cur.decoder.seek(heard).is_ok() {
+                    if cur.source.seek(heard).is_ok() {
                         tail_blocks = tail_block_budget(device_rate);
                         shared.tail_active.store(true, Ordering::Relaxed);
                     }
@@ -1114,10 +1238,19 @@ fn worker(
         }
 
         // --- crossfade: ask for the next track once close enough ----------
-        if crossfade.enabled() && next.is_none() && next_wait_token.is_none() && !next_declined {
+        let playing_a_mix = current
+            .as_ref()
+            .map(|cur| cur.source.is_timeline())
+            .unwrap_or(false);
+        if crossfade.enabled()
+            && !playing_a_mix
+            && next.is_none()
+            && next_wait_token.is_none()
+            && !next_declined
+        {
             let cur = current.as_ref().expect("checked by `idle` above");
             let remaining_track =
-                (cur.decoder.info.duration_secs - cur.decoder.decoded_secs()).max(0.0);
+                (cur.source.info().duration_secs - cur.source.decoded_secs()).max(0.0);
             let speed = if cur.settings.enabled {
                 cur.settings.pitch.ratio()
             } else {
@@ -1140,8 +1273,8 @@ fn worker(
         // that would otherwise skip the very track being promoted to.
         if next.is_some() {
             let cur = current.as_ref().expect("checked by `idle` above");
-            let x = cur.decoder.decoded_secs() - cur.decoder.info.duration_secs;
-            if x >= 0.0 || cur.decoder.is_eof() {
+            let x = cur.source.decoded_secs() - cur.source.info().duration_secs;
+            if x >= 0.0 || cur.source.is_eof() {
                 let retiring_ix = cur.chain_ix;
                 let promoted = next.take().expect("checked by outer `if`");
                 chains[retiring_ix].prepare(device_rate as f32);
@@ -1151,16 +1284,16 @@ fn worker(
                     .track_gain_db
                     .store(promoted.track_gain_db.to_bits(), Ordering::Relaxed);
                 shared.duration_ms.store(
-                    (promoted.decoder.info.duration_secs * 1000.0) as u64,
+                    (promoted.source.info().duration_secs * 1000.0) as u64,
                     Ordering::Relaxed,
                 );
                 shared.position_ms.store(
-                    (promoted.decoder.decoded_secs() * 1000.0) as u64,
+                    (promoted.source.decoded_secs() * 1000.0) as u64,
                     Ordering::Relaxed,
                 );
                 shared
                     .stream_info
-                    .store(Arc::new(Some(promoted.decoder.info.clone())));
+                    .store(Arc::new(Some(promoted.source.info().clone())));
 
                 let queue_ref = promoted.queue_ref.clone();
                 current = Some(promoted);
@@ -1191,13 +1324,13 @@ fn worker(
             } else {
                 1.0
             };
-            if let Err(e) = cur.decoder.set_speed(speed) {
+            if let Err(e) = cur.source.set_speed(speed) {
                 let _ = events.send(EngineEvent::Error {
                     message: e.to_string(),
                 });
             }
 
-            let got_a = match cur.decoder.read(&mut interleaved_a) {
+            let got_a = match cur.source.read(&mut interleaved_a) {
                 Ok(n) => n,
                 Err(e) => {
                     let _ = events.send(EngineEvent::Error {
@@ -1211,7 +1344,7 @@ fn worker(
             if frames == 0 {
                 // Wait for the ring to empty so the tail is actually heard.
                 let queued = BLOCK * CHANNELS - producer.slots().min(BLOCK * CHANNELS);
-                if cur.decoder.is_eof() && queued == 0 && !finished_reported {
+                if cur.source.is_eof() && queued == 0 && !finished_reported {
                     finished_reported = true;
                     let _ = events.send(EngineEvent::TrackFinished);
                 }
@@ -1246,7 +1379,7 @@ fn worker(
         if next.is_some() {
             let x = {
                 let cur = current.as_ref().expect("checked by `idle` above");
-                cur.decoder.decoded_secs() - cur.decoder.info.duration_secs
+                cur.source.decoded_secs() - cur.source.info().duration_secs
             };
             let gain_a = crossfade.curve.gain_out(x as f32);
             for ch in 0..CHANNELS {
@@ -1268,14 +1401,14 @@ fn worker(
                 } else {
                     1.0
                 };
-                if let Err(e) = nx.decoder.set_speed(nx_speed) {
+                if let Err(e) = nx.source.set_speed(nx_speed) {
                     let _ = events.send(EngineEvent::Error {
                         message: e.to_string(),
                     });
                 }
 
                 let want_b = frames * CHANNELS;
-                let got_b = match nx.decoder.read(&mut interleaved_b[..want_b]) {
+                let got_b = match nx.source.read(&mut interleaved_b[..want_b]) {
                     Ok(n) => n,
                     Err(e) => {
                         let _ = events.send(EngineEvent::Error {
@@ -1345,7 +1478,7 @@ fn worker(
         let capacity = producer.buffer().capacity();
         let queued_frames = (capacity - producer.slots()) / CHANNELS;
         let queued_secs = queued_frames as f64 / device_rate as f64 * speed;
-        let position = (cur.decoder.decoded_secs() - queued_secs).max(0.0);
+        let position = (cur.source.decoded_secs() - queued_secs).max(0.0);
         shared
             .position_ms
             .store((position * 1000.0) as u64, Ordering::Relaxed);
@@ -1394,7 +1527,7 @@ fn heard_position(
     let queued_frames = (capacity - producer.slots()) / CHANNELS;
     let speed = f64::from(shared.speed_millis.load(Ordering::Relaxed) as u32) / 1000.0;
     let queued_secs = queued_frames as f64 / device_rate as f64 * speed.max(0.05);
-    (voice.decoder.decoded_secs() - queued_secs).max(0.0)
+    (voice.source.decoded_secs() - queued_secs).max(0.0)
 }
 
 /// Render one block of pure tail: silence through the effect chain, so only

@@ -12,6 +12,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import AppSlider from "../AppSlider.vue";
+import EqPresetSelect from "./EqPresetSelect.vue";
 import { bandResponse, logFrequencies, summedResponse } from "@/lib/eqCurve";
 import { defaultBands, hasGain } from "@/lib/mixer";
 import * as api from "@/lib/api";
@@ -316,6 +317,8 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
           <p class="eq-modal__eyebrow">Equaliser</p>
           <h2 id="eq-modal-title">{{ targetLabel }}</h2>
         </div>
+
+        <EqPresetSelect :eq="eq" @change="emit('change', $event)" />
 
         <label class="eq-modal__power">
           <input
