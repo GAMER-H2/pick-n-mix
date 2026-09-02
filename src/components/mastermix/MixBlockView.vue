@@ -8,9 +8,11 @@
  *
  * Dragging is not handled here: the modal owns it, because a move can cross
  * lanes and a block cannot see its neighbours. This component only reports
- * *what* was grabbed.
+ * *what* was grabbed — including volume keyframes when the automation tool
+ * is armed.
  */
 import { computed, onMounted, ref, watch } from "vue";
+import { MAX_GAIN_DB, MIN_GAIN_DB, automationGainAt } from "@/lib/masterMix";
 import type { MixBlock, MixEntry, Waveform } from "@/lib/types";
 
 const props = defineProps<{
@@ -27,9 +29,20 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "grab", payload: { event: PointerEvent; mode: "move" | "trim-start" | "trim-end" }): void;
+  (
+    e: "automation",
+    payload: {
+      event: PointerEvent;
+      mode: "add" | "move-point" | "curve" | "remove";
+      index?: number;
+      atSecs: number;
+      gainDb: number;
+    },
+  ): void;
 }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
+const overlay = ref<SVGSVGElement | null>(null);
 
 const width = computed(() => Math.max(2, props.block.durationSecs * props.pixelsPerSecond));
 const left = computed(() => props.block.startSecs * props.pixelsPerSecond);
@@ -42,6 +55,125 @@ const missing = computed(() => props.entry !== null && !props.entry.available);
 /** Trim handles get in the way of a blade cut, so they only exist for the
  *  pointer tool. */
 const trimmable = computed(() => props.tool === "select" && width.value > 22);
+const automating = computed(() => props.tool === "automation");
+const showEnvelope = computed(
+  () => automating.value || props.block.automation.length > 0,
+);
+
+function gainToY(gainDb: number, height: number): number {
+  const t = (gainDb - MIN_GAIN_DB) / (MAX_GAIN_DB - MIN_GAIN_DB);
+  return (1 - t) * height;
+}
+
+function pointAt(event: PointerEvent): { atSecs: number; gainDb: number } {
+  const element = overlay.value;
+  if (!element) return { atSecs: 0, gainDb: 0 };
+  const box = element.getBoundingClientRect();
+  const x = event.clientX - box.left;
+  const y = event.clientY - box.top;
+  const atSecs = (x / Math.max(1, box.width)) * props.block.durationSecs;
+  const t = 1 - y / Math.max(1, box.height);
+  const gainDb = MIN_GAIN_DB + t * (MAX_GAIN_DB - MIN_GAIN_DB);
+  return {
+    atSecs: Math.min(props.block.durationSecs, Math.max(0, atSecs)),
+    gainDb: Math.min(MAX_GAIN_DB, Math.max(MIN_GAIN_DB, gainDb)),
+  };
+}
+
+const envelopePoints = computed(() => {
+  const w = width.value;
+  const h = Math.max(1, props.height - 6);
+  const n = Math.max(2, Math.ceil(w / 3));
+  const parts: string[] = [];
+  for (let i = 0; i <= n; i += 1) {
+    const t = i / n;
+    const db = automationGainAt(props.block.automation, t * props.block.durationSecs);
+    parts.push(`${t * w},${gainToY(db, h)}`);
+  }
+  return parts.join(" ");
+});
+
+const zeroY = computed(() => gainToY(0, Math.max(1, props.height - 6)));
+
+const keyframes = computed(() => {
+  const h = Math.max(1, props.height - 6);
+  const w = width.value;
+  const dur = Math.max(props.block.durationSecs, 0.0001);
+  return props.block.automation.map((point, index) => ({
+    index,
+    cx: (point.atSecs / dur) * w,
+    cy: gainToY(point.gainDb, h),
+    point,
+  }));
+});
+
+const curveHandles = computed(() => {
+  const h = Math.max(1, props.height - 6);
+  const w = width.value;
+  const dur = Math.max(props.block.durationSecs, 0.0001);
+  const points = props.block.automation;
+  const handles: { index: number; cx: number; cy: number }[] = [];
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const a = points[i];
+    const b = points[i + 1];
+    const midSecs = (a.atSecs + b.atSecs) / 2;
+    handles.push({
+      index: i,
+      cx: (midSecs / dur) * w,
+      cy: gainToY(automationGainAt(points, midSecs), h),
+    });
+  }
+  return handles;
+});
+
+function onBodyDown(event: PointerEvent) {
+  if (automating.value) return;
+  emit("grab", { event, mode: "move" });
+}
+
+function onOverlayDown(event: PointerEvent) {
+  if (!automating.value || event.button !== 0) return;
+  const at = pointAt(event);
+  emit("automation", { event, mode: "add", atSecs: at.atSecs, gainDb: at.gainDb });
+}
+
+function onPointDown(event: PointerEvent, index: number) {
+  if (!automating.value || event.button !== 0) return;
+  event.stopPropagation();
+  const at = pointAt(event);
+  emit("automation", {
+    event,
+    mode: "move-point",
+    index,
+    atSecs: at.atSecs,
+    gainDb: at.gainDb,
+  });
+}
+
+function onPointRemove(event: MouseEvent, index: number) {
+  if (!automating.value) return;
+  event.stopPropagation();
+  emit("automation", {
+    event: event as unknown as PointerEvent,
+    mode: "remove",
+    index,
+    atSecs: 0,
+    gainDb: 0,
+  });
+}
+
+function onCurveDown(event: PointerEvent, index: number) {
+  if (!automating.value || event.button !== 0) return;
+  event.stopPropagation();
+  const at = pointAt(event);
+  emit("automation", {
+    event,
+    mode: "curve",
+    index,
+    atSecs: at.atSecs,
+    gainDb: at.gainDb,
+  });
+}
 
 function draw() {
   const element = canvas.value;
@@ -64,21 +196,20 @@ function draw() {
 
   ctx.fillStyle = `hsl(${props.hue} 70% 26% / 0.8)`;
   const middle = cssHeight / 2;
-  const from = props.block.offsetSecs;
-  const secondsPerPixel = props.block.durationSecs / cssWidth;
+  const fromPeak = Math.floor(props.block.offsetSecs * waveform.peaksPerSec);
+  const loopPeaks = Math.max(0, waveform.peaks.length - fromPeak);
+  const peaksPerPixel = (props.block.durationSecs * waveform.peaksPerSec) / cssWidth;
 
-  // One column per pixel, taking the loudest peak the column spans. Zoomed
-  // out that is many peaks per column, which is exactly what keeps a
-  // transient visible instead of averaging it away.
+  // Timeline peaks beyond EOF wrap to the block's offset. This mirrors the
+  // audio source, so extending a region shows each repeated pass explicitly.
   for (let x = 0; x < cssWidth; x += 1) {
-    const startPeak = Math.floor((from + x * secondsPerPixel) * waveform.peaksPerSec);
-    const endPeak = Math.max(
-      startPeak + 1,
-      Math.floor((from + (x + 1) * secondsPerPixel) * waveform.peaksPerSec),
-    );
+    const startPeak = Math.floor(x * peaksPerPixel);
+    const endPeak = Math.max(startPeak + 1, Math.floor((x + 1) * peaksPerPixel));
     let peak = 0;
-    for (let i = Math.max(0, startPeak); i < endPeak && i < waveform.peaks.length; i += 1) {
-      peak = Math.max(peak, waveform.peaks[i]);
+    if (loopPeaks > 0) {
+      for (let i = startPeak; i < endPeak; i += 1) {
+        peak = Math.max(peak, waveform.peaks[fromPeak + (i % loopPeaks)] ?? 0);
+      }
     }
     if (peak === 0) continue;
     const half = (peak / 255) * middle;
@@ -103,10 +234,15 @@ watch(
 <template>
   <div
     class="block"
-    :class="{ 'is-selected': selected, 'is-missing': missing, 'is-blade': tool === 'blade' }"
+    :class="{
+      'is-selected': selected,
+      'is-missing': missing,
+      'is-blade': tool === 'blade',
+      'is-auto': automating,
+    }"
     :style="{ left: `${left}px`, width: `${width}px`, '--lane-hue': hue }"
     :title="label"
-    @pointerdown.stop="emit('grab', { event: $event, mode: 'move' })"
+    @pointerdown.stop="onBodyDown"
   >
     <div class="block__label">{{ label }}</div>
     <canvas ref="canvas" class="block__wave" />
@@ -123,6 +259,46 @@ watch(
       class="block__fade block__fade--out"
       :style="{ width: `${block.fadeOutSecs * pixelsPerSecond}px` }"
     />
+
+    <svg
+      v-if="showEnvelope"
+      ref="overlay"
+      class="block__auto"
+      :class="{ 'is-live': automating }"
+      :viewBox="`0 0 ${width} ${Math.max(1, height - 6)}`"
+      preserveAspectRatio="none"
+      @pointerdown.stop="onOverlayDown"
+    >
+      <line
+        class="block__auto-zero"
+        x1="0"
+        :y1="zeroY"
+        :x2="width"
+        :y2="zeroY"
+      />
+      <polyline class="block__auto-line" :points="envelopePoints" />
+      <template v-if="automating">
+        <circle
+          v-for="handle in curveHandles"
+          :key="`c${handle.index}`"
+          class="block__auto-curve"
+          :cx="handle.cx"
+          :cy="handle.cy"
+          r="3.5"
+          @pointerdown.stop="onCurveDown($event, handle.index)"
+        />
+        <circle
+          v-for="key in keyframes"
+          :key="`k${key.index}`"
+          class="block__auto-point"
+          :cx="key.cx"
+          :cy="key.cy"
+          r="5"
+          @pointerdown.stop="onPointDown($event, key.index)"
+          @dblclick.stop="onPointRemove($event, key.index)"
+        />
+      </template>
+    </svg>
 
     <template v-if="trimmable">
       <div
@@ -154,6 +330,10 @@ watch(
 }
 
 .block.is-blade {
+  cursor: crosshair;
+}
+
+.block.is-auto {
   cursor: crosshair;
 }
 
@@ -214,6 +394,49 @@ watch(
 .block__fade--out {
   right: 0;
   background: linear-gradient(to left, var(--bg) 0%, transparent 100%);
+}
+
+.block__auto {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.block__auto.is-live {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+.block__auto-zero {
+  stroke: hsl(var(--lane-hue) 70% 16% / 0.35);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.block__auto-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.block__auto-point {
+  fill: var(--bg-elevated);
+  stroke: hsl(var(--lane-hue) 80% 16%);
+  stroke-width: 1.5;
+  cursor: grab;
+  vector-effect: non-scaling-stroke;
+}
+
+.block__auto-curve {
+  fill: hsl(var(--lane-hue) 70% 30%);
+  stroke: hsl(var(--lane-hue) 80% 16%);
+  stroke-width: 1;
+  cursor: ns-resize;
+  vector-effect: non-scaling-stroke;
 }
 
 .block__handle {

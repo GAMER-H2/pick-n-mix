@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use crate::audio::decode::{StreamInfo, TrackDecoder};
@@ -52,7 +52,8 @@ pub struct PlanBlock {
     /// evaluated per frame.
     pub block: Block,
     /// The lane's gain, folded in as a constant. Mute and solo are resolved
-    /// when the plan is built: a silent lane simply contributes no blocks.
+    /// when the plan is built; silent lanes stay in the plan to preserve its
+    /// duration, but their files are never opened.
     pub lane_gain: f32,
     pub settings: Arc<Resolved>,
     /// Replay-gain normalisation for the underlying file.
@@ -91,7 +92,8 @@ struct OpenRequest {
     generation: u64,
     block_ix: usize,
     path: PathBuf,
-    seek_secs: f64,
+    offset_secs: f64,
+    into_block_secs: f64,
     rate: u32,
     /// The timeline frame this decoder's first sample belongs to.
     enter_frame: u64,
@@ -251,6 +253,16 @@ impl TimelineSource {
         Ok(frames * CHANNELS)
     }
 
+    /// Like [`read`], but waits for any file that should already be open.
+    ///
+    /// Real-time playback can afford to miss a late open and fade the block in;
+    /// a bounce cannot, or the exported file would drop the start of every song.
+    pub fn read_offline(&mut self, out: &mut [f32]) -> Result<usize> {
+        self.request_openings();
+        self.wait_pending()?;
+        self.read(out)
+    }
+
     fn ensure_capacity(&mut self, frames: usize) {
         if self.interleaved.len() < frames * CHANNELS {
             self.interleaved.resize(frames * CHANNELS, 0.0);
@@ -265,54 +277,83 @@ impl TimelineSource {
     /// Take delivery of any files the opener has finished with.
     fn collect_ready(&mut self) {
         while let Ok(ready) = self.ready_rx.try_recv() {
-            if ready.generation != self.generation {
-                continue;
-            }
-            self.pending.remove(&ready.block_ix);
-            let Some(mut decoder) = ready.decoder else {
-                // Unreadable — a file deleted since the mix was built, say.
-                // The rest of the mix plays; only this block is missing.
-                self.finished.insert(ready.block_ix);
-                continue;
-            };
-            if self.active.len() >= MAX_VOICES {
-                self.finished.insert(ready.block_ix);
-                continue;
-            }
-            // Late arrivals are nudged forward rather than dragging the
-            // timeline back: the mix keeps time, this block just joins late.
-            let mut next_frame = ready.enter_frame;
-            if self.cursor > next_frame {
-                let behind = (self.cursor - next_frame) as f64 / self.rate as f64;
-                if behind > MAX_CATCH_UP_SECS {
-                    let target = decoder.decoded_secs() + behind;
-                    if decoder.seek(target).is_err() {
-                        self.finished.insert(ready.block_ix);
-                        continue;
-                    }
-                } else if self.discard(&mut decoder, behind).is_err() {
-                    self.finished.insert(ready.block_ix);
-                    continue;
-                }
-                next_frame = self.cursor;
-            }
-            let chain_ix = self.take_chain();
-            self.active.push(Active {
-                block_ix: ready.block_ix,
-                decoder,
-                chain_ix,
-                next_frame,
-            });
+            self.apply_ready(ready);
         }
+    }
+
+    fn wait_pending(&mut self) -> Result<()> {
+        while !self.pending.is_empty() {
+            let ready = self
+                .ready_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .map_err(|_| anyhow!("timed out opening a mix block"))?;
+            self.apply_ready(ready);
+        }
+        Ok(())
+    }
+
+    fn apply_ready(&mut self, ready: Opened) {
+        if ready.generation != self.generation {
+            return;
+        }
+        self.pending.remove(&ready.block_ix);
+        let Some(mut decoder) = ready.decoder else {
+            // Unreadable — a file deleted since the mix was built, say.
+            // The rest of the mix plays; only this block is missing.
+            self.finished.insert(ready.block_ix);
+            return;
+        };
+        if self.active.len() >= MAX_VOICES {
+            self.finished.insert(ready.block_ix);
+            return;
+        }
+        // Late arrivals are nudged forward rather than dragging the
+        // timeline back: the mix keeps time, this block just joins late.
+        let mut next_frame = ready.enter_frame;
+        if self.cursor > next_frame {
+            let behind = (self.cursor - next_frame) as f64 / self.rate as f64;
+            if behind > MAX_CATCH_UP_SECS {
+                let plan_block = &self.plan.blocks[ready.block_ix];
+                let into_block = self.decoded_secs() - plan_block.block.start_secs;
+                let target = looped_source_secs(
+                    plan_block.block.offset_secs,
+                    into_block,
+                    decoder.info.duration_secs,
+                );
+                if decoder.seek(target).is_err() {
+                    self.finished.insert(ready.block_ix);
+                    return;
+                }
+            } else {
+                let loop_start = self.plan.blocks[ready.block_ix].block.offset_secs;
+                if self.discard(&mut decoder, behind, loop_start).is_err() {
+                    self.finished.insert(ready.block_ix);
+                    return;
+                }
+            }
+            next_frame = self.cursor;
+        }
+        let chain_ix = self.take_chain();
+        self.active.push(Active {
+            block_ix: ready.block_ix,
+            decoder,
+            chain_ix,
+            next_frame,
+        });
     }
 
     /// Read and throw away `secs` of audio, so a decoder that opened slowly
     /// lines up with the timeline again without an expensive seek.
-    fn discard(&mut self, decoder: &mut TrackDecoder, secs: f64) -> Result<()> {
+    fn discard(
+        &mut self,
+        decoder: &mut TrackDecoder,
+        secs: f64,
+        loop_start_secs: f64,
+    ) -> Result<()> {
         let mut left = (secs * self.rate as f64) as usize * CHANNELS;
         while left > 0 {
             let take = left.min(self.interleaved.len().max(CHANNELS));
-            let got = decoder.read(&mut self.interleaved[..take])?;
+            let got = decoder.read_looping(&mut self.interleaved[..take], loop_start_secs)?;
             if got == 0 {
                 break;
             }
@@ -331,6 +372,9 @@ impl TimelineSource {
             if plan_block.block.start_secs > horizon {
                 // Sorted by start time, so nothing after this is due either.
                 break;
+            }
+            if plan_block.lane_gain <= 0.0 {
+                continue;
             }
             if self.active.len() + self.pending.len() >= MAX_VOICES {
                 break;
@@ -352,7 +396,8 @@ impl TimelineSource {
                 generation: self.generation,
                 block_ix,
                 path: plan_block.path.clone(),
-                seek_secs: plan_block.block.offset_secs + into_block,
+                offset_secs: plan_block.block.offset_secs,
+                into_block_secs: into_block,
                 rate: self.rate,
                 enter_frame: frame_of(enter_secs, self.rate),
             });
@@ -387,7 +432,10 @@ impl TimelineSource {
 
             let got = {
                 let voice = &mut self.active[slot];
-                voice.decoder.read(&mut self.interleaved[..count * CHANNELS])?
+                voice.decoder.read_looping(
+                    &mut self.interleaved[..count * CHANNELS],
+                    plan_block.block.offset_secs,
+                )?
             };
             let got_frames = got / CHANNELS;
             for f in 0..count {
@@ -470,13 +518,27 @@ fn frame_of(secs: f64, rate: u32) -> u64 {
     (secs.max(0.0) * rate as f64).round() as u64
 }
 
+/// Source position for elapsed block time, repeating the slice from offset to EOF.
+fn looped_source_secs(offset_secs: f64, into_block_secs: f64, source_duration_secs: f64) -> f64 {
+    let loop_secs = source_duration_secs - offset_secs;
+    if !loop_secs.is_finite() || loop_secs <= 0.0 {
+        return offset_secs.max(0.0);
+    }
+    offset_secs.max(0.0) + into_block_secs.max(0.0) % loop_secs
+}
+
 /// Opens files for the timeline, off the DSP thread.
 fn opener(requests: Receiver<OpenRequest>, ready: Sender<Opened>) {
     for request in requests.iter() {
         let opened = TrackDecoder::open(&request.path, request.rate)
             .and_then(|mut decoder| {
-                if request.seek_secs > 0.0 {
-                    decoder.seek(request.seek_secs)?;
+                let seek_secs = looped_source_secs(
+                    request.offset_secs,
+                    request.into_block_secs,
+                    decoder.info.duration_secs,
+                );
+                if seek_secs > 0.0 {
+                    decoder.seek(seek_secs)?;
                 }
                 Ok(decoder)
             })
@@ -555,6 +617,18 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_lane_keeps_its_duration_without_opening_a_voice() {
+        let mut block = plan_block(0.0, 5.0);
+        block.lane_gain = 0.0;
+        let mut source = TimelineSource::new(Plan::new(vec![block]), 48_000);
+
+        source.request_openings();
+
+        assert!(source.pending.is_empty());
+        assert_eq!(source.info().duration_secs, 5.0);
+    }
+
+    #[test]
     fn a_gap_in_the_arrangement_is_silence_rather_than_the_end() {
         let rate = 48_000;
         // Nothing until 10 s in: reads across the gap must keep returning
@@ -581,6 +655,19 @@ mod tests {
     }
 
     #[test]
+    fn source_time_repeats_from_the_offset_after_eof() {
+        assert!((looped_source_secs(2.0, 0.0, 10.0) - 2.0).abs() < 1e-9);
+        assert!((looped_source_secs(2.0, 7.0, 10.0) - 9.0).abs() < 1e-9);
+        assert!((looped_source_secs(2.0, 8.0, 10.0) - 2.0).abs() < 1e-9);
+        assert!((looped_source_secs(2.0, 19.0, 10.0) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_offset_at_eof_has_no_invalid_loop_span() {
+        assert_eq!(looped_source_secs(10.0, 20.0, 10.0), 10.0);
+    }
+
+    #[test]
     fn an_empty_mix_is_immediately_finished() {
         let mut source = TimelineSource::new(Plan::default(), 48_000);
         let mut out = vec![0.0f32; 512 * CHANNELS];
@@ -591,9 +678,7 @@ mod tests {
     #[test]
     fn no_more_than_the_voice_limit_is_ever_opened_at_once() {
         let rate = 48_000;
-        let blocks: Vec<PlanBlock> = (0..MAX_VOICES * 3)
-            .map(|_| plan_block(0.0, 30.0))
-            .collect();
+        let blocks: Vec<PlanBlock> = (0..MAX_VOICES * 3).map(|_| plan_block(0.0, 30.0)).collect();
         let mut source = TimelineSource::new(Plan::new(blocks), rate);
         let mut out = vec![0.0f32; 512 * CHANNELS];
         source.read(&mut out).unwrap();

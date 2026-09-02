@@ -18,10 +18,14 @@ const props = withDefaults(
     ariaLabel?: string;
     /** Formatted readout under the knob. */
     display?: string;
+    /** Values to snap to during normal gestures, such as a centre detent. */
+    detents?: number[];
+    /** Detent reach as a fraction of the knob's full range. */
+    detentRadius?: number;
     size?: number;
     disabled?: boolean;
   }>(),
-  { min: 0, max: 1, size: 46, disabled: false },
+  { min: 0, max: 1, detents: () => [], detentRadius: 0.05, size: 46, disabled: false },
 );
 
 const emit = defineEmits<{ "update:modelValue": [value: number] }>();
@@ -59,7 +63,7 @@ function onPointerMove(event: PointerEvent) {
   if (!dragging.value) return;
   const scale = event.shiftKey ? 4 : 1;
   const delta = ((startY - event.clientY) / (TRAVEL * scale)) * range.value;
-  emit("update:modelValue", clamp(startValue + delta));
+  emit("update:modelValue", snap(clamp(startValue + delta), event.shiftKey));
 }
 
 function onPointerUp(event: PointerEvent) {
@@ -72,7 +76,8 @@ function onWheel(event: WheelEvent) {
   if (props.disabled) return;
   event.preventDefault();
   const scale = event.shiftKey ? 0.002 : 0.01;
-  emit("update:modelValue", clamp(props.modelValue - event.deltaY * scale * range.value));
+  const value = clamp(props.modelValue - event.deltaY * scale * range.value);
+  emit("update:modelValue", snap(value, event.shiftKey));
 }
 
 /** Double-click resets to the middle of the range, the usual DAW gesture. */
@@ -83,6 +88,19 @@ function onDoubleClick() {
 
 function clamp(value: number) {
   return Math.min(props.max, Math.max(props.min, value));
+}
+
+function snap(value: number, bypass: boolean): number {
+  if (bypass || props.detents.length === 0) return value;
+  const reach = range.value * props.detentRadius;
+  let nearest: number | null = null;
+  for (const detent of props.detents) {
+    if (detent < props.min || detent > props.max) continue;
+    if (Math.abs(detent - value) <= reach && (nearest === null || Math.abs(detent - value) < Math.abs(nearest - value))) {
+      nearest = detent;
+    }
+  }
+  return nearest ?? value;
 }
 </script>
 

@@ -198,7 +198,7 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                         // A master mix ends where its arrangement ends. There
                         // is no queue to advance into, but the editor does
                         // need to know the playhead has stopped.
-                        if state.master_mix_previewing() {
+                        if state.master_mix_playing() {
                             state.engine.pause();
                             let _ = app.emit("playing-changed", false);
                             let _ = app.emit("master-mix-ended", ());
@@ -366,7 +366,6 @@ fn spawn_ticker(app: tauri::AppHandle) {
                     snapshot.playing,
                     snapshot.position_secs,
                 );
-
             }
         })
         .ok();
@@ -578,8 +577,14 @@ pub fn run() {
             commands::set_master_mix_enabled,
             commands::reset_master_mix,
             commands::entry_waveform,
+            commands::begin_master_mix_session,
+            commands::end_master_mix_session,
             commands::play_master_mix,
+            commands::set_master_mix_playing,
             commands::stop_master_mix,
+            commands::import_mix_asset,
+            commands::asset_waveform,
+            commands::bounce_master_mix,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Pick n Mix");

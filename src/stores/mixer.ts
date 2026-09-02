@@ -14,7 +14,9 @@ export type Target =
   | { kind: "global" }
   | { kind: "playlist"; id: string; name: string }
   /** One entry of one playlist. `index` addresses it inside the file. */
-  | { kind: "entry"; playlistId: string; index: number; name: string };
+  | { kind: "entry"; playlistId: string; index: number; name: string }
+  /** One audio block on a playlist's master mix timeline. */
+  | { kind: "block"; playlistId: string; blockId: string; name: string };
 
 export const useMixerStore = defineStore("mixer", () => {
   const global = ref<MixerSettings>({});
@@ -42,6 +44,8 @@ export const useMixerStore = defineStore("mixer", () => {
       case "playlist":
         return target.value.name;
       case "entry":
+        return target.value.name;
+      case "block":
         return target.value.name;
     }
   });
@@ -114,6 +118,20 @@ export const useMixerStore = defineStore("mixer", () => {
     underlyingLayers.value = [global.value, playlistMixer ?? {}];
   }
 
+  /** Effects for one block on the master mix, layered over global + playlist. */
+  async function editMixBlock(
+    playlistId: string,
+    blockId: string,
+    name: string,
+    mixer: MixerSettings | null,
+    playlistMixer: MixerSettings | null = null,
+  ) {
+    await refresh();
+    target.value = { kind: "block", playlistId, blockId, name };
+    targetLayer.value = mixer ? clone(mixer) : {};
+    underlyingLayers.value = [global.value, playlistMixer ?? {}];
+  }
+
   /** Write a whole section into the layer being edited, then persist. */
   async function setSection<K extends Section>(section: K, value: MixerSettings[K]) {
     targetLayer.value = { ...targetLayer.value, [section]: value };
@@ -159,6 +177,14 @@ export const useMixerStore = defineStore("mixer", () => {
           Object.keys(layer).length ? layer : null,
         );
         break;
+      case "block": {
+        const { useMasterMixStore } = await import("./masterMix");
+        useMasterMixStore().setBlockMixer(
+          target.value.blockId,
+          Object.keys(layer).length ? layer : null,
+        );
+        break;
+      }
     }
   }
 
@@ -167,7 +193,13 @@ export const useMixerStore = defineStore("mixer", () => {
     const settings = clone(preset.settings);
     // A crossfade spans playlist entries, so an entry preset may not introduce
     // one even if that preset carries a crossfade setting.
-    if (target.value.kind === "entry") delete settings.crossfade;
+    if (target.value.kind === "entry" || target.value.kind === "block") delete settings.crossfade;
+    // Timeline voices do not currently schedule varispeed or atmosphere beds.
+    // Do not persist controls that the selected audio block cannot render.
+    if (target.value.kind === "block") {
+      delete settings.pitch;
+      delete settings.filters;
+    }
     targetLayer.value = { ...targetLayer.value, ...settings, preset: preset.name };
     await persist();
   }
@@ -221,6 +253,7 @@ export const useMixerStore = defineStore("mixer", () => {
     editGlobal,
     editPlaylist,
     editPlaylistEntry,
+    editMixBlock,
     setSection,
     clearSection,
     setEnabled,

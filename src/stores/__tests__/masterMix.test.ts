@@ -9,7 +9,10 @@ const setMasterMix = vi.fn();
 const setMasterMixEnabled = vi.fn();
 const resetMasterMix = vi.fn();
 const entryWaveform = vi.fn();
+const beginMasterMixSession = vi.fn();
+const endMasterMixSession = vi.fn();
 const playMasterMix = vi.fn();
+const setMasterMixPlaying = vi.fn();
 const stopMasterMix = vi.fn();
 
 vi.mock("@/lib/api", () => ({
@@ -18,8 +21,14 @@ vi.mock("@/lib/api", () => ({
   setMasterMixEnabled: (...args: unknown[]) => setMasterMixEnabled(...args),
   resetMasterMix: (...args: unknown[]) => resetMasterMix(...args),
   entryWaveform: (...args: unknown[]) => entryWaveform(...args),
+  beginMasterMixSession: (...args: unknown[]) => beginMasterMixSession(...args),
+  endMasterMixSession: (...args: unknown[]) => endMasterMixSession(...args),
   playMasterMix: (...args: unknown[]) => playMasterMix(...args),
+  setMasterMixPlaying: (...args: unknown[]) => setMasterMixPlaying(...args),
   stopMasterMix: (...args: unknown[]) => stopMasterMix(...args),
+  assetWaveform: vi.fn(),
+  importMixAsset: vi.fn(),
+  bounceMasterMix: vi.fn(),
 }));
 
 function mix(): MasterMix {
@@ -58,7 +67,14 @@ function view(overrides: Partial<MasterMixView> = {}): MasterMixView {
     playlistName: "Evening",
     mix: mix(),
     entries: [
-      { index: 0, title: "Song", artist: "Artist", artworkId: null, durationSecs: 100, available: true },
+      {
+        index: 0,
+        title: "Song",
+        artist: "Artist",
+        artworkId: null,
+        durationSecs: 100,
+        available: true,
+      },
     ],
     durationSecs: 100,
     saved: true,
@@ -72,13 +88,23 @@ describe("master mix store", () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
     masterMix.mockResolvedValue(view());
-    setMasterMix.mockImplementation(async (_id: string, sent: MasterMix) => view({ mix: sent }));
-    setMasterMixEnabled.mockImplementation(async (_id: string, enabled: boolean) =>
-      view({ mix: { ...mix(), enabled } }),
+    setMasterMix.mockImplementation(async (_id: string, sent: MasterMix) =>
+      view({ mix: sent }),
+    );
+    setMasterMixEnabled.mockImplementation(
+      async (_id: string, enabled: boolean) =>
+        view({ mix: { ...mix(), enabled } }),
     );
     resetMasterMix.mockResolvedValue(view());
-    entryWaveform.mockResolvedValue({ peaks: [1, 2, 3], peaksPerSec: 25, durationSecs: 100 });
+    entryWaveform.mockResolvedValue({
+      peaks: [1, 2, 3],
+      peaksPerSec: 25,
+      durationSecs: 100,
+    });
+    beginMasterMixSession.mockResolvedValue("session-1");
+    endMasterMixSession.mockResolvedValue(true);
     playMasterMix.mockResolvedValue(100);
+    setMasterMixPlaying.mockImplementation(async (playing: boolean) => playing);
     stopMasterMix.mockResolvedValue(undefined);
   });
 
@@ -89,6 +115,10 @@ describe("master mix store", () => {
     expect(store.playlistName).toBe("Evening");
     expect(store.mix.lanes).toHaveLength(1);
     expect(store.duration).toBe(100);
+    expect(beginMasterMixSession).toHaveBeenCalledTimes(1);
+    expect(beginMasterMixSession.mock.invocationCallOrder[0]).toBeLessThan(
+      masterMix.mock.invocationCallOrder[0],
+    );
   });
 
   it("surfaces a load failure instead of showing an empty timeline", async () => {
@@ -150,6 +180,8 @@ describe("master mix store", () => {
 
     await store.close();
     expect(setMasterMix).toHaveBeenCalledTimes(1);
+    expect(endMasterMixSession).toHaveBeenCalledWith("session-1");
+    expect(stopMasterMix).not.toHaveBeenCalled();
     expect(store.open).toBe(false);
   });
 
@@ -159,10 +191,71 @@ describe("master mix store", () => {
     store.commit(moveBlock(store.mix, "a", 30));
 
     await store.play(12);
-    expect(playMasterMix).toHaveBeenCalledWith("pl_1", store.mix, 12);
-    expect(playMasterMix.mock.calls[0][1].lanes[0].blocks[0].startSecs).toBe(30);
+    expect(playMasterMix).toHaveBeenCalledWith(
+      "pl_1",
+      store.mix,
+      12,
+      "session-1",
+    );
+    expect(playMasterMix.mock.calls[0][1].lanes[0].blocks[0].startSecs).toBe(
+      30,
+    );
     expect(store.previewing).toBe(true);
     await vi.runAllTimersAsync();
+  });
+
+  it("pauses and resumes an audition without replacing its timeline", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(12);
+
+    await store.pause();
+    expect(setMasterMixPlaying).toHaveBeenLastCalledWith(false, "session-1");
+    expect(store.previewing).toBe(true);
+    expect(store.previewPaused).toBe(true);
+
+    await store.resume();
+    expect(setMasterMixPlaying).toHaveBeenLastCalledWith(true, "session-1");
+    expect(playMasterMix).toHaveBeenCalledTimes(1);
+    expect(store.previewPaused).toBe(false);
+  });
+
+  it("keeps the absolute playhead while rebuilding a preview", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(24);
+    store.playhead = 24;
+    playMasterMix.mockImplementationOnce(async () => {
+      store.playhead = 0;
+      return 100;
+    });
+
+    await store.reloadPreview();
+
+    expect(playMasterMix).toHaveBeenLastCalledWith(
+      "pl_1",
+      store.mix,
+      24,
+      "session-1",
+    );
+    expect(store.playhead).toBe(24);
+  });
+
+  it("ignores a play completion after close has restored the session", async () => {
+    let finishPlay!: () => void;
+    playMasterMix.mockImplementationOnce(
+      () => new Promise<number>((resolve) => (finishPlay = () => resolve(100))),
+    );
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+
+    const playing = store.play(10);
+    await store.close();
+    finishPlay();
+    await playing;
+
+    expect(endMasterMixSession).toHaveBeenCalledWith("session-1");
+    expect(store.previewing).toBe(false);
   });
 
   it("stops auditioning when the engine says the mix has run out", async () => {
@@ -180,6 +273,18 @@ describe("master mix store", () => {
     expect(stopMasterMix).not.toHaveBeenCalled();
   });
 
+  it("stop silences the audition without ending and restoring the modal session", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(8);
+
+    await store.stop();
+
+    expect(stopMasterMix).toHaveBeenCalledWith("session-1");
+    expect(endMasterMixSession).not.toHaveBeenCalled();
+    expect(store.previewing).toBe(false);
+  });
+
   it("fetches each song's waveform once", async () => {
     const store = useMasterMixStore();
     await store.openFor("pl_1");
@@ -189,13 +294,21 @@ describe("master mix store", () => {
     expect(store.waveforms[0].peaks).toEqual([1, 2, 3]);
   });
 
-  it("keeps zoom inside usable limits", async () => {
+  it("keeps horizontal and vertical zoom inside usable limits", async () => {
     const store = useMasterMixStore();
     await store.openFor("pl_1");
-    for (let i = 0; i < 50; i += 1) store.zoom(2);
+    for (let i = 0; i < 50; i += 1) {
+      store.zoom(2);
+      store.zoomTracks(2);
+    }
     expect(store.pixelsPerSecond).toBeLessThanOrEqual(400);
-    for (let i = 0; i < 100; i += 1) store.zoom(0.5);
+    expect(store.laneHeight).toBeLessThanOrEqual(180);
+    for (let i = 0; i < 100; i += 1) {
+      store.zoom(0.5);
+      store.zoomTracks(0.5);
+    }
     expect(store.pixelsPerSecond).toBeGreaterThanOrEqual(0.5);
+    expect(store.laneHeight).toBeGreaterThanOrEqual(48);
   });
 
   it("reports a failed save without throwing away the edit", async () => {

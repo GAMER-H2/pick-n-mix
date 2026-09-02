@@ -38,6 +38,16 @@ describe("mixer cascade", () => {
     expect(fx.reverb.mix).toBe(0.1);
   });
 
+  it("cascades panning as one section", () => {
+    const fx = resolve([
+      { panning: { mode: "monoPan", position: -0.5, width: 1 } },
+      {},
+      { panning: { mode: "trueStereo", position: 0.25, width: 0.4 } },
+    ]);
+    expect(fx.panning).toEqual({ mode: "trueStereo", position: 0.25, width: 0.4 });
+    expect(presetSections({ panning: fx.panning })).toContain("panning");
+  });
+
   it("allows a playlist crossfade but ignores an entry crossfade", () => {
     const fx = resolve([
       { crossfade: { lengthSecs: 1, curve: { ...symmetricCurve(1) } } },
@@ -50,6 +60,7 @@ describe("mixer cascade", () => {
   it("fills in defaults when no layer mentions a section", () => {
     const fx = resolve([]);
     expect(fx.enabled).toBe(true);
+    expect(fx.panning).toEqual({ mode: "stereoBalance", position: 0, width: 1 });
     expect(fx.eq.bands).toHaveLength(8);
     expect(fx.reverb.enabled).toBe(false);
     expect(fx.filters).toEqual([]);

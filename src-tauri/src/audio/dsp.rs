@@ -3,7 +3,7 @@
 //! Everything here runs on the DSP worker thread and is allocation-free once
 //! `prepare` has run. Buffers are planar stereo: `[[f32; frames]; 2]`.
 
-use crate::audio::params::{BandKind, EqBand, Resolved};
+use crate::audio::params::{BandKind, EqBand, Panning, PanningMode, Resolved};
 
 pub const CHANNELS: usize = 2;
 
@@ -737,6 +737,91 @@ impl Limiter {
 }
 
 // ---------------------------------------------------------------------------
+// Panning
+// ---------------------------------------------------------------------------
+
+/// A smoothed stereo matrix. Each coefficient glides independently so mode and
+/// position changes cannot introduce discontinuities into either output.
+pub struct PanningMatrix {
+    coefficients: [[Smoothed; CHANNELS]; CHANNELS],
+    initialised: bool,
+}
+
+impl PanningMatrix {
+    pub fn new() -> Self {
+        PanningMatrix {
+            coefficients: [
+                [Smoothed::new(1.0), Smoothed::new(0.0)],
+                [Smoothed::new(0.0), Smoothed::new(1.0)],
+            ],
+            initialised: false,
+        }
+    }
+
+    pub fn prepare(&mut self, sample_rate: f32) {
+        for row in &mut self.coefficients {
+            for coefficient in row {
+                coefficient.prepare(sample_rate, 20.0);
+            }
+        }
+    }
+
+    pub fn update(&mut self, panning: &Panning) {
+        let matrix = Self::matrix(panning);
+        for (row, targets) in self.coefficients.iter_mut().zip(matrix) {
+            for (coefficient, target) in row.iter_mut().zip(targets) {
+                if self.initialised {
+                    coefficient.set_target(target);
+                } else {
+                    coefficient.jump_to(target);
+                }
+            }
+        }
+        self.initialised = true;
+    }
+
+    fn matrix(panning: &Panning) -> [[f32; CHANNELS]; CHANNELS] {
+        let position = panning.position.clamp(-1.0, 1.0);
+        match panning.mode {
+            PanningMode::MonoPan => {
+                let [left, right] = equal_power(position);
+                [[left * 0.5, left * 0.5], [right * 0.5, right * 0.5]]
+            }
+            PanningMode::StereoBalance => {
+                let left = if position > 0.0 { 1.0 - position } else { 1.0 };
+                let right = if position < 0.0 { 1.0 + position } else { 1.0 };
+                [[left, 0.0], [0.0, right]]
+            }
+            PanningMode::TrueStereo => {
+                let width = panning.width.clamp(0.0, 1.0);
+                let [ll, lr] = equal_power((position - width).clamp(-1.0, 1.0));
+                let [rl, rr] = equal_power((position + width).clamp(-1.0, 1.0));
+                [[ll, rl], [lr, rr]]
+            }
+        }
+    }
+
+    pub fn process(&mut self, buf: &mut [Vec<f32>], frames: usize) {
+        for i in 0..frames {
+            let ll = self.coefficients[0][0].next();
+            let lr = self.coefficients[0][1].next();
+            let rl = self.coefficients[1][0].next();
+            let rr = self.coefficients[1][1].next();
+            let left = buf[0][i];
+            let right = buf[1][i];
+            buf[0][i] = ll * left + lr * right;
+            buf[1][i] = rl * left + rr * right;
+        }
+    }
+}
+
+#[inline]
+fn equal_power(position: f32) -> [f32; CHANNELS] {
+    let angle = (position.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    [angle.cos(), angle.sin()]
+}
+
+// ---------------------------------------------------------------------------
 // Chain
 // ---------------------------------------------------------------------------
 
@@ -751,6 +836,7 @@ pub struct Chain {
     pub delay: DelayFx,
     pub reverb: ReverbFx,
     pub lofi: LofiFx,
+    pub panning: PanningMatrix,
     gain: Smoothed,
     bypassed: bool,
 }
@@ -762,6 +848,7 @@ impl Chain {
             delay: DelayFx::new(),
             reverb: ReverbFx::new(),
             lofi: LofiFx::new(),
+            panning: PanningMatrix::new(),
             gain: Smoothed::new(1.0),
             bypassed: false,
         }
@@ -772,6 +859,7 @@ impl Chain {
         self.delay.prepare(sample_rate);
         self.reverb.prepare(sample_rate);
         self.lofi.prepare(sample_rate);
+        self.panning.prepare(sample_rate);
         self.gain.prepare(sample_rate, 25.0);
     }
 
@@ -788,6 +876,7 @@ impl Chain {
         self.delay.update(&settings.delay);
         self.reverb.update(&settings.reverb);
         self.lofi.update(&settings.lofi);
+        self.panning.update(&settings.panning);
 
         let norm_db = if settings.normalisation.enabled {
             track_gain_db + settings.normalisation.gain_db
@@ -807,6 +896,7 @@ impl Chain {
         self.delay.process(buf, frames);
         self.reverb.process(buf, frames);
         self.lofi.process(buf, frames);
+        self.panning.process(buf, frames);
     }
 
     /// This voice's own gain ramp (normalisation plus any manual trim).
@@ -827,7 +917,7 @@ impl Chain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::params::{Eq, Lofi, Normalisation};
+    use crate::audio::params::{Eq, Lofi, Normalisation, Panning, PanningMode};
 
     fn silence(frames: usize) -> Vec<Vec<f32>> {
         vec![vec![0.0; frames]; CHANNELS]
@@ -882,6 +972,79 @@ mod tests {
         let mut buf = vec![vec![0.3f32; 128]; CHANNELS];
         lofi.process(&mut buf, 128);
         assert!((buf[0][127] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn panning_modes_build_the_expected_stereo_matrices() {
+        let cases = [
+            (
+                Panning {
+                    mode: PanningMode::MonoPan,
+                    position: 0.0,
+                    width: 1.0,
+                },
+                [1.0, 0.0],
+                [std::f32::consts::FRAC_1_SQRT_2 * 0.5; 2],
+            ),
+            (
+                Panning {
+                    mode: PanningMode::StereoBalance,
+                    position: 0.25,
+                    width: 1.0,
+                },
+                [1.0, 1.0],
+                [0.75, 1.0],
+            ),
+            (
+                Panning {
+                    mode: PanningMode::TrueStereo,
+                    position: 0.0,
+                    width: 0.0,
+                },
+                [1.0, 0.0],
+                [std::f32::consts::FRAC_1_SQRT_2; 2],
+            ),
+            (
+                Panning {
+                    mode: PanningMode::TrueStereo,
+                    position: 0.0,
+                    width: 1.0,
+                },
+                [0.25, 0.75],
+                [0.25, 0.75],
+            ),
+        ];
+
+        for (panning, input, expected) in cases {
+            let mut node = PanningMatrix::new();
+            node.prepare(48_000.0);
+            node.update(&panning);
+            let mut buf = vec![vec![input[0]], vec![input[1]]];
+            node.process(&mut buf, 1);
+            assert!((buf[0][0] - expected[0]).abs() < 1e-6, "{panning:?}");
+            assert!((buf[1][0] - expected[1]).abs() < 1e-6, "{panning:?}");
+        }
+    }
+
+    #[test]
+    fn first_panning_update_jumps_and_later_updates_are_smoothed() {
+        let mut node = PanningMatrix::new();
+        node.prepare(48_000.0);
+        node.update(&Panning {
+            mode: PanningMode::StereoBalance,
+            position: 1.0,
+            width: 1.0,
+        });
+        let mut first = vec![vec![1.0], vec![1.0]];
+        node.process(&mut first, 1);
+        assert_eq!(first[0][0], 0.0);
+        assert_eq!(first[1][0], 1.0);
+
+        node.update(&Panning::default());
+        let mut next = vec![vec![1.0], vec![1.0]];
+        node.process(&mut next, 1);
+        assert!(next[0][0] > 0.0 && next[0][0] < 1.0);
+        assert_eq!(next[1][0], 1.0);
     }
 
     #[test]

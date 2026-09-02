@@ -1,6 +1,8 @@
 Small Tasks:
 - Atmospheres shaders need more refinement (human task, all agents ignore)
-- Add panning to mixer
+- Get rid of the mp3 encoder with a weird license, use ffmpeg detection for mp3 encoder support
+- Playback in the master mixer is conflicting with the main player. The main player needs to be completely disabled when the master mixer is open for consistent playback.
+- Spacebar should pause playback in the master mixer, not stop it, that's button only
 
 Medium Tasks:
 - Duplicate song handling - (working but needs some refinement as there are a lot of true negatives)

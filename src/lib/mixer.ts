@@ -17,6 +17,7 @@ import type {
   Lofi,
   MixerSettings,
   Normalisation,
+  Panning,
   Pitch,
   ResolvedMixer,
   Reverb,
@@ -60,6 +61,7 @@ export function defaultBands(): EqBand[] {
 
 export const DEFAULTS = {
   pitch: (): Pitch => ({ semitones: 0, cents: 0 }),
+  panning: (): Panning => ({ mode: "stereoBalance", position: 0, width: 1 }),
   eq: (): Eq => ({ enabled: true, preampDb: 0, bands: defaultBands() }),
   reverb: (): Reverb => ({
     enabled: false,
@@ -94,6 +96,7 @@ export type Section = keyof typeof DEFAULTS;
 
 export const SECTIONS: Section[] = [
   "pitch",
+  "panning",
   "eq",
   "reverb",
   "delay",
@@ -124,6 +127,7 @@ export function resolve(layers: (MixerSettings | null | undefined)[]): ResolvedM
   return {
     enabled: merged.enabled ?? true,
     pitch: (merged.pitch as Pitch) ?? DEFAULTS.pitch(),
+    panning: (merged.panning as Panning) ?? DEFAULTS.panning(),
     eq: (merged.eq as Eq) ?? DEFAULTS.eq(),
     reverb: (merged.reverb as Reverb) ?? DEFAULTS.reverb(),
     delay: (merged.delay as Delay) ?? DEFAULTS.delay(),

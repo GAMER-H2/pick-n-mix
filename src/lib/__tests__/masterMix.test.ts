@@ -1,16 +1,25 @@
 import { describe, expect, it } from "vitest";
 import {
   MIN_BLOCK_SECS,
+  addAutomationPoint,
   addLane,
+  automationGainAt,
   blockEnd,
   cloneMix,
+  curveFromMidGain,
   deleteBlocks,
+  duplicateBlocks,
   locate,
   mixDuration,
+  moveAutomationPoint,
   moveBlock,
   moveBlocks,
+  placeAsset,
+  removeAutomationPoint,
   removeLane,
   rulerStep,
+  setAutomationCurve,
+  setBlockMixer,
   snapCandidates,
   snapDrag,
   snapTime,
@@ -119,9 +128,9 @@ describe("trimming", () => {
     expect(locate(next, "a")!.block.durationSecs).toBe(60);
   });
 
-  it("dragging the right edge cannot run past the end of the song", () => {
-    const next = trimBlock(mix(), "a", "end", 500, 120);
-    expect(locate(next, "a")!.block.durationSecs).toBe(120);
+  it("dragging the right edge can extend the block for looping", () => {
+    const next = trimBlock(mix(), "a", "end", 500);
+    expect(locate(next, "a")!.block.durationSecs).toBe(500);
   });
 
   it("dragging the left edge keeps the audio under the cursor still", () => {
@@ -253,6 +262,26 @@ describe("housekeeping", () => {
     expect(mixDuration(next)).toBe(0);
   });
 
+  it("duplicates a selection after itself with new IDs and deep-copied data", () => {
+    const before = mix();
+    before.lanes[0].blocks[0].automation = [{ atSecs: 2, gainDb: -4, curve: 1 }];
+    const result = duplicateBlocks(before, ["a"]);
+    const duplicate = locate(result.mix, result.blockIds[0])!.block;
+    expect(duplicate.id).not.toBe("a");
+    expect(duplicate.startSecs).toBe(100);
+    expect(duplicate.source).toEqual(before.lanes[0].blocks[0].source);
+    expect(duplicate.automation).toEqual(before.lanes[0].blocks[0].automation);
+    duplicate.automation[0].gainDb = -20;
+    expect(before.lanes[0].blocks[0].automation[0].gainDb).toBe(-4);
+  });
+
+  it("duplicates several blocks as one relative arrangement", () => {
+    const result = duplicateBlocks(mix(), ["a", "b"]);
+    expect(result.blockIds).toHaveLength(2);
+    expect(locate(result.mix, result.blockIds[0])!.block.startSecs).toBe(180);
+    expect(locate(result.mix, result.blockIds[1])!.block.startSecs).toBe(280);
+  });
+
   it("reports the mix's length as its last ending block", () => {
     expect(mixDuration(mix())).toBe(180);
   });
@@ -277,5 +306,61 @@ describe("housekeeping", () => {
     expect(rulerStep(1)).toBe(120);
     expect(rulerStep(10)).toBe(10);
     expect(rulerStep(200)).toBe(0.5);
+  });
+});
+
+describe("volume automation", () => {
+  it("adds a keyframe and interpolates in dB between two points", () => {
+    let next = addAutomationPoint(mix(), "a", 0, 0);
+    next = addAutomationPoint(next, "a", 10, -12);
+    const points = locate(next, "a")!.block.automation;
+    expect(points).toHaveLength(2);
+    expect(automationGainAt(points, 0)).toBe(0);
+    expect(automationGainAt(points, 10)).toBe(-12);
+    expect(automationGainAt(points, 5)).toBeCloseTo(-6, 5);
+  });
+
+  it("moves a keyframe without sorting so a drag keeps its index", () => {
+    let next = addAutomationPoint(mix(), "a", 2, 0);
+    next = addAutomationPoint(next, "a", 8, -6);
+    next = moveAutomationPoint(next, "a", 0, 9, -3);
+    expect(locate(next, "a")!.block.automation[0].atSecs).toBe(9);
+    expect(locate(next, "a")!.block.automation[0].gainDb).toBe(-3);
+  });
+
+  it("removes a keyframe", () => {
+    let next = addAutomationPoint(mix(), "a", 4, -3);
+    next = removeAutomationPoint(next, "a", 0);
+    expect(locate(next, "a")!.block.automation).toHaveLength(0);
+  });
+
+  it("bends a segment so the midpoint matches the dragged gain", () => {
+    // -3 dB at t=0.5 of a 0	o -12 fade is louder than linear (-6), so the
+    // drop happens late and the curve is greater than one.
+    const curve = curveFromMidGain(0, -12, -3);
+    expect(curve).toBeGreaterThan(1);
+    let next = addAutomationPoint(mix(), "a", 0, 0);
+    next = addAutomationPoint(next, "a", 10, -12);
+    next = setAutomationCurve(next, "a", 0, curve);
+    const mid = automationGainAt(locate(next, "a")!.block.automation, 5);
+    expect(mid).toBeCloseTo(-3, 1);
+  });
+});
+
+describe("imported files and per-block mixer", () => {
+  it("places an imported file on a new lane when asked for one that does not exist", () => {
+    const next = placeAsset(mix(), "riser.wav", 4, 12, 9, "Riser");
+    expect(next.lanes).toHaveLength(3);
+    expect(next.lanes[2].name).toBe("Riser");
+    const block = next.lanes[2].blocks[0];
+    expect(block.source).toEqual({ kind: "asset", file: "riser.wav" });
+    expect(block.startSecs).toBe(12);
+    expect(block.durationSecs).toBe(4);
+  });
+
+  it("writes a mixer override onto one block", () => {
+    const next = setBlockMixer(mix(), "a", { enabled: true, reverb: { enabled: true, mix: 0.4, size: 0.5, damping: 0.5, width: 1, predelayMs: 0 } });
+    expect(locate(next, "a")!.block.mixer?.reverb?.mix).toBe(0.4);
+    expect(locate(mix(), "a")!.block.mixer).toBeNull();
   });
 });

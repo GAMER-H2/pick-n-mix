@@ -160,6 +160,16 @@ export interface Pitch {
   cents: number;
 }
 
+export type PanningMode = "monoPan" | "stereoBalance" | "trueStereo";
+
+export interface Panning {
+  mode: PanningMode;
+  /** Pan or stereo centre, from full left (-1) to full right (1). */
+  position: number;
+  /** Half-width used by true-stereo panning, from mono (0) to full width (1). */
+  width: number;
+}
+
 export interface Reverb {
   enabled: boolean;
   size: number;
@@ -206,6 +216,7 @@ export interface MixerSettings {
   enabled?: boolean | null;
   preset?: string | null;
   pitch?: Pitch | null;
+  panning?: Panning | null;
   eq?: Eq | null;
   reverb?: Reverb | null;
   delay?: Delay | null;
@@ -221,6 +232,7 @@ export interface MixerSettings {
 export interface ResolvedMixer {
   enabled: boolean;
   pitch: Pitch;
+  panning: Panning;
   eq: Eq;
   reverb: Reverb;
   delay: Delay;
@@ -348,6 +360,8 @@ export interface MixLane {
   muted: boolean;
   soloed: boolean;
   gainDb: number;
+  /** Stable optional lane colour; absent/null lets the timeline choose one. */
+  colorHue?: number | null;
   blocks: MixBlock[];
   [extra: string]: unknown;
 }
@@ -388,6 +402,22 @@ export interface Waveform {
   peaks: number[];
   peaksPerSec: number;
   durationSecs: number;
+}
+
+/** A file copied into a playlist's assets folder, ready to become a block. */
+export interface MixAsset {
+  file: string;
+  durationSecs: number;
+}
+
+export type BounceFormat = "wav" | "flac" | "mp3";
+
+export interface BounceOptions {
+  format: BounceFormat;
+  sampleRate: 44100 | 48000 | 96000;
+  wavBitDepth: 16 | 24 | 32;
+  flacCompression: number;
+  mp3Bitrate: 128 | 192 | 256 | 320;
 }
 
 // -- home ---------------------------------------------------------------------

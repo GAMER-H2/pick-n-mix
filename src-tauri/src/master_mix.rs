@@ -442,7 +442,8 @@ impl MasterMix {
                     .sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
             }
 
-            lane.blocks.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
+            lane.blocks
+                .sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
         }
     }
 }
@@ -614,7 +615,10 @@ mod tests {
             .iter()
             .map(|lane| lane.blocks[0].start_secs)
             .collect();
-        assert_eq!(starts, after, "the arrangement is the user's, not the list's");
+        assert_eq!(
+            starts, after,
+            "the arrangement is the user's, not the list's"
+        );
     }
 
     #[test]
@@ -636,7 +640,11 @@ mod tests {
             });
         }
         mix.normalise(1);
-        assert_eq!(mix.lanes[0].blocks.len(), 1, "only the entry block survives");
+        assert_eq!(
+            mix.lanes[0].blocks.len(),
+            1,
+            "only the entry block survives"
+        );
     }
 
     #[test]
@@ -671,9 +679,20 @@ mod tests {
         let mut mix = mix_of(&[10.0]);
         let template = mix.lanes[0].blocks[0].clone();
         mix.lanes[0].blocks = vec![
-            Block { start_secs: 30.0, ..template.clone() },
-            Block { start_secs: 5.0, id: new_id("blk"), ..template.clone() },
-            Block { start_secs: 12.0, id: new_id("blk"), ..template },
+            Block {
+                start_secs: 30.0,
+                ..template.clone()
+            },
+            Block {
+                start_secs: 5.0,
+                id: new_id("blk"),
+                ..template.clone()
+            },
+            Block {
+                start_secs: 12.0,
+                id: new_id("blk"),
+                ..template
+            },
         ];
         mix.normalise(1);
         let starts: Vec<f64> = mix.lanes[0].blocks.iter().map(|b| b.start_secs).collect();
@@ -715,8 +734,16 @@ mod tests {
         let block = Block {
             duration_secs: 10.0,
             automation: vec![
-                AutomationPoint { at_secs: 2.0, gain_db: 0.0, curve: 1.0 },
-                AutomationPoint { at_secs: 6.0, gain_db: -12.0, curve: 1.0 },
+                AutomationPoint {
+                    at_secs: 2.0,
+                    gain_db: 0.0,
+                    curve: 1.0,
+                },
+                AutomationPoint {
+                    at_secs: 6.0,
+                    gain_db: -12.0,
+                    curve: 1.0,
+                },
             ],
             ..Default::default()
         };
@@ -744,6 +771,17 @@ mod tests {
         assert_eq!(back.lanes.len(), 2);
         assert_eq!(back.lanes[1].blocks[0].start_secs, 110.0);
         assert_eq!(back.lanes[0].blocks[0].automation[0].curve, 1.4);
+    }
+
+    #[test]
+    fn a_lane_color_round_trips_as_forward_compatible_metadata() {
+        let json = r#"{
+            "enabled": true,
+            "lanes": [{ "id": "lane_a", "name": "One", "colorHue": 165 }]
+        }"#;
+        let mix: MasterMix = serde_json::from_str(json).unwrap();
+        let round_tripped = serde_json::to_value(&mix).unwrap();
+        assert_eq!(round_tripped["lanes"][0]["colorHue"], 165);
     }
 
     #[test]

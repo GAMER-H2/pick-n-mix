@@ -18,21 +18,31 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
+import AdvancedMixer from "../mixer/AdvancedMixer.vue";
 import MixBlockView from "./MixBlockView.vue";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
+  MAX_GAIN_DB,
+  MIN_GAIN_DB,
   SNAP_PIXELS,
+  addAutomationPoint,
   addLane,
   cloneMix,
+  curveFromMidGain,
   deleteBlocks,
+  duplicateBlocks,
   locate,
   mixDuration,
+  moveAutomationPoint,
   moveBlocks,
+  placeAsset,
+  removeAutomationPoint,
   removeLane,
   rulerStep,
+  setAutomationCurve,
   snapCandidates,
   snapDrag,
   snapTime,
-  sourceDuration,
   splitBlock,
   timecode,
   trimBlock,
@@ -40,16 +50,22 @@ import {
 } from "@/lib/masterMix";
 import { formatDuration } from "@/lib/format";
 import { useMasterMixStore, type Tool } from "@/stores/masterMix";
+import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
+import { usePlaylistStore } from "@/stores/playlists";
 import { useUiStore } from "@/stores/ui";
+import * as api from "@/lib/api";
 import type { MasterMix, MixBlock } from "@/lib/types";
 
 const store = useMasterMixStore();
 const player = usePlayerStore();
+const mixer = useMixerStore();
+const playlists = usePlaylistStore();
 const ui = useUiStore();
+const AUDIO_EXTENSIONS = ["mp3", "flac", "wav"] as const;
 
-const LANE_HEIGHT = 74;
 const HEADER_WIDTH = 190;
+const RULER_HEIGHT = 26;
 /** Blank timeline kept past the end so there is always somewhere to drag to. */
 const TAIL_SECS = 60;
 
@@ -61,7 +77,7 @@ const tools: { id: Tool; icon: "automation" | "blade" | "pointer"; label: string
     id: "automation",
     icon: "automation",
     label: "Volume automation",
-    hint: "Volume keyframes over a block — arrives with the next stage",
+    hint: "Click to add volume keyframes, drag to shape the fade",
   },
   { id: "blade", icon: "blade", label: "Blade", hint: "Click a block to split it in two" },
   { id: "select", icon: "pointer", label: "Pointer", hint: "Select, move and trim blocks" },
@@ -69,9 +85,14 @@ const tools: { id: Tool; icon: "automation" | "blade" | "pointer"; label: string
 
 const mix = computed(() => store.mix);
 const pps = computed(() => store.pixelsPerSecond);
+const laneHeight = computed(() => store.laneHeight);
 const contentSecs = computed(() => Math.max(store.duration, 30) + TAIL_SECS);
 const contentWidth = computed(() => contentSecs.value * pps.value);
 const step = computed(() => rulerStep(pps.value));
+const colorLaneId = ref<string | null>(null);
+const renamingLaneId = ref<string | null>(null);
+const renameValue = ref("");
+const COLOR_HUES = [8, 32, 55, 105, 165, 205, 245, 285, 325] as const;
 
 const ticks = computed(() => {
   const out: { secs: number; label: string }[] = [];
@@ -81,9 +102,10 @@ const ticks = computed(() => {
   return out;
 });
 
-/** A hue per lane, evenly spread, so neighbouring lanes never look alike. */
+/** Use a persisted lane colour when set, otherwise spread defaults apart. */
 function hueFor(laneIndex: number): number {
-  return (laneIndex * 47 + 18) % 360;
+  const saved = Number(mix.value.lanes[laneIndex]?.colorHue);
+  return Number.isFinite(saved) ? ((saved % 360) + 360) % 360 : (laneIndex * 47 + 18) % 360;
 }
 
 function entryFor(block: MixBlock) {
@@ -93,9 +115,11 @@ function entryFor(block: MixBlock) {
 }
 
 function waveformFor(block: MixBlock) {
+  if (block.source.kind === "asset") return store.assetWaveforms[block.source.file] ?? null;
   if (block.source.kind !== "entry") return null;
   return store.waveforms[block.source.index] ?? null;
 }
+
 
 /** Pull in the peaks for every song on the timeline, once the modal is up. */
 function loadVisibleWaveforms() {
@@ -106,10 +130,27 @@ function loadVisibleWaveforms() {
     }
   }
   for (const index of wanted) void store.loadWaveform(index);
+  for (const lane of mix.value.lanes) {
+    for (const block of lane.blocks) {
+      if (block.source.kind === "asset") void store.loadAssetWaveform(block.source.file);
+    }
+  }
 }
 
 watch(() => store.mix.lanes.length, loadVisibleWaveforms);
 watch(() => store.playlistId, loadVisibleWaveforms);
+watch(
+  () => store.selection.join("\u0000"),
+  () => {
+    if (
+      mixer.target.kind === "block" &&
+      mixer.target.playlistId === store.playlistId &&
+      (store.selection.length !== 1 || store.selection[0] !== mixer.target.blockId)
+    ) {
+      mixer.panelOpen = false;
+    }
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -129,7 +170,7 @@ function timeAt(event: PointerEvent | MouseEvent): number {
 // ---------------------------------------------------------------------------
 
 interface Drag {
-  mode: "move" | "trim-start" | "trim-end";
+  mode: "move" | "trim-start" | "trim-end" | "move-point" | "curve";
   blockId: string;
   originX: number;
   originY: number;
@@ -138,6 +179,10 @@ interface Drag {
   origin: MasterMix;
   ids: string[];
   moved: boolean;
+  pointIndex?: number;
+  /** Overlay box at pointer-down, so a drag can leave the block. */
+  overlay?: DOMRect;
+  durationSecs?: number;
 }
 
 const drag = ref<Drag | null>(null);
@@ -199,7 +244,7 @@ function onDragMove(event: PointerEvent) {
   if (current.mode === "move") {
     const wanted = found.block.startSecs + dx / pps.value;
     const snapped = snapDrag(wanted, found.block.durationSecs, candidates, tolerance);
-    const laneDelta = Math.round(dy / LANE_HEIGHT);
+    const laneDelta = Math.round(dy / laneHeight.value);
     store.mix = moveBlocks(current.origin, current.ids, snapped - found.block.startSecs, laneDelta);
     return;
   }
@@ -207,13 +252,7 @@ function onDragMove(event: PointerEvent) {
   const edge = current.mode === "trim-start" ? "start" : "end";
   const anchor = edge === "start" ? found.block.startSecs : found.block.startSecs + found.block.durationSecs;
   const wanted = snapTime(anchor + dx / pps.value, candidates, tolerance);
-  store.mix = trimBlock(
-    current.origin,
-    current.blockId,
-    edge,
-    wanted,
-    sourceDuration(found.block, store.entries),
-  );
+  store.mix = trimBlock(current.origin, current.blockId, edge, wanted);
 }
 
 function onDragEnd() {
@@ -242,6 +281,108 @@ function stopDragListening() {
   window.removeEventListener("pointercancel", onDragCancel);
 }
 
+function onAutomation(
+  payload: {
+    event: PointerEvent;
+    mode: "add" | "move-point" | "curve" | "remove";
+    index?: number;
+    atSecs: number;
+    gainDb: number;
+  },
+  blockId: string,
+) {
+  const { event, mode } = payload;
+  if (mode === "add") {
+    store.commit(addAutomationPoint(mix.value, blockId, payload.atSecs, payload.gainDb));
+    if (!store.selection.includes(blockId)) store.select([blockId]);
+    return;
+  }
+  if (mode === "remove" && payload.index !== undefined) {
+    store.commit(removeAutomationPoint(mix.value, blockId, payload.index));
+    return;
+  }
+  if (payload.index === undefined) return;
+  const found = locate(mix.value, blockId);
+  const overlay = (event.currentTarget as Element | null)?.closest("svg")?.getBoundingClientRect();
+  drag.value = {
+    mode: mode === "curve" ? "curve" : "move-point",
+    blockId,
+    originX: event.clientX,
+    originY: event.clientY,
+    origin: cloneMix(mix.value),
+    ids: [blockId],
+    moved: false,
+    pointIndex: payload.index,
+    overlay,
+    durationSecs: found?.block.durationSecs ?? 0,
+  };
+  (event.target as Element).setPointerCapture?.(event.pointerId);
+  window.addEventListener("pointermove", onAutomationMove);
+  window.addEventListener("pointerup", onAutomationEnd);
+  window.addEventListener("pointercancel", onAutomationCancel);
+}
+
+function gainAtPointer(event: PointerEvent, box: DOMRect): number {
+  const t = 1 - (event.clientY - box.top) / Math.max(1, box.height);
+  return MIN_GAIN_DB + t * (MAX_GAIN_DB - MIN_GAIN_DB);
+}
+
+function onAutomationMove(event: PointerEvent) {
+  const current = drag.value;
+  if (!current || current.pointIndex === undefined || !current.overlay) return;
+  if (current.mode !== "move-point" && current.mode !== "curve") return;
+  current.moved = true;
+  const found = locate(current.origin, current.blockId);
+  if (!found) return;
+  const box = current.overlay;
+  const atSecs = ((event.clientX - box.left) / Math.max(1, box.width)) * (current.durationSecs ?? 0);
+  const gainDb = gainAtPointer(event, box);
+
+  if (current.mode === "move-point") {
+    store.mix = moveAutomationPoint(
+      current.origin,
+      current.blockId,
+      current.pointIndex,
+      atSecs,
+      gainDb,
+    );
+    return;
+  }
+  const points = found.block.automation;
+  const a = points[current.pointIndex];
+  const b = points[current.pointIndex + 1];
+  if (!a || !b) return;
+  store.mix = setAutomationCurve(
+    current.origin,
+    current.blockId,
+    current.pointIndex,
+    curveFromMidGain(a.gainDb, b.gainDb, gainDb),
+  );
+}
+
+function onAutomationEnd() {
+  const current = drag.value;
+  stopAutomationListening();
+  if (!current || (current.mode !== "move-point" && current.mode !== "curve")) return;
+  if (!current.moved) return;
+  const result = mix.value;
+  store.mix = current.origin;
+  store.commit(result);
+}
+
+function onAutomationCancel() {
+  const current = drag.value;
+  stopAutomationListening();
+  if (current) store.mix = current.origin;
+}
+
+function stopAutomationListening() {
+  drag.value = null;
+  window.removeEventListener("pointermove", onAutomationMove);
+  window.removeEventListener("pointerup", onAutomationEnd);
+  window.removeEventListener("pointercancel", onAutomationCancel);
+}
+
 // ---------------------------------------------------------------------------
 // Playhead
 // ---------------------------------------------------------------------------
@@ -261,8 +402,8 @@ function onRulerMove(event: PointerEvent) {
 async function onRulerUp() {
   if (!scrubbing.value) return;
   scrubbing.value = false;
-  // Auditioning follows the playhead, exactly as pressing play here would.
-  if (store.previewing) await store.play(store.playhead);
+  // Auditioning follows the playhead; a paused transport stays paused.
+  if (store.previewing) await store.reloadPreview();
 }
 
 function movePlayhead(event: PointerEvent) {
@@ -281,12 +422,13 @@ watch(
 // Commands
 // ---------------------------------------------------------------------------
 
-async function togglePlay() {
-  if (store.previewing && player.playing) {
-    await player.toggle();
-    return;
-  }
-  await store.play(store.playhead);
+async function play() {
+  if (store.previewing && store.previewPaused) await store.resume();
+  else if (!store.previewing) await store.play(store.playhead);
+}
+
+async function pause() {
+  await store.pause();
 }
 
 async function stop() {
@@ -300,6 +442,41 @@ function deleteSelection() {
   store.select([]);
 }
 
+function duplicateSelection() {
+  const duplicated = duplicateBlocks(mix.value, store.selection);
+  if (duplicated.blockIds.length === 0) return;
+  store.commit(duplicated.mix);
+  store.select(duplicated.blockIds);
+}
+
+function startLaneRename(laneIndex: number) {
+  const lane = mix.value.lanes[laneIndex];
+  renamingLaneId.value = lane.id;
+  renameValue.value = lane.name;
+  void nextTick(() => {
+    const input = dialog.value?.querySelector<HTMLInputElement>(`.mm__lane-name-input[data-lane-id="${lane.id}"]`);
+    input?.focus();
+    input?.select();
+  });
+}
+
+function finishLaneRename(laneIndex: number) {
+  const lane = mix.value.lanes[laneIndex];
+  if (renamingLaneId.value !== lane.id) return;
+  const name = renameValue.value.trim() || `Track ${laneIndex + 1}`;
+  renamingLaneId.value = null;
+  if (name !== lane.name) store.commit(updateLane(mix.value, laneIndex, { name }));
+}
+
+function cancelLaneRename() {
+  renamingLaneId.value = null;
+}
+
+function setLaneColor(laneIndex: number, colorHue: number) {
+  store.commit(updateLane(mix.value, laneIndex, { colorHue }));
+  colorLaneId.value = null;
+}
+
 function addCustomLane() {
   store.commit(addLane(mix.value, `Track ${mix.value.lanes.length + 1}`));
 }
@@ -308,17 +485,30 @@ function dropLane(laneIndex: number) {
   store.commit(removeLane(mix.value, laneIndex));
 }
 
-function toggleMute(laneIndex: number) {
+async function toggleMute(laneIndex: number) {
   const lane = mix.value.lanes[laneIndex];
   store.commit(updateLane(mix.value, laneIndex, { muted: !lane.muted }));
+  await store.reloadPreview();
 }
 
-function toggleSolo(laneIndex: number) {
+async function toggleSolo(laneIndex: number) {
   const lane = mix.value.lanes[laneIndex];
   store.commit(updateLane(mix.value, laneIndex, { soloed: !lane.soloed }));
+  await store.reloadPreview();
+}
+
+const hasSolo = computed(() => mix.value.lanes.some((lane) => lane.soloed));
+
+function laneAudible(laneIndex: number): boolean {
+  const lane = mix.value.lanes[laneIndex];
+  return !!lane && !lane.muted && (!hasSolo.value || lane.soloed);
 }
 
 async function close() {
+  if (mixer.target.kind === "block" && mixer.target.playlistId === store.playlistId) {
+    mixer.panelOpen = false;
+    await mixer.editGlobal();
+  }
   await store.close();
 }
 
@@ -328,9 +518,107 @@ async function resetArrangement() {
   ui.notify("Arrangement reset to the playlist order");
 }
 
-/** The prototype's "Open Mixer": per-block effects, which is the next stage. */
-function openBlockMixer() {
-  ui.notify("Per-block mixer effects arrive with the next stage of this feature");
+const selectedBlock = computed<MixBlock | null>(() => {
+  if (store.selection.length !== 1) return null;
+  return locate(mix.value, store.selection[0])?.block ?? null;
+});
+const blockMixerOpen = computed(
+  () =>
+    mixer.panelOpen &&
+    mixer.target.kind === "block" &&
+    mixer.target.playlistId === store.playlistId,
+);
+
+/** Open effects for exactly one selected audio region. */
+async function openBlockMixer() {
+  const block = selectedBlock.value;
+  if (!block) {
+    ui.notify("Select a block first");
+    return;
+  }
+  const name =
+    entryFor(block)?.title ??
+    (block.source.kind === "asset" ? block.source.file : "Audio block");
+  const playlistMixer = playlists.open?.mixer ?? null;
+  await mixer.editMixBlock(store.playlistId, block.id, name, block.mixer, playlistMixer);
+  mixer.panelOpen = true;
+}
+
+function laneIndexAt(event: PointerEvent | DragEvent): number {
+  const element = scroller.value;
+  if (!element) return mix.value.lanes.length;
+  const box = element.getBoundingClientRect();
+  const y = event.clientY - box.top + element.scrollTop - RULER_HEIGHT;
+  const index = Math.floor(y / laneHeight.value);
+  if (index < 0) return 0;
+  if (index >= mix.value.lanes.length) return mix.value.lanes.length;
+  return index;
+}
+
+async function importPaths(paths: string[], startSecs: number, laneIndex: number) {
+  if (!store.playlistId || paths.length === 0) return;
+  let next = mix.value;
+  let lane = laneIndex;
+  for (const path of paths) {
+    try {
+      const asset = await api.importMixAsset(store.playlistId, path);
+      const name = asset.file.replace(/\.[^.]+$/, "");
+      next = placeAsset(next, asset.file, asset.durationSecs, startSecs, lane, name);
+      void store.loadAssetWaveform(asset.file);
+      if (lane >= mix.value.lanes.length) lane = next.lanes.length - 1;
+      startSecs += asset.durationSecs;
+    } catch (e) {
+      ui.notify(String(e), "error");
+    }
+  }
+  if (next !== mix.value) store.commit(next);
+}
+
+async function chooseAudio() {
+  const selected = await open({
+    multiple: true,
+    title: "Import audio into the mix",
+    filters: [{ name: "Audio", extensions: [...AUDIO_EXTENSIONS] }],
+  });
+  if (selected === null) return;
+  const paths = Array.isArray(selected) ? selected : [selected];
+  await importPaths(paths, store.playhead, mix.value.lanes.length);
+}
+
+function isAudioPath(path: string): boolean {
+  const ext = path.split(".").pop()?.toLowerCase();
+  return !!ext && (AUDIO_EXTENSIONS as readonly string[]).includes(ext);
+}
+
+function pathsFromDrop(event: DragEvent): string[] {
+  const files = event.dataTransfer?.files;
+  if (!files) return [];
+  return Array.from(files)
+    .map((file) => (file as File & { path?: string }).path)
+    .filter((path): path is string => typeof path === "string" && isAudioPath(path));
+}
+
+const dropping = ref(false);
+
+function onFileDrag(event: DragEvent) {
+  if (!event.dataTransfer?.types.includes("Files")) return;
+  event.preventDefault();
+  dropping.value = true;
+}
+
+function onFileDragLeave(event: DragEvent) {
+  if (event.currentTarget === event.target) dropping.value = false;
+}
+
+async function onFileDrop(event: DragEvent) {
+  event.preventDefault();
+  dropping.value = false;
+  const paths = pathsFromDrop(event);
+  if (paths.length === 0) {
+    ui.notify("Only MP3, FLAC and WAV files can become blocks");
+    return;
+  }
+  await importPaths(paths, timeAt(event as unknown as PointerEvent), laneIndexAt(event));
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -345,14 +633,21 @@ function onKeydown(event: KeyboardEvent) {
     else store.undo();
     return;
   }
+  if (modifier && event.key.toLowerCase() === "d") {
+    event.preventDefault();
+    duplicateSelection();
+    return;
+  }
   switch (event.key) {
     case "Escape":
       event.preventDefault();
-      void close();
+      if (blockMixerOpen.value) mixer.panelOpen = false;
+      else void close();
       break;
     case " ":
       event.preventDefault();
-      void togglePlay();
+      if (store.previewing && !store.previewPaused) void pause();
+      else void play();
       break;
     case "Backspace":
     case "Delete":
@@ -365,19 +660,28 @@ function onKeydown(event: KeyboardEvent) {
     case "b":
       store.tool = "blade";
       break;
+    case "a":
+      store.tool = "automation";
+      break;
     default:
       break;
   }
 }
 
-/** Zoom around the pointer, so the thing under the cursor stays under it. */
+/** Continuous, restrained zoom: Option adjusts lane height, Cmd/Ctrl adjusts time. */
 function onWheel(event: WheelEvent) {
+  const factor = Math.exp(-event.deltaY * 0.0015);
+  if (event.altKey) {
+    event.preventDefault();
+    store.zoomTracks(factor);
+    return;
+  }
   if (!(event.metaKey || event.ctrlKey)) return;
   event.preventDefault();
   const element = scroller.value;
   if (!element) return;
   const before = timeAt(event as unknown as PointerEvent);
-  store.zoom(event.deltaY < 0 ? 1.12 : 1 / 1.12);
+  store.zoom(factor);
   void nextTick(() => {
     const box = element.getBoundingClientRect();
     const wanted = event.clientX - box.left - HEADER_WIDTH;
@@ -394,6 +698,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKeydown);
   stopDragListening();
+  stopAutomationListening();
 });
 
 const summary = computed(() => {
@@ -403,7 +708,16 @@ const summary = computed(() => {
 </script>
 
 <template>
-  <div class="mm-scrim" @pointerdown.self="close">
+  <div
+    class="mm-scrim"
+    :class="{ 'is-drop': dropping }"
+    @pointerdown.self="close"
+    @dragenter="onFileDrag"
+    @dragover="onFileDrag"
+    @dragleave="onFileDragLeave"
+    @drop="onFileDrop"
+  >
+    <div class="mm__workspace" :class="{ 'is-editing': blockMixerOpen }">
     <section
       ref="dialog"
       class="mm"
@@ -425,7 +739,6 @@ const summary = computed(() => {
             type="button"
             class="mm__tool"
             :class="{ 'is-active': store.tool === entry.id }"
-            :disabled="entry.id === 'automation'"
             :title="entry.hint"
             :aria-label="entry.label"
             :aria-pressed="store.tool === entry.id"
@@ -436,12 +749,22 @@ const summary = computed(() => {
         </div>
 
         <button
+          class="mm__duplicate-button"
+          type="button"
+          :disabled="store.selection.length === 0"
+          title="Duplicate selected blocks (Cmd/Ctrl+D)"
+          @click="duplicateSelection"
+        >
+          Duplicate
+        </button>
+        <button
           class="mm__mixer-button"
           type="button"
-          title="Effects for the selected block — arrives with the next stage"
+          :disabled="!selectedBlock"
+          :title="selectedBlock ? 'Effects for the selected block' : 'Select exactly one audio block'"
           @click="openBlockMixer"
         >
-          Open Mixer
+          Block Mixer
         </button>
 
         <button class="icon-button" type="button" aria-label="Close master mixer" @click="close">
@@ -453,12 +776,22 @@ const summary = computed(() => {
         <button
           class="icon-button"
           type="button"
-          :aria-label="store.previewing && player.playing ? 'Pause' : 'Play the mix'"
-          @click="togglePlay"
+          aria-label="Play the mix"
+          :disabled="store.previewing && !store.previewPaused"
+          @click="play"
         >
-          <PnmIcon :name="store.previewing && player.playing ? 'pause' : 'play'" :size="17" />
+          <PnmIcon name="play" :size="17" />
         </button>
-        <button class="icon-button" type="button" aria-label="Stop" @click="stop">
+        <button
+          class="icon-button"
+          type="button"
+          aria-label="Pause"
+          :disabled="!store.previewing || store.previewPaused"
+          @click="pause"
+        >
+          <PnmIcon name="pause" :size="17" />
+        </button>
+        <button class="icon-button" type="button" aria-label="Stop" :disabled="!store.previewing" @click="stop">
           <PnmIcon name="stop" :size="15" />
         </button>
         <span class="mm__timecode">{{ timecode(store.playhead) }}</span>
@@ -486,12 +819,24 @@ const summary = computed(() => {
 
         <span class="mm__divider" />
 
-        <button class="icon-button" type="button" aria-label="Zoom out" @click="store.zoom(1 / 1.4)">
-          <PnmIcon name="minimize" :size="16" />
-        </button>
-        <button class="icon-button" type="button" aria-label="Zoom in" @click="store.zoom(1.4)">
-          <PnmIcon name="plus" :size="16" />
-        </button>
+        <div class="mm__zoom-group" role="group" aria-label="Timeline zoom">
+          <span>Time</span>
+          <button class="icon-button" type="button" aria-label="Zoom timeline out" @click="store.zoom(1 / 1.4)">
+            <PnmIcon name="minimize" :size="16" />
+          </button>
+          <button class="icon-button" type="button" aria-label="Zoom timeline in" @click="store.zoom(1.4)">
+            <PnmIcon name="plus" :size="16" />
+          </button>
+        </div>
+        <div class="mm__zoom-group" role="group" aria-label="Track height">
+          <span>Tracks</span>
+          <button class="icon-button" type="button" aria-label="Decrease track height" @click="store.zoomTracks(1 / 1.2)">
+            <PnmIcon name="minimize" :size="16" />
+          </button>
+          <button class="icon-button" type="button" aria-label="Increase track height" @click="store.zoomTracks(1.2)">
+            <PnmIcon name="plus" :size="16" />
+          </button>
+        </div>
 
         <span class="mm__spacer" />
 
@@ -541,18 +886,59 @@ const summary = computed(() => {
             v-for="(lane, laneIndex) in mix.lanes"
             :key="lane.id"
             class="mm__lane"
-            :style="{ height: `${LANE_HEIGHT}px` }"
+            :class="{
+              'is-muted': lane.muted,
+              'is-solo-silenced': !lane.muted && !laneAudible(laneIndex),
+            }"
+            :style="{ height: `${laneHeight}px` }"
           >
             <div class="mm__lane-head" :style="{ width: `${HEADER_WIDTH}px` }">
-              <span class="mm__lane-swatch" :style="{ background: `hsl(${hueFor(laneIndex)} 60% 62%)` }" />
-              <span class="mm__lane-name" :title="lane.name">{{ lane.name || `Track ${laneIndex + 1}` }}</span>
+              <div class="mm__color-wrap">
+                <button
+                  type="button"
+                  class="mm__lane-swatch"
+                  :style="{ background: `hsl(${hueFor(laneIndex)} 60% 62%)` }"
+                  :aria-label="`Choose colour for ${lane.name}`"
+                  :aria-expanded="colorLaneId === lane.id"
+                  @click="colorLaneId = colorLaneId === lane.id ? null : lane.id"
+                />
+                <div v-if="colorLaneId === lane.id" class="mm__palette" role="menu" aria-label="Track colours">
+                  <button
+                    v-for="colorHue in COLOR_HUES"
+                    :key="colorHue"
+                    type="button"
+                    class="mm__palette-color"
+                    :class="{ 'is-selected': hueFor(laneIndex) === colorHue }"
+                    :style="{ background: `hsl(${colorHue} 60% 62%)` }"
+                    :aria-label="`Use hue ${colorHue}`"
+                    @click="setLaneColor(laneIndex, colorHue)"
+                  />
+                </div>
+              </div>
+              <input
+                v-if="renamingLaneId === lane.id"
+                v-model="renameValue"
+                class="mm__lane-name mm__lane-name-input"
+                :data-lane-id="lane.id"
+                :aria-label="`Rename ${lane.name}`"
+                @keydown.enter.prevent="finishLaneRename(laneIndex); ($event.target as HTMLInputElement).blur()"
+                @keydown.escape.prevent="cancelLaneRename(); ($event.target as HTMLInputElement).blur()"
+                @blur="finishLaneRename(laneIndex)"
+              />
+              <span
+                v-else
+                class="mm__lane-name"
+                :title="`${lane.name} — double-click to rename`"
+                @dblclick="startLaneRename(laneIndex)"
+              >{{ lane.name || `Track ${laneIndex + 1}` }}</span>
               <div class="mm__lane-buttons">
                 <button
                   type="button"
                   class="mm__ms"
                   :class="{ 'is-on': lane.muted }"
                   :aria-pressed="lane.muted"
-                  :title="`Mute ${lane.name}`"
+                  :title="`${lane.muted ? 'Unmute' : 'Mute'} ${lane.name}`"
+                  :aria-label="`${lane.muted ? 'Unmute' : 'Mute'} ${lane.name}`"
                   @click="toggleMute(laneIndex)"
                 >
                   M
@@ -562,7 +948,8 @@ const summary = computed(() => {
                   class="mm__ms mm__ms--solo"
                   :class="{ 'is-on': lane.soloed }"
                   :aria-pressed="lane.soloed"
-                  :title="`Solo ${lane.name}`"
+                  :title="`${lane.soloed ? 'Unsolo' : 'Solo'} ${lane.name}`"
+                  :aria-label="`${lane.soloed ? 'Unsolo' : 'Solo'} ${lane.name}`"
                   @click="toggleSolo(laneIndex)"
                 >
                   S
@@ -586,11 +973,12 @@ const summary = computed(() => {
                 :entry="entryFor(block)"
                 :waveform="waveformFor(block)"
                 :pixels-per-second="pps"
-                :height="LANE_HEIGHT"
+                :height="laneHeight"
                 :selected="store.selected.has(block.id)"
                 :hue="hueFor(laneIndex)"
                 :tool="store.tool"
                 @grab="onGrab($event, block.id)"
+                @automation="onAutomation($event, block.id)"
               />
             </div>
           </div>
@@ -599,6 +987,10 @@ const summary = computed(() => {
             <button type="button" @click="addCustomLane">
               <PnmIcon name="plus" :size="13" />
               <span>Add Custom Track</span>
+            </button>
+            <button type="button" @click="chooseAudio">
+              <PnmIcon name="importFile" :size="13" />
+              <span>Import audio</span>
             </button>
           </div>
 
@@ -614,16 +1006,29 @@ const summary = computed(() => {
 
       <footer class="mm__footer">
         <span v-if="store.tool === 'blade'">Click a block to split it. Press V for the pointer.</span>
+        <span v-else-if="store.tool === 'automation'">
+          Click to add a keyframe, drag to move it, drag the midpoint to bend the curve. Double-click
+          a point to remove it.
+        </span>
         <span v-else>
-          Drag to move, drag an edge to trim, hold Alt to ignore snapping. Overlap two blocks to
-          crossfade them.
+          Drag to move, drag an edge to trim, hold Alt to ignore snapping. Cmd/Ctrl+D duplicates.
+          Option+wheel changes track height. Drop MP3, FLAC or WAV to import.
         </span>
       </footer>
     </section>
+    <Transition name="slide-panel">
+      <AdvancedMixer v-if="blockMixerOpen" class="mm__block-mixer" />
+    </Transition>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.mm-scrim.is-drop .mm {
+  outline: 2px dashed var(--accent);
+  outline-offset: -8px;
+}
+
 .mm-scrim {
   position: fixed;
   inset: 0;
@@ -631,16 +1036,27 @@ const summary = computed(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 18px;
+  /* Keep interactive chrome clear of macOS's overlay traffic lights. */
+  padding: 44px 22px 22px 78px;
   background: rgba(0, 0, 0, 0.4);
   backdrop-filter: blur(4px);
+}
+
+.mm__workspace {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
 }
 
 /* "Fills most of the window, with little deadspace" — the drawing's proportions. */
 .mm {
   display: flex;
   flex-direction: column;
+  flex: 1;
   width: 100%;
+  min-width: 0;
   height: 100%;
   overflow: hidden;
   border: 0.5px solid var(--separator);
@@ -713,7 +1129,8 @@ const summary = computed(() => {
   cursor: default;
 }
 
-.mm__mixer-button {
+.mm__mixer-button,
+.mm__duplicate-button {
   padding: 5px 14px;
   border: 0.5px solid var(--separator-strong);
   border-radius: 999px;
@@ -721,8 +1138,15 @@ const summary = computed(() => {
   color: var(--text);
 }
 
-.mm__mixer-button:hover {
+.mm__mixer-button:hover:not(:disabled),
+.mm__duplicate-button:hover:not(:disabled) {
   background: var(--bg-hover);
+}
+
+.mm__mixer-button:disabled,
+.mm__duplicate-button:disabled {
+  opacity: 0.42;
+  cursor: default;
 }
 
 .mm__transport {
@@ -746,6 +1170,20 @@ const summary = computed(() => {
   height: 18px;
   margin: 0 6px;
   background: var(--separator);
+}
+
+.mm__zoom-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.mm__zoom-group > span {
+  margin: 0 3px 0 2px;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .mm__spacer {
@@ -848,11 +1286,43 @@ const summary = computed(() => {
   border-right: 0.5px solid var(--separator);
 }
 
-.mm__lane-swatch {
+.mm__color-wrap {
+  position: relative;
   flex: none;
-  width: 4px;
+}
+
+.mm__lane-swatch {
+  display: block;
+  width: 7px;
   height: 32px;
-  border-radius: 2px;
+  border-radius: 3px;
+}
+
+.mm__palette {
+  position: absolute;
+  z-index: 8;
+  top: calc(100% + 5px);
+  left: 0;
+  display: grid;
+  grid-template-columns: repeat(3, 18px);
+  gap: 5px;
+  padding: 7px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-popover);
+}
+
+.mm__palette-color {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid transparent;
+}
+
+.mm__palette-color.is-selected {
+  border-color: var(--text);
+  box-shadow: 0 0 0 1px var(--bg-elevated), 0 0 0 2px var(--text);
 }
 
 .mm__lane-name {
@@ -863,6 +1333,15 @@ const summary = computed(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.mm__lane-name-input {
+  padding: 2px 4px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  outline: none;
+  background: var(--bg);
+  color: var(--text);
 }
 
 .mm__lane-buttons {
@@ -909,12 +1388,26 @@ const summary = computed(() => {
 .mm__lane-track {
   position: relative;
   flex: none;
+  transition: opacity 0.15s var(--ease), filter 0.15s var(--ease);
+}
+
+.mm__lane.is-muted .mm__lane-track,
+.mm__lane.is-solo-silenced .mm__lane-track {
+  opacity: 0.32;
+  filter: saturate(0.35);
+}
+
+.mm__lane.is-solo-silenced .mm__lane-name {
+  color: var(--text-tertiary);
 }
 
 .mm__add-lane {
   position: sticky;
   left: 0;
   z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   padding: 8px;
 }
 
@@ -949,6 +1442,18 @@ const summary = computed(() => {
   color: var(--text-tertiary);
 }
 
+.mm__block-mixer {
+  height: 100%;
+  border: 0.5px solid var(--separator);
+  border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
+  overflow: hidden;
+  box-shadow: var(--shadow-popover);
+}
+
+.mm__workspace.is-editing .mm {
+  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+}
+
 .mm__footer {
   margin: 0;
   padding: 8px 14px;
@@ -956,5 +1461,38 @@ const summary = computed(() => {
   font-size: 11.5px;
   color: var(--text-tertiary);
   background: var(--bg-sidebar);
+}
+
+@media (max-width: 1180px) {
+  .mm__block-mixer {
+    position: absolute;
+    z-index: 8;
+    top: 0;
+    right: 0;
+    width: min(var(--mixer-width), 92vw);
+  }
+
+  .mm__workspace.is-editing .mm {
+    border-radius: var(--radius-lg);
+  }
+}
+
+@media (max-width: 760px) {
+  .mm-scrim {
+    padding-right: 10px;
+    padding-bottom: 10px;
+  }
+
+  .mm__header {
+    flex-wrap: wrap;
+  }
+
+  .mm__transport {
+    overflow-x: auto;
+  }
+
+  .mm__enable span {
+    display: none;
+  }
 }
 </style>

@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::audio::{
     crossfade::{CrossfadeCurve, CrossfadeSettings},
     params::{
-        default_bands, BandKind, Delay, Eq, EqBand, Lofi, MixerSettings, Normalisation, Pitch,
-        Reverb,
+        default_bands, BandKind, Delay, Eq, EqBand, Lofi, MixerSettings, Normalisation, Panning,
+        Pitch, Reverb,
     },
 };
 
@@ -106,6 +106,7 @@ pub fn built_ins() -> Vec<Preset> {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings::default()),
                 pitch: Some(Pitch::default()),
+                panning: Some(Panning::default()),
                 eq: Some(Eq::default()),
                 reverb: Some(Reverb::default()),
                 delay: Some(Delay::default()),
@@ -549,6 +550,10 @@ mod tests {
                 ..Default::default()
             }),
             crossfade: Some(crossfade.clone()),
+            panning: Some(Panning {
+                position: 0.35,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         upsert(&path, "My Mix", settings).unwrap();
@@ -559,6 +564,7 @@ mod tests {
         assert_eq!(mine.settings.preset, None);
         assert_eq!(mine.settings.reverb.as_ref().unwrap().mix, 0.66);
         assert_eq!(mine.settings.crossfade, Some(crossfade));
+        assert_eq!(mine.settings.panning.as_ref().unwrap().position, 0.35);
     }
 
     #[test]
@@ -569,6 +575,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(preset.kind, PresetKind::Mixer);
+        assert_eq!(
+            MixerSettings::resolve(&[&preset.settings]).panning,
+            Panning::default()
+        );
         assert_eq!(
             serde_json::to_value(&preset).unwrap()["kind"],
             serde_json::json!("mixer")

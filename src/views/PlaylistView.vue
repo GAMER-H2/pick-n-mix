@@ -13,6 +13,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
 import CollectionHeader from "@/components/CollectionHeader.vue";
 import TrackRow from "@/components/TrackRow.vue";
+import BounceDialog from "@/components/mastermix/BounceDialog.vue";
 import { formatTotal } from "@/lib/format";
 import * as api from "@/lib/api";
 import { usePlaylistStore } from "@/stores/playlists";
@@ -32,6 +33,7 @@ const ui = useUiStore();
 
 const editingDescription = ref(false);
 const draftDescription = ref("");
+const bounceOpen = ref(false);
 
 const playlist = computed(() => playlists.open);
 const items = computed<ResolvedEntry[]>(() => playlist.value?.items ?? []);
@@ -159,6 +161,11 @@ async function openMasterMix() {
   await masterMix.openFor(p.id);
 }
 
+function onBounced(path: string) {
+  bounceOpen.value = false;
+  ui.notify(`Bounced mix to ${path}`);
+}
+
 /**
  * Per-entry override. It is written into this playlist's file, so the same
  * song in another playlist, or played from the library, is unaffected.
@@ -221,6 +228,15 @@ async function saveDescription() {
           @click="openMasterMix"
         >
           <PnmIcon name="timeline" :size="18" />
+        </button>
+        <button
+          class="icon-button"
+          title="Bounce this playlist to an audio file"
+          aria-label="Bounce mix"
+          :disabled="available.length === 0"
+          @click="bounceOpen = true"
+        >
+          <PnmIcon name="bounce" :size="18" />
         </button>
       </template>
     </CollectionHeader>
@@ -309,6 +325,14 @@ async function saveDescription() {
 
   <div v-else-if="playlists.loading" class="playlist__loading">Loading…</div>
   <div v-else class="playlist__loading">This playlist could not be found.</div>
+
+  <BounceDialog
+    v-if="bounceOpen && playlist"
+    :playlist-id="playlist.id"
+    :playlist-name="playlist.name"
+    @close="bounceOpen = false"
+    @bounced="onBounced"
+  />
 </template>
 
 <style scoped>

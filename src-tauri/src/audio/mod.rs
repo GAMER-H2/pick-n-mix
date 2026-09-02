@@ -1,5 +1,6 @@
 pub mod ambience;
 pub mod analyser;
+pub mod bounce;
 pub mod crossfade;
 pub mod decode;
 pub mod dsp;

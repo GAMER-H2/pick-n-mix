@@ -22,8 +22,9 @@ use crate::player::{Context, QueueItem, QueueView, Repeat};
 use crate::playlist::{self, Playlist};
 use crate::presets::{self, Preset, PresetKind};
 use crate::state::{
-    load_app_preferences, AppPreferences, AppState, SETTING_APP_PREFERENCES, SETTING_GLOBAL_MIXER,
-    SETTING_REPEAT, SETTING_SHUFFLE, SETTING_VOLUME,
+    load_app_preferences, AppPreferences, AppState, MasterMixOriginal, MasterMixPlayback,
+    MasterMixSession, SETTING_APP_PREFERENCES, SETTING_GLOBAL_MIXER, SETTING_REPEAT,
+    SETTING_SHUFFLE, SETTING_VOLUME,
 };
 
 type Cmd<T> = Result<T, String>;
@@ -1387,9 +1388,16 @@ pub fn play_playlist(
     start_index: Option<usize>,
 ) -> Cmd<()> {
     state.cancel_preview();
-    let Some((_, p)) = find_playlist(&state, &id) else {
+    let Some((path, p)) = find_playlist(&state, &id) else {
         return Err("playlist not found".into());
     };
+    if p.master_mix.as_ref().is_some_and(|m| m.enabled) {
+        match play_enabled_mix(&app, &state, &p, &path, start_index) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => return Err(e),
+        }
+    }
     let context = Context {
         kind: "playlist".into(),
         id: p.id.clone(),
@@ -2128,6 +2136,137 @@ pub async fn entry_waveform(
     .map_err(err)
 }
 
+/// Capture and pause normal playback before the Master Mixer can replace it.
+#[tauri::command]
+pub fn begin_master_mix_session(state: State<'_, AppState>) -> Cmd<String> {
+    // Repeated opens share the capture rather than accidentally treating an
+    // audition as the normal source that should later be restored.
+    let mut slot = state.master_mix_session.lock();
+    if let Some(session) = slot.as_ref() {
+        return Ok(session.token.clone());
+    }
+
+    // A physical-file preview is not normal playback. Put its original back
+    // before taking the modal's longer-lived snapshot.
+    if state.preview.lock().is_some() {
+        state.stop_preview().map_err(err)?;
+    }
+    let snapshot = state.engine.snapshot();
+    let playback = state.master_mix_playback.lock().clone();
+    let original = if snapshot.stream.is_none() {
+        MasterMixOriginal::Empty
+    } else if let Some(MasterMixPlayback::Enabled { playlist_id }) = playback {
+        MasterMixOriginal::EnabledMix {
+            playlist_id,
+            position_secs: snapshot.position_secs,
+            playing: snapshot.playing,
+        }
+    } else {
+        let player = state.player.lock();
+        let track = player
+            .current()
+            .ok_or_else(|| "loaded queue audio has no current track".to_string())?;
+        let order_index = player
+            .view()
+            .current_index
+            .ok_or_else(|| "loaded queue audio has no queue position".to_string())?;
+        let file = state
+            .db
+            .effective_file_for_song(&track.id)
+            .map_err(err)?
+            .ok_or_else(|| "the current track no longer has an available file".to_string())?;
+        MasterMixOriginal::Queue {
+            track_id: track.id.clone(),
+            order_index,
+            path: PathBuf::from(file.location),
+            gain_db: file.gain_db.unwrap_or(0.0),
+            position_secs: snapshot.position_secs,
+            playing: snapshot.playing,
+        }
+    };
+    if snapshot.playing {
+        state.engine.pause();
+    }
+    let token = state.next_master_mix_session_token();
+    *slot = Some(MasterMixSession {
+        token: token.clone(),
+        original,
+    });
+    Ok(token)
+}
+
+/// Restore the exact source, position and play/pause state captured on open.
+#[tauri::command]
+pub fn end_master_mix_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+) -> Cmd<bool> {
+    let mut slot = state.master_mix_session.lock();
+    if !slot.as_ref().is_some_and(|session| session.token == token) {
+        return Ok(false);
+    }
+    let session = slot.take().expect("session checked above");
+
+    state.engine.cancel_next();
+    state.master_mix_playback.lock().take();
+    match session.original {
+        MasterMixOriginal::Empty => state.engine.clear(),
+        MasterMixOriginal::Queue {
+            track_id,
+            order_index,
+            path,
+            gain_db,
+            position_secs,
+            playing,
+        } => {
+            let restored_id = state
+                .player
+                .lock()
+                .jump_to(order_index)
+                .map(|track| track.id.clone());
+            if restored_id.as_deref() != Some(track_id.as_str()) {
+                state.engine.clear();
+                return Err("the captured queue track is no longer available".into());
+            }
+            state.sync_mixer();
+            if let Err(error) = state.engine.load(path, position_secs, gain_db) {
+                state.engine.clear();
+                return Err(err(error));
+            }
+            if playing {
+                state.engine.play();
+            } else {
+                state.engine.pause();
+            }
+        }
+        MasterMixOriginal::EnabledMix {
+            playlist_id,
+            position_secs,
+            playing,
+        } => {
+            let Some((path, playlist)) = find_playlist(&state, &playlist_id) else {
+                state.engine.clear();
+                return Err("the captured master-mix playlist no longer exists".into());
+            };
+            match load_enabled_mix(&state, &playlist, &path, position_secs, playing, false) {
+                Ok(true) => {}
+                Ok(false) => {
+                    state.engine.clear();
+                    return Err("the captured master mix can no longer be played".into());
+                }
+                Err(error) => {
+                    state.engine.clear();
+                    return Err(error);
+                }
+            }
+        }
+    }
+    let playing = state.engine.is_playing();
+    let _ = app.emit("playing-changed", playing);
+    Ok(true)
+}
+
 /// Audition the arrangement, from `position_secs`.
 ///
 /// The mix takes over playback entirely while the editor is open: the engine
@@ -2140,7 +2279,15 @@ pub fn play_master_mix(
     playlist_id: String,
     mix: Option<crate::master_mix::MasterMix>,
     position_secs: Option<f64>,
+    token: String,
 ) -> Cmd<f64> {
+    let session = state.master_mix_session.lock();
+    if !session
+        .as_ref()
+        .is_some_and(|session| session.token == token)
+    {
+        return Ok(0.0);
+    }
     let Some((path, p)) = find_playlist(&state, &playlist_id) else {
         return Err("playlist not found".into());
     };
@@ -2158,35 +2305,281 @@ pub fn play_master_mix(
     }
     let duration = plan.duration_secs;
 
-    // Ends any duplicate-file audition and stops the queue's own playback
-    // before the timeline replaces it.
-    state.cancel_preview();
-    *state.master_mix_preview.lock() = Some(playlist_id);
-
+    state.engine.cancel_next();
     let rate = state.engine.device_sample_rate();
     let mut source = crate::audio::timeline::TimelineSource::new(plan, rate);
     if let Some(position) = position_secs.filter(|p| *p > 0.0) {
         source.seek(position).map_err(err)?;
     }
     state.engine.load_timeline(source).map_err(err)?;
+    *state.master_mix_playback.lock() = Some(MasterMixPlayback::Audition {
+        token: token.clone(),
+        playlist_id,
+    });
     state.engine.play();
     let _ = app.emit("playing-changed", true);
     Ok(duration)
 }
 
-/// Stop auditioning and hand the engine back to the queue.
+/// Pause or resume the loaded timeline without clearing its decoder and DSP state.
 #[tauri::command]
-pub fn stop_master_mix(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
-    if state.master_mix_preview.lock().take().is_none() {
+pub fn set_master_mix_playing(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    playing: bool,
+    token: String,
+) -> Cmd<bool> {
+    let session = state.master_mix_session.lock();
+    if !session
+        .as_ref()
+        .is_some_and(|session| session.token == token)
+        || !matches!(
+            state.master_mix_playback.lock().as_ref(),
+            Some(MasterMixPlayback::Audition { token: active, .. }) if active == &token
+        )
+        || state.engine.snapshot().stream.is_none()
+    {
+        return Ok(false);
+    }
+    if playing {
+        state.engine.play();
+    } else {
+        state.engine.pause();
+    }
+    let _ = app.emit("playing-changed", playing);
+    Ok(playing)
+}
+
+/// Stop auditioning without restoring the source captured by the open modal.
+#[tauri::command]
+pub fn stop_master_mix(app: AppHandle, state: State<'_, AppState>, token: String) -> Cmd<()> {
+    let session = state.master_mix_session.lock();
+    if !session
+        .as_ref()
+        .is_some_and(|session| session.token == token)
+    {
         return Ok(());
     }
+    let mut playback = state.master_mix_playback.lock();
+    if !matches!(
+        playback.as_ref(),
+        Some(MasterMixPlayback::Audition { token: active, .. }) if active == &token
+    ) {
+        return Ok(());
+    }
+    playback.take();
+    state.engine.cancel_next();
     state.engine.clear();
     let _ = app.emit("playing-changed", false);
     Ok(())
 }
 
-/// Resolve a mix against this library: every audible block paired with a file
-/// on this machine and the mixer cascade that applies to it.
+/// Copy an MP3/FLAC/WAV into this playlist's assets folder so it can become a block.
+#[tauri::command]
+pub fn import_mix_asset(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    path: String,
+) -> Cmd<ImportedAsset> {
+    let Some((playlist_path, _)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    let source = PathBuf::from(&path);
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "mp3" | "flac" | "wav") {
+        return Err("only MP3, FLAC and WAV files can be imported".into());
+    }
+    if !source.is_file() {
+        return Err("that file could not be read".into());
+    }
+    let assets = Playlist::assets_dir(&playlist_path);
+    std::fs::create_dir_all(&assets)
+        .with_context(|| format!("creating {}", assets.display()))
+        .map_err(err)?;
+
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("audio");
+    let cleaned: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = if cleaned.is_empty() {
+        "audio".to_string()
+    } else {
+        cleaned
+    };
+    let mut file_name = format!("{stem}.{ext}");
+    let mut dest = assets.join(&file_name);
+    if dest.exists() {
+        file_name = format!(
+            "{stem}_{}.{ext}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        dest = assets.join(&file_name);
+    }
+    std::fs::copy(&source, &dest)
+        .with_context(|| format!("copying into {}", dest.display()))
+        .map_err(err)?;
+
+    let decoder = crate::audio::decode::TrackDecoder::open(&dest, 44_100).map_err(err)?;
+    let duration_secs = decoder
+        .info
+        .duration_secs
+        .max(crate::master_mix::MIN_BLOCK_SECS);
+    Ok(ImportedAsset {
+        file: file_name,
+        duration_secs,
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedAsset {
+    pub file: String,
+    pub duration_secs: f64,
+}
+
+#[tauri::command]
+pub async fn asset_waveform(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    file: String,
+) -> Cmd<crate::audio::peaks::Waveform> {
+    let Some((playlist_path, _)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    let name = Path::new(&file)
+        .file_name()
+        .ok_or_else(|| "invalid asset name".to_string())?;
+    let path = Playlist::assets_dir(&playlist_path).join(name);
+    if !path.is_file() {
+        return Err("that imported file is no longer on disk".into());
+    }
+    let cache = state.paths.waveforms.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::audio::peaks::waveform(&path, &cache))
+        .await
+        .map_err(err)?
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn bounce_master_mix(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    destination: String,
+    options: crate::audio::bounce::BounceOptions,
+) -> Cmd<()> {
+    let Some((path, p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    let mut mix = p.master_mix_or_default(&state.db).map_err(err)?;
+    mix.normalise(p.tracks.len());
+    let plan = build_plan(&state, &p, &mix, &path).map_err(err)?;
+    if plan.is_empty() {
+        return Err("there is nothing in this mix to bounce".into());
+    }
+    let global = state.player.lock().global_mixer.clone();
+    let resolved = MixerSettings::resolve(&[&global]);
+    let dest = PathBuf::from(destination);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::audio::bounce::render(plan, &dest, &options, &resolved.normalisation)
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)
+}
+
+fn play_enabled_mix(
+    app: &AppHandle,
+    state: &AppState,
+    p: &Playlist,
+    path: &Path,
+    start_index: Option<usize>,
+) -> Cmd<bool> {
+    use crate::master_mix::BlockSource;
+    let Some(existing) = p.master_mix.clone() else {
+        return Ok(false);
+    };
+    let mut mix = existing;
+    mix.normalise(p.tracks.len());
+    let mut position = 0.0;
+    if let Some(index) = start_index {
+        position = mix
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.blocks.iter())
+            .filter(|block| matches!(&block.source, BlockSource::Entry { index: i } if *i == index))
+            .map(|block| block.start_secs)
+            .fold(f64::INFINITY, f64::min);
+        if !position.is_finite() {
+            position = 0.0;
+        }
+    }
+    let loaded = load_enabled_mix(state, p, path, position, true, true)?;
+    if loaded {
+        let _ = app.emit("playing-changed", true);
+    }
+    Ok(loaded)
+}
+
+fn load_enabled_mix(
+    state: &AppState,
+    p: &Playlist,
+    path: &Path,
+    position_secs: f64,
+    playing: bool,
+    update_player: bool,
+) -> Cmd<bool> {
+    let Some(mut mix) = p.master_mix.clone() else {
+        return Ok(false);
+    };
+    mix.normalise(p.tracks.len());
+    let plan = build_plan(state, p, &mix, path).map_err(err)?;
+    if plan.is_empty() {
+        return Ok(false);
+    }
+    if update_player {
+        let mut player = state.player.lock();
+        player.clear();
+        player.context = Some(Context {
+            kind: "playlist".into(),
+            id: p.id.clone(),
+            name: p.name.clone(),
+        });
+        player.context_mixer = p.mixer.clone();
+    }
+    let rate = state.engine.device_sample_rate();
+    let mut source = crate::audio::timeline::TimelineSource::new(plan, rate);
+    if position_secs > 0.0 {
+        source.seek(position_secs).map_err(err)?;
+    }
+    state.engine.load_timeline(source).map_err(err)?;
+    *state.master_mix_playback.lock() = Some(MasterMixPlayback::Enabled {
+        playlist_id: p.id.clone(),
+    });
+    if playing {
+        state.engine.play();
+    } else {
+        state.engine.pause();
+    }
+    Ok(true)
+}
+
+/// Resolve a mix against this library: every block paired with a file on this
+/// machine and the mixer cascade that applies to it. Inaudible lanes remain in
+/// the plan at zero gain so mute/solo does not shorten or empty the timeline.
 ///
 /// A block whose song is not here is dropped rather than failing the whole
 /// mix — the roadmap's open question, answered the way that keeps a shared
@@ -2206,10 +2599,11 @@ fn build_plan(
 
     let mut blocks = Vec::new();
     for lane in mix.lanes.iter() {
-        if !mix.lane_audible(lane) {
-            continue;
-        }
-        let lane_gain = db_to_gain(lane.gain_db);
+        let lane_gain = if mix.lane_audible(lane) {
+            db_to_gain(lane.gain_db)
+        } else {
+            0.0
+        };
         for block in lane.blocks.iter() {
             let (path, entry_layer, track_gain_db) = match &block.source {
                 BlockSource::Entry { index } => {
@@ -2240,12 +2634,8 @@ fn build_plan(
             };
 
             let block_layer = block.mixer.clone().unwrap_or_default();
-            let settings = MixerSettings::resolve(&[
-                &global,
-                &playlist_layer,
-                &entry_layer,
-                &block_layer,
-            ]);
+            let settings =
+                MixerSettings::resolve(&[&global, &playlist_layer, &entry_layer, &block_layer]);
             blocks.push(crate::audio::timeline::PlanBlock {
                 path,
                 block: block.clone(),

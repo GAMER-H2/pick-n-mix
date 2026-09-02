@@ -11,7 +11,7 @@
  * is about to be silently corrected underneath them.
  */
 
-import type { MasterMix, MixBlock, MixEntry, MixLane } from "./types";
+import type { AutomationPoint, MasterMix, MixBlock, MixEntry, MixLane, MixerSettings } from "./types";
 
 /** Shortest a block may be, matching `MIN_BLOCK_SECS` in Rust. */
 export const MIN_BLOCK_SECS = 0.02;
@@ -28,16 +28,39 @@ export function newId(prefix: string): string {
   return `${prefix}_${random.slice(0, 12)}`;
 }
 
+function cloneMixer(mixer: MixerSettings | null): MixerSettings | null {
+  if (!mixer) return null;
+  return {
+    ...mixer,
+    pitch: mixer.pitch ? { ...mixer.pitch } : mixer.pitch,
+    panning: mixer.panning ? { ...mixer.panning } : mixer.panning,
+    eq: mixer.eq
+      ? { ...mixer.eq, bands: mixer.eq.bands.map((band) => ({ ...band })) }
+      : mixer.eq,
+    reverb: mixer.reverb ? { ...mixer.reverb } : mixer.reverb,
+    delay: mixer.delay ? { ...mixer.delay } : mixer.delay,
+    normalisation: mixer.normalisation ? { ...mixer.normalisation } : mixer.normalisation,
+    lofi: mixer.lofi ? { ...mixer.lofi } : mixer.lofi,
+    crossfade: mixer.crossfade ? { ...mixer.crossfade } : mixer.crossfade,
+    filters: mixer.filters ? mixer.filters.map((filter) => ({ ...filter })) : mixer.filters,
+  };
+}
+
+function cloneBlock(block: MixBlock): MixBlock {
+  return {
+    ...block,
+    source: { ...block.source },
+    mixer: cloneMixer(block.mixer),
+    automation: block.automation.map((point) => ({ ...point })),
+  };
+}
+
 export function cloneMix(mix: MasterMix): MasterMix {
   return {
     ...mix,
     lanes: mix.lanes.map((lane) => ({
       ...lane,
-      blocks: lane.blocks.map((block) => ({
-        ...block,
-        source: { ...block.source },
-        automation: block.automation.map((point) => ({ ...point })),
-      })),
+      blocks: lane.blocks.map(cloneBlock),
     })),
   };
 }
@@ -77,9 +100,13 @@ export function locate(mix: MasterMix, blockId: string): Located | null {
  * edge can be dragged. Unknown for an imported file until it has been
  * analysed, in which case there is nothing to bound it with.
  */
-export function sourceDuration(block: MixBlock, entries: MixEntry[]): number {
+export function sourceDuration(
+  block: MixBlock,
+  entries: MixEntry[],
+  assetDurationSecs = Infinity,
+): number {
   const source = block.source;
-  if (source.kind !== "entry") return Infinity;
+  if (source.kind === "asset") return assetDurationSecs;
   return entries.find((e) => e.index === source.index)?.durationSecs ?? Infinity;
 }
 
@@ -178,7 +205,6 @@ export function trimBlock(
   blockId: string,
   edge: "start" | "end",
   toSecs: number,
-  naturalDuration = Infinity,
 ): MasterMix {
   const found = locate(mix, blockId);
   if (!found) return mix;
@@ -199,13 +225,9 @@ export function trimBlock(
       durationSecs: block.durationSecs - shift,
     };
   } else {
-    const longest = Number.isFinite(naturalDuration)
-      ? naturalDuration - block.offsetSecs
-      : Infinity;
-    const duration = Math.min(
-      Math.max(toSecs - block.startSecs, MIN_BLOCK_SECS),
-      longest,
-    );
+    // A region may outlast its source. The renderer and audio timeline repeat
+    // [offset, EOF) until the requested block duration has elapsed.
+    const duration = Math.max(toSecs - block.startSecs, MIN_BLOCK_SECS);
     next = { ...block, durationSecs: duration };
   }
 
@@ -268,6 +290,46 @@ export function deleteBlocks(mix: MasterMix, blockIds: string[]): MasterMix {
       ...lane,
       blocks: lane.blocks.filter((block) => !doomed.has(block.id)),
     })),
+  };
+}
+
+export interface DuplicateResult {
+  mix: MasterMix;
+  blockIds: string[];
+}
+
+/** Duplicate a selection after itself, preserving its relative timing and lanes. */
+export function duplicateBlocks(mix: MasterMix, blockIds: string[]): DuplicateResult {
+  const selected = blockIds
+    .map((id) => locate(mix, id))
+    .filter((found): found is Located => found !== null);
+  if (selected.length === 0) return { mix, blockIds: [] };
+
+  const first = Math.min(...selected.map(({ block }) => block.startSecs));
+  const last = Math.max(...selected.map(({ block }) => blockEnd(block)));
+  const shift = Math.max(MIN_BLOCK_SECS, last - first);
+  const duplicatesByLane = new Map<number, MixBlock[]>();
+  const duplicateIds: string[] = [];
+
+  for (const { laneIndex, block } of selected) {
+    const duplicate = cloneBlock(block);
+    duplicate.id = newId("blk");
+    duplicate.startSecs += shift;
+    duplicateIds.push(duplicate.id);
+    const laneBlocks = duplicatesByLane.get(laneIndex) ?? [];
+    laneBlocks.push(duplicate);
+    duplicatesByLane.set(laneIndex, laneBlocks);
+  }
+
+  return {
+    mix: {
+      ...mix,
+      lanes: mix.lanes.map((lane, laneIndex) => {
+        const duplicates = duplicatesByLane.get(laneIndex);
+        return duplicates ? { ...lane, blocks: ordered([...lane.blocks, ...duplicates]) } : lane;
+      }),
+    },
+    blockIds: duplicateIds,
   };
 }
 
@@ -377,4 +439,160 @@ export function rulerStep(pixelsPerSecond: number): number {
   const ladder = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
   const wanted = 90 / pixelsPerSecond;
   return ladder.find((step) => step >= wanted) ?? ladder[ladder.length - 1];
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function withBlock(
+  mix: MasterMix,
+  blockId: string,
+  next: MixBlock,
+): MasterMix {
+  const found = locate(mix, blockId);
+  if (!found) return mix;
+  const blocks = [...found.lane.blocks];
+  blocks[found.blockIndex] = next;
+  return withLane(mix, found.laneIndex, blocks);
+}
+
+/** Volume envelope as dB, matching `Block::automation_gain` in Rust. */
+export function automationGainAt(points: AutomationPoint[], atSecs: number): number {
+  if (points.length === 0) return 0;
+  if (points.length === 1) return points[0].gainDb;
+  const ordered = [...points].sort((a, b) => a.atSecs - b.atSecs);
+  if (atSecs <= ordered[0].atSecs) return ordered[0].gainDb;
+  const last = ordered[ordered.length - 1];
+  if (atSecs >= last.atSecs) return last.gainDb;
+  let ix = 0;
+  for (let i = 0; i < ordered.length - 1; i += 1) {
+    if (ordered[i + 1].atSecs > atSecs) {
+      ix = i;
+      break;
+    }
+  }
+  const a = ordered[ix];
+  const b = ordered[ix + 1];
+  const span = b.atSecs - a.atSecs;
+  const t = span > 0 ? clamp((atSecs - a.atSecs) / span, 0, 1) : 1;
+  const shaped = t ** clamp(a.curve, 0.05, 8);
+  return a.gainDb + (b.gainDb - a.gainDb) * shaped;
+}
+
+export function addAutomationPoint(
+  mix: MasterMix,
+  blockId: string,
+  atSecs: number,
+  gainDb: number,
+): MasterMix {
+  const found = locate(mix, blockId);
+  if (!found) return mix;
+  const point: AutomationPoint = {
+    atSecs: clamp(atSecs, 0, found.block.durationSecs),
+    gainDb: clamp(gainDb, MIN_GAIN_DB, MAX_GAIN_DB),
+    curve: 1,
+  };
+  const automation = [...found.block.automation, point].sort((a, b) => a.atSecs - b.atSecs);
+  return withBlock(mix, blockId, { ...found.block, automation });
+}
+
+/** Move one point. Not sorted, so a drag can keep addressing it by index. */
+export function moveAutomationPoint(
+  mix: MasterMix,
+  blockId: string,
+  index: number,
+  atSecs: number,
+  gainDb: number,
+): MasterMix {
+  const found = locate(mix, blockId);
+  if (!found || index < 0 || index >= found.block.automation.length) return mix;
+  const automation = found.block.automation.map((point, i) =>
+    i === index
+      ? {
+          ...point,
+          atSecs: clamp(atSecs, 0, found.block.durationSecs),
+          gainDb: clamp(gainDb, MIN_GAIN_DB, MAX_GAIN_DB),
+        }
+      : point,
+  );
+  return withBlock(mix, blockId, { ...found.block, automation });
+}
+
+export function removeAutomationPoint(mix: MasterMix, blockId: string, index: number): MasterMix {
+  const found = locate(mix, blockId);
+  if (!found || index < 0 || index >= found.block.automation.length) return mix;
+  return withBlock(mix, blockId, {
+    ...found.block,
+    automation: found.block.automation.filter((_, i) => i !== index),
+  });
+}
+
+export function setAutomationCurve(
+  mix: MasterMix,
+  blockId: string,
+  index: number,
+  curve: number,
+): MasterMix {
+  const found = locate(mix, blockId);
+  if (!found || index < 0 || index >= found.block.automation.length) return mix;
+  const automation = found.block.automation.map((point, i) =>
+    i === index ? { ...point, curve: clamp(curve, 0.05, 8) } : point,
+  );
+  return withBlock(mix, blockId, { ...found.block, automation });
+}
+
+/**
+ * The curve of a segment such that t=0.5 lands on `midDb`.
+ * Used when the user drags the midpoint of two keyframes.
+ */
+export function curveFromMidGain(fromDb: number, toDb: number, midDb: number): number {
+  const span = toDb - fromDb;
+  if (Math.abs(span) < 0.01) return 1;
+  const t = clamp((midDb - fromDb) / span, 0.05, 0.95);
+  return clamp(Math.log(t) / Math.log(0.5), 0.05, 8);
+}
+
+export function setBlockMixer(
+  mix: MasterMix,
+  blockId: string,
+  mixer: MixerSettings | null,
+): MasterMix {
+  const found = locate(mix, blockId);
+  if (!found) return mix;
+  return withBlock(mix, blockId, { ...found.block, mixer });
+}
+
+/** Drop an imported file onto a lane, creating one if the index is out of range. */
+export function placeAsset(
+  mix: MasterMix,
+  file: string,
+  durationSecs: number,
+  startSecs: number,
+  laneIndex: number,
+  laneName?: string,
+): MasterMix {
+  let next = mix;
+  let target = laneIndex;
+  if (target < 0 || target >= mix.lanes.length) {
+    const name = laneName?.trim() || file.replace(/\.[^.]+$/, "") || "Custom";
+    next = addLane(mix, name);
+    target = next.lanes.length - 1;
+  }
+  const block: MixBlock = {
+    id: newId("blk"),
+    source: { kind: "asset", file },
+    startSecs: Math.max(0, startSecs),
+    offsetSecs: 0,
+    durationSecs: Math.max(MIN_BLOCK_SECS, durationSecs),
+    gainDb: 0,
+    fadeInSecs: 0,
+    fadeOutSecs: 0,
+    mixer: null,
+    automation: [],
+  };
+  const lanes = next.lanes.map((lane, i) =>
+    i === target ? { ...lane, blocks: ordered([...lane.blocks, block]) } : lane,
+  );
+  return { ...next, lanes };
 }

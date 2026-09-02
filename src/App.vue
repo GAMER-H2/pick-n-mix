@@ -223,7 +223,7 @@ onBeforeUnmount(() => {
       </Transition>
 
       <Transition name="slide-panel">
-        <AdvancedMixer v-if="mixer.panelOpen" />
+        <AdvancedMixer v-if="mixer.panelOpen && !masterMix.open" />
       </Transition>
     </div>
 
@@ -278,6 +278,8 @@ onBeforeUnmount(() => {
     <DuplicateFilesDialog />
     <Transition name="fade">
       <SettingsModal v-if="ui.settingsOpen" />
+    </Transition>
+    <Transition name="fade">
       <MasterMixModal v-if="masterMix.open" />
     </Transition>
 

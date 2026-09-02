@@ -1,8 +1,8 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as api from "@/lib/api";
-import { cloneMix, mixDuration } from "@/lib/masterMix";
-import type { MasterMix, MixEntry, Waveform } from "@/lib/types";
+import { mixDuration, setBlockMixer as patchBlockMixer } from "@/lib/masterMix";
+import type { MasterMix, MixEntry, MixerSettings, Waveform } from "@/lib/types";
 
 /** Which of the three tools in the drawing is armed. */
 export type Tool = "select" | "blade" | "automation";
@@ -26,25 +26,41 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   const tool = ref<Tool>("select");
   const selection = ref<string[]>([]);
   const pixelsPerSecond = ref(8);
+  /** Session-only vertical zoom. Kept out of the saved arrangement. */
+  const laneHeight = ref(74);
   /** Where the playhead sits, in timeline seconds. Driven by the engine while
    *  auditioning and by the user's clicks otherwise. */
   const playhead = ref(0);
   const previewing = ref(false);
+  const previewPaused = ref(false);
 
   /** One waveform per playlist entry, fetched lazily and kept for the session. */
   const waveforms = ref<Record<number, Waveform>>({});
   const waveformsLoading = ref<Set<number>>(new Set());
+  /** Waveforms for imported files, keyed by the asset's stored name. */
+  const assetWaveforms = ref<Record<string, Waveform>>({});
+  const assetWaveformsLoading = ref<Set<string>>(new Set());
 
   const undoStack = ref<MasterMix[]>([]);
   const redoStack = ref<MasterMix[]>([]);
   let saveTimer: number | undefined;
+  let previewReloadTimer: number | undefined;
+  let sessionToken: string | null = null;
+  let lifecycle = 0;
 
   const duration = computed(() => mixDuration(mix.value));
   const canUndo = computed(() => undoStack.value.length > 0);
   const canRedo = computed(() => redoStack.value.length > 0);
   const selected = computed(() => new Set(selection.value));
 
+  /** Master mixes are JSON documents. Serialising snapshots strips Vue proxies
+   * at every depth while retaining forward-compatible fields verbatim. */
+  function snapshotMix(value: MasterMix): MasterMix {
+    return JSON.parse(JSON.stringify(value));
+  }
+
   async function openFor(id: string) {
+    const request = ++lifecycle;
     open.value = true;
     loading.value = true;
     error.value = null;
@@ -53,13 +69,25 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     undoStack.value = [];
     redoStack.value = [];
     waveforms.value = {};
+    assetWaveforms.value = {};
     playhead.value = 0;
+    previewing.value = false;
+    previewPaused.value = false;
     try {
-      apply(await api.masterMix(id));
+      const token = await api.beginMasterMixSession();
+      if (request !== lifecycle) {
+        // A newer open shares the backend's existing capture and owns it. A
+        // close leaves no owner, so it must end a begin that completed late.
+        if (!open.value) await api.endMasterMixSession(token);
+        return;
+      }
+      sessionToken = token;
+      const loaded = await api.masterMix(id);
+      if (request === lifecycle && sessionToken === token) apply(loaded);
     } catch (e) {
-      error.value = String(e);
+      if (request === lifecycle) error.value = String(e);
     } finally {
-      loading.value = false;
+      if (request === lifecycle) loading.value = false;
     }
   }
 
@@ -74,11 +102,25 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   }
 
   async function close() {
+    ++lifecycle;
+    open.value = false;
     // A pending edit must reach disk before the modal goes away, or the last
     // thing the user did is the one thing that is lost.
     await flush();
-    await stop();
-    open.value = false;
+    window.clearTimeout(previewReloadTimer);
+    previewReloadTimer = undefined;
+    const token = sessionToken;
+    sessionToken = null;
+    previewing.value = false;
+    previewPaused.value = false;
+    if (token) {
+      try {
+        await api.endMasterMixSession(token);
+      } catch (e) {
+        error.value = String(e);
+      }
+    }
+    loading.value = false;
     selection.value = [];
   }
 
@@ -91,7 +133,10 @@ export const useMasterMixStore = defineStore("masterMix", () => {
    * release.
    */
   function commit(next: MasterMix) {
-    undoStack.value = [...undoStack.value.slice(-(UNDO_DEPTH - 1)), cloneMix(mix.value)];
+    undoStack.value = [
+      ...undoStack.value.slice(-(UNDO_DEPTH - 1)),
+      snapshotMix(mix.value),
+    ];
     redoStack.value = [];
     mix.value = next;
     scheduleSave();
@@ -100,7 +145,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   function undo() {
     const previous = undoStack.value.pop();
     if (!previous) return;
-    redoStack.value = [...redoStack.value, cloneMix(mix.value)];
+    redoStack.value = [...redoStack.value, snapshotMix(mix.value)];
     mix.value = previous;
     pruneSelection();
     scheduleSave();
@@ -109,7 +154,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   function redo() {
     const next = redoStack.value.pop();
     if (!next) return;
-    undoStack.value = [...undoStack.value, cloneMix(mix.value)];
+    undoStack.value = [...undoStack.value, snapshotMix(mix.value)];
     mix.value = next;
     pruneSelection();
     scheduleSave();
@@ -118,7 +163,9 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   /** Undo can remove blocks that were selected; a stale id would break the
    *  next keyboard action. */
   function pruneSelection() {
-    const alive = new Set(mix.value.lanes.flatMap((lane) => lane.blocks.map((b) => b.id)));
+    const alive = new Set(
+      mix.value.lanes.flatMap((lane) => lane.blocks.map((b) => b.id)),
+    );
     selection.value = selection.value.filter((id) => alive.has(id));
   }
 
@@ -162,7 +209,10 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     window.clearTimeout(saveTimer);
     saveTimer = undefined;
     try {
-      undoStack.value = [...undoStack.value.slice(-(UNDO_DEPTH - 1)), cloneMix(mix.value)];
+      undoStack.value = [
+        ...undoStack.value.slice(-(UNDO_DEPTH - 1)),
+        snapshotMix(mix.value),
+      ];
       redoStack.value = [];
       apply(await api.resetMasterMix(playlistId.value));
       selection.value = [];
@@ -173,22 +223,72 @@ export const useMasterMixStore = defineStore("masterMix", () => {
 
   /** Audition from `fromSecs`, including edits not yet written to disk. */
   async function play(fromSecs = playhead.value) {
-    if (!playlistId.value) return;
+    const token = sessionToken;
+    if (!playlistId.value || !token) return;
     try {
-      await api.playMasterMix(playlistId.value, mix.value, Math.max(0, fromSecs));
+      await api.playMasterMix(
+        playlistId.value,
+        mix.value,
+        Math.max(0, fromSecs),
+        token,
+      );
+      if (sessionToken !== token) return;
       previewing.value = true;
+      previewPaused.value = false;
       error.value = null;
     } catch (e) {
+      if (sessionToken !== token) return;
       previewing.value = false;
       error.value = String(e);
     }
   }
 
-  async function stop() {
+  async function pause() {
+    const token = sessionToken;
+    if (!previewing.value || previewPaused.value || !token) return;
+    const paused = !(await api.setMasterMixPlaying(false, token));
+    if (sessionToken === token && paused) previewPaused.value = true;
+  }
+
+  async function resume() {
+    const token = sessionToken;
+    if (!previewing.value || !previewPaused.value || !token) return;
+    const resumed = await api.setMasterMixPlaying(true, token);
+    if (sessionToken === token && resumed) previewPaused.value = false;
+  }
+
+  /** Rebuild the loaded plan so timeline and mixer edits become audible. */
+  async function reloadPreview() {
     if (!previewing.value) return;
+    const token = sessionToken;
+    const absolutePosition = playhead.value;
+    const wasPaused = previewPaused.value;
+    await play(absolutePosition);
+    if (sessionToken !== token) return;
+    // Polling can briefly report the replacement decoder at zero while it is
+    // loading. Reloading is an implementation detail, not a playhead move.
+    playhead.value = absolutePosition;
+    if (wasPaused && previewing.value) await pause();
+  }
+
+  function schedulePreviewReload() {
+    if (!previewing.value) return;
+    window.clearTimeout(previewReloadTimer);
+    previewReloadTimer = window.setTimeout(() => {
+      previewReloadTimer = undefined;
+      void reloadPreview();
+    }, 150);
+  }
+
+  async function stop() {
+    window.clearTimeout(previewReloadTimer);
+    previewReloadTimer = undefined;
+    const token = sessionToken;
+    if (!previewing.value || !token) return;
     previewing.value = false;
+    previewPaused.value = false;
     try {
-      await api.stopMasterMix();
+      await api.stopMasterMix(token);
     } catch {
       // Nothing useful to do: the engine is already not playing this mix.
     }
@@ -197,6 +297,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   /** Called when the engine reports the arrangement has run out. */
   function previewEnded() {
     previewing.value = false;
+    previewPaused.value = false;
   }
 
   async function loadWaveform(index: number) {
@@ -212,6 +313,30 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     }
   }
 
+  async function loadAssetWaveform(file: string) {
+    if (assetWaveforms.value[file] || assetWaveformsLoading.value.has(file))
+      return;
+    assetWaveformsLoading.value.add(file);
+    try {
+      const waveform = await api.assetWaveform(playlistId.value, file);
+      assetWaveforms.value = { ...assetWaveforms.value, [file]: waveform };
+    } catch {
+      // Same as a missing song: the block still sits on the timeline.
+    } finally {
+      assetWaveformsLoading.value.delete(file);
+    }
+  }
+
+  /**
+   * Write a block's mixer without an undo step. Knob moves would otherwise
+   * bury the arrangement history in hundreds of snapshots.
+   */
+  function setBlockMixer(blockId: string, mixer: MixerSettings | null) {
+    mix.value = patchBlockMixer(mix.value, blockId, mixer);
+    scheduleSave();
+    schedulePreviewReload();
+  }
+
   function select(ids: string[]) {
     selection.value = ids;
   }
@@ -223,7 +348,14 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   }
 
   function zoom(factor: number) {
-    pixelsPerSecond.value = Math.min(400, Math.max(0.5, pixelsPerSecond.value * factor));
+    pixelsPerSecond.value = Math.min(
+      400,
+      Math.max(0.5, pixelsPerSecond.value * factor),
+    );
+  }
+
+  function zoomTracks(factor: number) {
+    laneHeight.value = Math.min(180, Math.max(48, laneHeight.value * factor));
   }
 
   return {
@@ -238,9 +370,12 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     selection,
     selected,
     pixelsPerSecond,
+    laneHeight,
     playhead,
     previewing,
+    previewPaused,
     waveforms,
+    assetWaveforms,
     duration,
     canUndo,
     canRedo,
@@ -254,11 +389,17 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     setEnabled,
     reset,
     play,
+    pause,
+    resume,
+    reloadPreview,
     stop,
     previewEnded,
     loadWaveform,
+    loadAssetWaveform,
+    setBlockMixer,
     select,
     toggleSelected,
     zoom,
+    zoomTracks,
   };
 });

@@ -264,6 +264,33 @@ impl TrackDecoder {
         Ok(written)
     }
 
+    /// Fill a timeline block by returning to `loop_start_secs` whenever EOF is
+    /// reached. A source whose offset is at or beyond EOF remains silent.
+    pub fn read_looping(&mut self, out: &mut [f32], loop_start_secs: f64) -> Result<usize> {
+        let loop_start_secs = loop_start_secs.max(0.0);
+        if self.info.duration_secs <= loop_start_secs + f64::EPSILON {
+            return Ok(0);
+        }
+
+        let mut written = 0;
+        while written < out.len() {
+            let got = self.read(&mut out[written..])?;
+            written += got;
+            if written >= out.len() {
+                break;
+            }
+            self.seek(loop_start_secs)?;
+            // A corrupt duration must not turn a zero-sample decoder into a
+            // busy loop. One retry is enough to establish that it cannot play.
+            let got = self.read(&mut out[written..])?;
+            written += got;
+            if got == 0 {
+                break;
+            }
+        }
+        Ok(written)
+    }
+
     /// Decode and resample one more chunk into `pending`. Returns false at EOF.
     fn produce(&mut self) -> Result<bool> {
         let Some(_) = self.resampler.as_ref() else {

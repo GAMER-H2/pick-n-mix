@@ -254,6 +254,10 @@ impl Source {
     }
 }
 
+fn source_position_ms(source: &Source) -> u64 {
+    (source.decoded_secs() * 1000.0) as u64
+}
+
 /// One decoded, effects-processed audio source. The worker holds at most two
 /// at once: `current` (always playing) and `next` (being pre-mixed in ahead
 /// of a crossfade).
@@ -355,9 +359,7 @@ impl AudioEngine {
 
         std::thread::Builder::new()
             .name("pnm-audio-out".into())
-            .spawn(move || {
-                output_thread(stream_shared, ready_tx, ring_tx, reopen_rx, rebind_tx)
-            })
+            .spawn(move || output_thread(stream_shared, ready_tx, ring_tx, reopen_rx, rebind_tx))
             .map_err(|e| anyhow!("spawning audio thread: {e}"))?;
 
         let (device_rate, _channels) = ready_rx
@@ -982,14 +984,19 @@ fn worker(
                 }
                 Cmd::LoadTimeline { source, reply } => {
                     let info = source.info().clone();
+                    let timeline_source = Source::Timeline(source);
                     shared
                         .duration_ms
                         .store((info.duration_secs * 1000.0) as u64, Ordering::Relaxed);
-                    shared.position_ms.store(0, Ordering::Relaxed);
+                    shared
+                        .position_ms
+                        .store(source_position_ms(&timeline_source), Ordering::Relaxed);
                     shared.stream_info.store(Arc::new(Some(info.clone())));
-                    shared.track_gain_db.store(0.0f32.to_bits(), Ordering::Relaxed);
+                    shared
+                        .track_gain_db
+                        .store(0.0f32.to_bits(), Ordering::Relaxed);
                     current = Some(Voice {
-                        source: Source::Timeline(source),
+                        source: timeline_source,
                         // Every block in a mix carries its own resolved
                         // cascade and runs through its own chain inside the
                         // timeline, so the voice-level chain is bypassed
@@ -1585,6 +1592,18 @@ mod tests {
         assert_eq!(fade_step(fade_mode_bits("pause"), false, ramp), ramp);
         assert_eq!(fade_step(fade_mode_bits("both"), true, ramp), ramp);
         assert_eq!(fade_step(fade_mode_bits("both"), false, ramp), ramp);
+    }
+
+    #[test]
+    fn loading_a_preseeked_timeline_reports_its_source_position() {
+        let plan = crate::audio::timeline::Plan {
+            blocks: Vec::new(),
+            duration_secs: 30.0,
+        };
+        let mut timeline = TimelineSource::new(plan, 48_000);
+        timeline.seek(12.25).unwrap();
+        let source = Source::Timeline(Box::new(timeline));
+        assert_eq!(source_position_ms(&source), 12_250);
     }
 
     #[test]

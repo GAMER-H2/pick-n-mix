@@ -290,6 +290,15 @@ const DEFS = {
       { cx: 17.8, cy: 17.4, r: 2.6 },
     ],
   },
+  /** Bounce the mix to a file. */
+  bounce: {
+    mode: "stroke",
+    d: [
+      "M12 3.6v10.4",
+      "M8.2 10.4 12 14.2l3.8-3.8",
+      "M5.2 17.4h13.6",
+    ],
+  },
   /** Volume automation: a breakpoint envelope over a region. */
   automation: {
     mode: "stroke",
