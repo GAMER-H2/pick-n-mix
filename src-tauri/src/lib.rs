@@ -199,8 +199,19 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                         // is no queue to advance into, but the editor does
                         // need to know the playhead has stopped.
                         if state.master_mix_playing() {
-                            state.engine.pause();
-                            let _ = app.emit("playing-changed", false);
+                            // An audition inside the editor stops where the
+                            // arrangement stops. A mix playing from the queue
+                            // is a queue entry that has ended, so it hands on
+                            // to whatever was queued behind it.
+                            if commands::master_mix_owns_playback(&state) {
+                                state.engine.pause();
+                                let _ = app.emit("playing-changed", false);
+                                let _ = app.emit("master-mix-ended", ());
+                                continue;
+                            }
+                            if let Err(error) = commands::advance_past_mix(&app, &state) {
+                                let _ = app.emit("engine-error", error);
+                            }
                             let _ = app.emit("master-mix-ended", ());
                             continue;
                         }
@@ -298,7 +309,9 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                         {
                             let mut player = state.player.lock();
                             match player.jump_to(order_index) {
-                                Some(track) if track.id != track_id => {
+                                Some(entry)
+                                    if entry.track().map(|t| t.id.as_str()) != Some(&track_id) =>
+                                {
                                     // Should not happen: every queue mutation
                                     // also cancels a pending crossfade. Play on
                                     // regardless — the audio has already
@@ -359,13 +372,24 @@ fn spawn_ticker(app: tauri::AppHandle) {
 
                 // Keep the OS transport in step. `publish` skips the call when
                 // nothing has changed, so this is cheap at tick rate.
-                let current = state.player.lock().current().cloned();
-                media::publish(
-                    &app,
-                    current.as_ref(),
-                    snapshot.playing,
-                    snapshot.position_secs,
-                );
+                //
+                // While the Master Mixer owns the engine the OS is told there
+                // is nothing playing at all, rather than simply not being
+                // told anything. Going quiet would leave Control Centre and
+                // MPRIS showing the queue track — which is paused, behind a
+                // modal, and not what the speakers are playing — with live
+                // buttons on it. Publishing an empty, stopped state takes the
+                // entry away, so there is nothing left to press by mistake.
+                let current = if commands::master_mix_owns_playback(&state) {
+                    None
+                } else {
+                    state.player.lock().current().cloned()
+                };
+                let (playing, position) = match current {
+                    Some(_) => (snapshot.playing, snapshot.position_secs),
+                    None => (false, 0.0),
+                };
+                media::publish(&app, current.as_ref(), playing, position);
             }
         })
         .ok();
@@ -579,12 +603,15 @@ pub fn run() {
             commands::entry_waveform,
             commands::begin_master_mix_session,
             commands::end_master_mix_session,
+            commands::master_mix_now_playing,
+            commands::queue_playlist,
             commands::play_master_mix,
             commands::set_master_mix_playing,
             commands::stop_master_mix,
             commands::import_mix_asset,
             commands::asset_waveform,
             commands::bounce_master_mix,
+            commands::ffmpeg_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Pick n Mix");

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useMasterMixStore } from "../masterMix";
-import { deleteBlocks, moveBlock } from "@/lib/masterMix";
+import { deleteBlocks, locate, moveBlock } from "@/lib/masterMix";
 import type { MasterMix, MasterMixView } from "@/lib/types";
 
 const masterMix = vi.fn();
@@ -106,6 +106,15 @@ describe("master mix store", () => {
     playMasterMix.mockResolvedValue(100);
     setMasterMixPlaying.mockImplementation(async (playing: boolean) => playing);
     stopMasterMix.mockResolvedValue(undefined);
+  });
+
+  it("does not chase the playhead until it is asked to", async () => {
+    // Following moves the timeline under the pointer, which is worse while an
+    // edit is being lined up than losing sight of where the music has got to.
+    const store = useMasterMixStore();
+    expect(store.followPlayhead).toBe(false);
+    expect(store.snapping).toBe(true);
+    expect(store.gridSnapping).toBe(false);
   });
 
   it("loads a playlist's arrangement and its entries", async () => {
@@ -241,6 +250,73 @@ describe("master mix store", () => {
     expect(store.playhead).toBe(24);
   });
 
+  /**
+   * The bug this exists for: the engine is polled five times a second, so a
+   * snapshot taken *before* a seek can be delivered *after* it. Believing it
+   * threw the playhead back to the old position for a frame — which is what
+   * made the playhead look like it would not stay where it was put.
+   */
+  it("ignores an engine position left over from before a seek", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(60);
+    expect(store.playhead).toBe(60);
+
+    store.applyEnginePosition(3.5);
+    expect(store.playhead).toBe(60);
+
+    // The first report that has caught up is believed, and so is every one
+    // after it.
+    store.applyEnginePosition(60.2);
+    expect(store.playhead).toBe(60.2);
+    store.applyEnginePosition(60.4);
+    expect(store.playhead).toBe(60.4);
+  });
+
+  it("takes engine positions no further behind than the polling interval", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(60);
+
+    // The engine reports where the audio is, which can be a hair short of the
+    // requested position without being a stale report at all.
+    store.applyEnginePosition(59.9);
+    expect(store.playhead).toBe(59.9);
+  });
+
+  it("dropping the playhead by hand abandons a position the engine still owes", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(60);
+
+    store.setPlayhead(10);
+    expect(store.playhead).toBe(10);
+    // Nothing is being waited for any more, so the next report is followed.
+    store.applyEnginePosition(10.2);
+    expect(store.playhead).toBe(10.2);
+  });
+
+  it("ignores engine positions entirely when nothing is being auditioned", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    store.setPlayhead(30);
+
+    store.applyEnginePosition(0);
+    expect(store.playhead).toBe(30);
+  });
+
+  it("a rebuild does not move where stop will return to", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(12);
+    store.playhead = 45;
+
+    await store.reloadPreview();
+
+    expect(store.playhead).toBe(45);
+    expect(store.playStartSecs).toBe(12);
+  });
+
   it("ignores a play completion after close has restored the session", async () => {
     let finishPlay!: () => void;
     playMasterMix.mockImplementationOnce(
@@ -320,5 +396,42 @@ describe("master mix store", () => {
 
     expect(store.error).toContain("disk full");
     expect(store.mix.lanes[0].blocks[0].startSecs).toBe(8);
+  });
+
+  /**
+   * Pitching a region up makes it cover more of the song per second, so the
+   * region shrinks to keep the same audio under it. The first write only
+   * records the speed — there is nothing yet to compare against.
+   */
+  it("resizes a block when its resolved speed changes", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    store.noteBlockSpeed("a", 1);
+
+    store.setBlockMixer("a", { pitch: { semitones: 12, cents: 0 } }, 2);
+
+    expect(locate(store.mix, "a")!.block.durationSecs).toBe(50);
+  });
+
+  it("leaves a block alone the first time its speed is seen", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+
+    store.setBlockMixer("a", { pitch: { semitones: 12, cents: 0 } }, 2);
+
+    expect(locate(store.mix, "a")!.block.durationSecs).toBe(100);
+    // But the speed is now known, so the next change does resize it.
+    store.setBlockMixer("a", {}, 1);
+    expect(locate(store.mix, "a")!.block.durationSecs).toBe(200);
+  });
+
+  it("writes a block mixer with no speed at all without touching its length", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    store.noteBlockSpeed("a", 1);
+
+    store.setBlockMixer("a", { enabled: false });
+
+    expect(locate(store.mix, "a")!.block.durationSecs).toBe(100);
   });
 });

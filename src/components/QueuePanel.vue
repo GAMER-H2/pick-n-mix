@@ -14,12 +14,13 @@ const current = computed(() => player.queue.currentIndex);
 const items = computed(() => player.queue.items);
 
 /** Clicking the row that is already playing toggles it instead of restarting. */
-async function jump(index: number) {
-  if (index === current.value && player.playing) {
+async function jump(index: number, positionSecs?: number) {
+  // A chapter inside the playing mix is a place to go, not a play/pause.
+  if (positionSecs === undefined && index === current.value && player.playing) {
     await player.toggle();
     return;
   }
-  await api.playQueueIndex(index);
+  await api.playQueueIndex(index, positionSecs);
 }
 
 async function remove(index: number) {
@@ -38,8 +39,11 @@ async function move(from: number, to: number) {
 }
 
 function openMenu(index: number, event: MouseEvent) {
-  const track = items.value[index];
-  if (track) ui.openContextMenu({ x: event.clientX, y: event.clientY, tracks: [track] });
+  // A mix has no track menu: nothing in it can be reordered or sent elsewhere
+  // on its own.
+  const row = items.value[index];
+  if (row?.kind !== "track") return;
+  ui.openContextMenu({ x: event.clientX, y: event.clientY, tracks: [row.track] });
 }
 </script>
 
@@ -70,6 +74,7 @@ function openMenu(index: number, event: MouseEvent) {
         :items="items"
         :current-index="current"
         :playing="player.playing"
+        :position-secs="player.position"
         @play="jump"
         @remove="remove"
         @move="move"

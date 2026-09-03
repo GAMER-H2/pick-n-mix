@@ -29,9 +29,10 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
+use crate::audio::ambience::{AmbienceMixer, Bank};
 use crate::audio::decode::{StreamInfo, TrackDecoder};
 use crate::audio::dsp::{Chain, CHANNELS};
-use crate::audio::params::Resolved;
+use crate::audio::params::{Filter, Resolved};
 use crate::master_mix::Block;
 
 /// Blocks that may sound simultaneously. Beyond this the quietest thing to do
@@ -58,6 +59,32 @@ pub struct PlanBlock {
     pub settings: Arc<Resolved>,
     /// Replay-gain normalisation for the underlying file.
     pub track_gain_db: f32,
+}
+
+impl PlanBlock {
+    /// Varispeed for this block, as a source-seconds-per-timeline-second
+    /// ratio.
+    ///
+    /// A block is laid out in timeline seconds, so pitching it up does not
+    /// make it end sooner — it makes it cover more of the song. The editor
+    /// resizes the region to match when the pitch is changed, which is the
+    /// half of this the user sees.
+    pub fn speed(&self) -> f64 {
+        if self.settings.enabled {
+            self.settings.pitch.ratio()
+        } else {
+            1.0
+        }
+    }
+
+    /// The ambience beds this block asks for. Empty when its mixer is off.
+    pub fn filters(&self) -> &[Filter] {
+        if self.settings.enabled {
+            &self.settings.filters
+        } else {
+            &[]
+        }
+    }
 }
 
 /// A whole master mix, ready to play.
@@ -94,6 +121,7 @@ struct OpenRequest {
     path: PathBuf,
     offset_secs: f64,
     into_block_secs: f64,
+    speed: f64,
     rate: u32,
     /// The timeline frame this decoder's first sample belongs to.
     enter_frame: u64,
@@ -135,7 +163,17 @@ pub struct TimelineSource {
     /// Effect chains, lent to active blocks and reset on return. A `Chain`
     /// owns delay lines and reverb combs, so they are worth reusing.
     chains: Vec<Chain>,
+    /// One ambience mixer per chain slot, taken and returned together, so a
+    /// block's beds are as much a part of its voice as its reverb is.
+    ambience: Vec<AmbienceMixer>,
     free_chains: Vec<usize>,
+    /// Decoded beds available to draw from. Empty until the engine hands one
+    /// over, which is why a bed can be silent for the first moment it is asked
+    /// for and correct thereafter.
+    bank: Arc<Bank>,
+    /// Beds a block wanted that the bank did not have. Drained by whoever is
+    /// driving this source, so it can go and decode them.
+    wanted_beds: HashSet<String>,
     interleaved: Vec<f32>,
     planar: Vec<Vec<f32>>,
     mix: Vec<Vec<f32>>,
@@ -176,7 +214,10 @@ impl TimelineSource {
             open_tx: Some(open_tx),
             ready_rx,
             chains: Vec::new(),
+            ambience: Vec::new(),
             free_chains: Vec::new(),
+            bank: Arc::new(Bank::new()),
+            wanted_beds: HashSet::new(),
             interleaved: Vec::new(),
             planar: vec![Vec::new(); CHANNELS],
             mix: vec![Vec::new(); CHANNELS],
@@ -186,6 +227,19 @@ impl TimelineSource {
 
     pub fn info(&self) -> &StreamInfo {
         &self.info
+    }
+
+    /// Hand over the decoded ambience beds. Cheap enough to call every audio
+    /// block: it is an `Arc` swap, and the engine already holds the bank.
+    pub fn set_bank(&mut self, bank: Arc<Bank>) {
+        if !Arc::ptr_eq(&self.bank, &bank) {
+            self.bank = bank;
+        }
+    }
+
+    /// Beds asked for since this was last called, so they can be decoded.
+    pub fn take_wanted_beds(&mut self) -> Vec<String> {
+        self.wanted_beds.drain().collect()
     }
 
     pub fn decoded_secs(&self) -> f64 {
@@ -314,10 +368,12 @@ impl TimelineSource {
             let behind = (self.cursor - next_frame) as f64 / self.rate as f64;
             if behind > MAX_CATCH_UP_SECS {
                 let plan_block = &self.plan.blocks[ready.block_ix];
+                // Timeline seconds into the block, converted to the source
+                // seconds that many will consume at this block's speed.
                 let into_block = self.decoded_secs() - plan_block.block.start_secs;
                 let target = looped_source_secs(
                     plan_block.block.offset_secs,
-                    into_block,
+                    into_block * plan_block.speed(),
                     decoder.info.duration_secs,
                 );
                 if decoder.seek(target).is_err() {
@@ -398,6 +454,7 @@ impl TimelineSource {
                 path: plan_block.path.clone(),
                 offset_secs: plan_block.block.offset_secs,
                 into_block_secs: into_block,
+                speed: plan_block.speed(),
                 rate: self.rate,
                 enter_frame: frame_of(enter_secs, self.rate),
             });
@@ -458,6 +515,21 @@ impl TimelineSource {
             }
             chain.apply_gain(&mut self.planar, count);
 
+            // Atmospheres, laid over this block's music the same way the main
+            // player lays them over the master bus: after the effect chain, so
+            // the block's EQ and reverb are not applied to the bed, and before
+            // the envelope below, so a bed fades out with the region carrying
+            // it rather than hanging on after it.
+            let filters = plan_block.filters();
+            let beds = &mut self.ambience[chain_ix];
+            beds.sync(filters, &self.bank);
+            if !beds.is_silent() {
+                beds.process(&mut self.planar, count);
+            }
+            for id in beds.missing(filters, &self.bank) {
+                self.wanted_beds.insert(id.to_string());
+            }
+
             // The envelope is sampled at each end of this stretch and
             // interpolated across it. At 512 frames that is ~10 ms, far below
             // anything audible as a stair-step, and it keeps a per-frame
@@ -503,13 +575,17 @@ impl TimelineSource {
         let mut chain = Chain::new();
         chain.prepare(self.rate as f32);
         self.chains.push(chain);
+        let mut beds = AmbienceMixer::new();
+        beds.prepare(self.rate as f32);
+        self.ambience.push(beds);
         self.chains.len() - 1
     }
 
-    /// Reset before it goes back in the pool, so one block's reverb tail can
-    /// never bleed into the next block that happens to be handed this chain.
+    /// Reset before it goes back in the pool, so one block's reverb tail — or
+    /// its rain — can never bleed into the next block handed this slot.
     fn release_chain(&mut self, ix: usize) {
         self.chains[ix].prepare(self.rate as f32);
+        self.ambience[ix].prepare(self.rate as f32);
         self.free_chains.push(ix);
     }
 }
@@ -532,9 +608,12 @@ fn opener(requests: Receiver<OpenRequest>, ready: Sender<Opened>) {
     for request in requests.iter() {
         let opened = TrackDecoder::open(&request.path, request.rate)
             .and_then(|mut decoder| {
+                // Set before seeking: varispeed is folded into the resampler,
+                // and the position below is in source seconds either way.
+                decoder.set_speed(request.speed)?;
                 let seek_secs = looped_source_secs(
                     request.offset_secs,
-                    request.into_block_secs,
+                    request.into_block_secs * request.speed,
                     decoder.info.duration_secs,
                 );
                 if seek_secs > 0.0 {
@@ -652,6 +731,49 @@ mod tests {
         source.seek(-5.0).unwrap();
         assert_eq!(source.decoded_secs(), 0.0);
         assert!(!source.is_eof());
+    }
+
+    /// A block laid out in timeline seconds covers *more* of its song when it
+    /// is pitched up. The editor resizes the region so the same audio stays
+    /// under it; this is the half that decides where in the file to read.
+    #[test]
+    fn a_pitched_block_consumes_its_source_faster() {
+        use crate::audio::params::Pitch;
+
+        let mut block = plan_block(0.0, 10.0);
+        block.settings = Arc::new(Resolved {
+            pitch: Pitch {
+                semitones: 12.0,
+                cents: 0.0,
+            },
+            ..Resolved::default()
+        });
+        assert!((block.speed() - 2.0).abs() < 1e-9, "an octave up is double speed");
+
+        // Four timeline seconds in, at double speed, is eight source seconds.
+        let into_block = 4.0;
+        let target = looped_source_secs(block.block.offset_secs, into_block * block.speed(), 60.0);
+        assert!((target - 8.0).abs() < 1e-9);
+    }
+
+    /// A bypassed mixer must not silently varispeed the block, or turning the
+    /// mixer off would change where the audio sits rather than only how it
+    /// sounds.
+    #[test]
+    fn a_disabled_mixer_leaves_a_block_at_normal_speed() {
+        use crate::audio::params::Pitch;
+
+        let mut block = plan_block(0.0, 10.0);
+        block.settings = Arc::new(Resolved {
+            enabled: false,
+            pitch: Pitch {
+                semitones: 7.0,
+                cents: 0.0,
+            },
+            ..Resolved::default()
+        });
+        assert_eq!(block.speed(), 1.0);
+        assert!(block.filters().is_empty(), "and asks for no atmospheres");
     }
 
     #[test]

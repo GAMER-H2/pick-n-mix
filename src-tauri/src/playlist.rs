@@ -120,6 +120,36 @@ impl Entry {
 }
 
 /// A playlist joined against the local library, ready for the UI.
+/// One entry, matched against this library.
+///
+/// The stored path is tried first as a fast path, then musical identity. Kept
+/// out of [`Playlist::resolve`] so that [`Playlist::covers`] can use the same
+/// rules without resolving a whole playlist to answer a question about four
+/// of its songs.
+fn resolve_entry(db: &Db, entry: &Entry) -> Result<Option<Track>> {
+    let by_path = if let Some(path) = entry.local_path.as_deref() {
+        let direct = match db.file_by_location("local", path)? {
+            Some(file) => db.get_track(&file.song_id)?,
+            None => None,
+        };
+        direct
+            .or(db.get_track(&stable_id("t", path))?)
+            .filter(|track| normalise(&track.album) == normalise(&entry.album))
+    } else {
+        None
+    };
+
+    match by_path {
+        Some(track) => Ok(Some(track)),
+        None => db.resolve(
+            entry.musicbrainz_recording_id.as_deref(),
+            &entry.artist,
+            &entry.title,
+            &entry.album,
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Resolved {
@@ -264,34 +294,40 @@ impl Playlist {
     }
 
     /// Join every entry against the library.
+    /// Up to `limit` different covers, taken from the front of the playlist.
+    ///
+    /// What a playlist without a picture of its own is drawn as. Entries are
+    /// resolved one at a time and the walk stops as soon as there are enough,
+    /// so the common case costs four lookups rather than one per song — this
+    /// is called for every playlist in the sidebar's list.
+    ///
+    /// The scan is bounded as well: a long playlist of songs nobody here owns
+    /// must not turn a cheap listing into a full resolve.
+    pub fn covers(&self, db: &Db, limit: usize) -> Vec<String> {
+        const SCAN: usize = 40;
+        let mut out: Vec<String> = Vec::new();
+        for entry in self.tracks.iter().take(SCAN) {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok(Some(track)) = resolve_entry(db, entry) else {
+                continue;
+            };
+            if let Some(id) = track.artwork_id {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    }
+
     pub fn resolve(self, db: &Db) -> Result<Resolved> {
         let mut items = Vec::with_capacity(self.tracks.len());
         let mut missing = 0;
 
         for (index, entry) in self.tracks.iter().enumerate() {
-            // The stored path is tried first as a fast path, then we fall back
-            // to matching on musical identity.
-            let by_path = if let Some(path) = entry.local_path.as_deref() {
-                let direct = match db.file_by_location("local", path)? {
-                    Some(file) => db.get_track(&file.song_id)?,
-                    None => None,
-                };
-                direct
-                    .or(db.get_track(&stable_id("t", path))?)
-                    .filter(|track| normalise(&track.album) == normalise(&entry.album))
-            } else {
-                None
-            };
-
-            let track = match by_path {
-                Some(t) => Some(t),
-                None => db.resolve(
-                    entry.musicbrainz_recording_id.as_deref(),
-                    &entry.artist,
-                    &entry.title,
-                    &entry.album,
-                )?,
-            };
+            let track = resolve_entry(db, entry)?;
 
             if track.is_none() {
                 missing += 1;

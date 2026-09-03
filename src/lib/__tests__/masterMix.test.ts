@@ -18,14 +18,18 @@ import {
   removeAutomationPoint,
   removeLane,
   rulerStep,
+  scaleBlockForSpeed,
   setAutomationCurve,
   setBlockMixer,
+  soundSignature,
+  gridCandidates,
   snapCandidates,
   snapDrag,
   snapTime,
   splitBlock,
   timecode,
   trimBlock,
+  updateLane,
 } from "../masterMix";
 import type { MasterMix, MixBlock } from "../types";
 
@@ -247,6 +251,27 @@ describe("snapping", () => {
     expect(snapTime(90, [0, 100, 180], 5)).toBe(90);
   });
 
+  it("offers the ruler marks either side of each time, and no others", () => {
+    // Two per time is the whole point: everything further away is further
+    // away than one of these, so a long timeline costs nothing to snap on.
+    expect(gridCandidates([7.4], 1)).toEqual([7, 8]);
+    expect(gridCandidates([3], 0.25)).toEqual([3, 3]);
+    expect(gridCandidates([1, 9.5], 5)).toEqual([0, 5, 5, 10]);
+  });
+
+  it("never offers a grid mark before the start of the timeline", () => {
+    expect(gridCandidates([0.1], 1)).toEqual([0, 1]);
+  });
+
+  it("has no grid to offer when there is no spacing", () => {
+    expect(gridCandidates([7.4], 0)).toEqual([]);
+  });
+
+  it("lands a time on a whole second once the grid is in the candidates", () => {
+    const candidates = [...snapCandidates(mix(), new Set(["a"])), ...gridCandidates([42.2], 1)];
+    expect(snapTime(42.2, candidates, 0.9)).toBe(42);
+  });
+
   it("snaps a dragged block by whichever of its edges is closer", () => {
     // Dropping a 20 s block so its *end* lands on 100 is the common way to
     // butt one song against the next.
@@ -362,5 +387,68 @@ describe("imported files and per-block mixer", () => {
     const next = setBlockMixer(mix(), "a", { enabled: true, reverb: { enabled: true, mix: 0.4, size: 0.5, damping: 0.5, width: 1, predelayMs: 0 } });
     expect(locate(next, "a")!.block.mixer?.reverb?.mix).toBe(0.4);
     expect(locate(mix(), "a")!.block.mixer).toBeNull();
+  });
+});
+
+describe("pitch and the size of a region", () => {
+  it("halves a block that is pitched up an octave, so the same audio stays under it", () => {
+    const next = scaleBlockForSpeed(mix(), "a", 1, 2);
+    const block = locate(next, "a")!.block;
+    expect(block.durationSecs).toBe(50);
+    // The offset is a position in the song, not a length, so it does not move.
+    expect(block.offsetSecs).toBe(0);
+  });
+
+  it("stretches a block that is pitched down", () => {
+    const next = scaleBlockForSpeed(mix(), "a", 1, 0.5);
+    expect(locate(next, "a")!.block.durationSecs).toBe(200);
+  });
+
+  it("carries the fades and keyframes with it, so the envelope keeps its shape", () => {
+    const start = mix();
+    start.lanes[0].blocks[0] = {
+      ...start.lanes[0].blocks[0],
+      fadeInSecs: 10,
+      fadeOutSecs: 20,
+      automation: [
+        { atSecs: 0, gainDb: -6, curve: 1 },
+        { atSecs: 50, gainDb: 0, curve: 1 },
+      ],
+    };
+
+    const block = locate(scaleBlockForSpeed(start, "a", 1, 2), "a")!.block;
+    expect(block.fadeInSecs).toBe(5);
+    expect(block.fadeOutSecs).toBe(10);
+    expect(block.automation.map((p) => p.atSecs)).toEqual([0, 25]);
+    expect(block.automation.map((p) => p.gainDb)).toEqual([-6, 0]);
+  });
+
+  it("does nothing when the speed has not moved, or is nonsense", () => {
+    const start = mix();
+    expect(scaleBlockForSpeed(start, "a", 1, 1)).toBe(start);
+    expect(scaleBlockForSpeed(start, "a", 0, 2)).toBe(start);
+    expect(scaleBlockForSpeed(start, "a", 1, 0)).toBe(start);
+    expect(scaleBlockForSpeed(start, "missing", 1, 2)).toBe(start);
+  });
+
+  it("never shrinks a block out of existence, however far it is pitched", () => {
+    const block = locate(scaleBlockForSpeed(mix(), "a", 1, 100000), "a")!.block;
+    expect(block.durationSecs).toBeGreaterThanOrEqual(MIN_BLOCK_SECS);
+  });
+});
+
+describe("what counts as an audible edit", () => {
+  it("ignores a rename or a recolour", () => {
+    const before = soundSignature(mix());
+    const renamed = updateLane(mix(), 0, { name: "Intro", colorHue: 200 });
+    expect(soundSignature(renamed)).toBe(before);
+  });
+
+  it("notices a move, a mute, a lane gain and a block's mixer", () => {
+    const before = soundSignature(mix());
+    expect(soundSignature(moveBlock(mix(), "a", 5))).not.toBe(before);
+    expect(soundSignature(updateLane(mix(), 0, { muted: true }))).not.toBe(before);
+    expect(soundSignature(updateLane(mix(), 0, { gainDb: -3 }))).not.toBe(before);
+    expect(soundSignature(setBlockMixer(mix(), "a", { enabled: false }))).not.toBe(before);
   });
 });

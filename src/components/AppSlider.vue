@@ -24,6 +24,15 @@ const props = withDefaults(
     detents?: number[];
     /** How close, as a fraction of the range, a detent grabs from. */
     detentRadius?: number;
+    /**
+     * Positions to mark on the track, in the slider's own units.
+     *
+     * Unlike detents these only draw: they are landmarks in what is being
+     * scrubbed — the songs inside a mix — not places the handle should stick
+     * to. They stay visible rather than appearing on hover, since the point of
+     * them is to be read at a glance.
+     */
+    markers?: number[];
   }>(),
   {
     min: 0,
@@ -34,6 +43,7 @@ const props = withDefaults(
     subtle: false,
     detents: () => [],
     detentRadius: 0.035,
+    markers: () => [],
   },
 );
 
@@ -74,6 +84,11 @@ function snap(value: number, bypass: boolean): number {
   }
   return best ?? value;
 }
+
+/** Marker positions as fractions of the track, clamped to it. */
+const markerFractions = computed(() =>
+  props.markers.map((at) => Math.min(1, Math.max(0, (at - props.min) / range.value))),
+);
 
 function valueAt(clientX: number, bypassDetents = false): number {
   const rect = el.value?.getBoundingClientRect();
@@ -151,6 +166,12 @@ function onKeydown(event: KeyboardEvent) {
       class="slider__detent"
       :style="{ left: `${((detent - min) / range) * 100}%` }"
     />
+    <span
+      v-for="(at, index) in markerFractions"
+      :key="`marker-${index}`"
+      class="slider__marker"
+      :style="{ left: `${at * 100}%` }"
+    />
     <div class="slider__thumb" :style="{ left: `${fraction * 100}%` }" />
   </div>
 </template>
@@ -213,6 +234,21 @@ function onKeydown(event: KeyboardEvent) {
 .slider:hover .slider__detent,
 .slider.is-dragging .slider__detent {
   opacity: 0.75;
+}
+
+/* Drawn like a detent, but always visible: it is information rather than a
+   hint about where the handle will settle. */
+.slider__marker {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  margin-left: -1.5px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  transform: translateY(-50%);
+  opacity: 0.85;
+  pointer-events: none;
 }
 
 .slider__thumb {

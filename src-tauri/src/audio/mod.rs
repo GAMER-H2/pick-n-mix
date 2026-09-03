@@ -5,6 +5,7 @@ pub mod crossfade;
 pub mod decode;
 pub mod dsp;
 pub mod engine;
+pub mod ffmpeg;
 pub mod params;
 pub mod peaks;
 pub mod timeline;

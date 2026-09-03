@@ -4,7 +4,7 @@
  * subtitle, and the play / shuffle / mixer row from the drawings.
  */
 import PnmIcon from "./icons/PnmIcon.vue";
-import Artwork from "./Artwork.vue";
+import PlaylistArtwork from "./PlaylistArtwork.vue";
 
 withDefaults(
   defineProps<{
@@ -12,13 +12,21 @@ withDefaults(
     subtitle?: string;
     meta?: string;
     artworkId?: string | null;
+    /** Covers to quilt when there is no single image; playlists only. */
+    artworkIds?: string[];
     /** Artists get a round portrait; albums and playlists get a square. */
     round?: boolean;
     showMixer?: boolean;
     mixerActive?: boolean;
     disabled?: boolean;
   }>(),
-  { round: false, showMixer: true, mixerActive: false, disabled: false },
+  {
+    round: false,
+    showMixer: true,
+    mixerActive: false,
+    disabled: false,
+    artworkIds: () => [],
+  },
 );
 
 const emit = defineEmits<{ play: []; shuffle: []; mixer: []; menu: [event: MouseEvent] }>();
@@ -26,8 +34,9 @@ const emit = defineEmits<{ play: []; shuffle: []; mixer: []; menu: [event: Mouse
 
 <template>
   <header class="collection">
-    <Artwork
-      :artwork-id="artworkId"
+    <PlaylistArtwork
+      :artwork="artworkId"
+      :artwork-ids="artworkIds"
       :size="188"
       :radius="round ? 94 : 8"
       shadow

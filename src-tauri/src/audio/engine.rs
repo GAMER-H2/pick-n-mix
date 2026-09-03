@@ -582,6 +582,12 @@ impl AudioEngine {
         });
     }
 
+    /// A snapshot of the decoded beds, for anything rendering off the audio
+    /// thread — the offline bounce, which has to gather its own.
+    pub fn bank(&self) -> Arc<Bank> {
+        self.shared.bank.load_full()
+    }
+
     pub fn has_bed(&self, id: &str) -> bool {
         self.shared.bank.load().contains_key(id)
     }
@@ -1138,6 +1144,22 @@ fn worker(
 
         let crossfade = shared.crossfade.load_full();
         let bank = shared.bank.load_full();
+
+        // A master mix carries its atmospheres per block rather than on the
+        // master bus — each block's cascade resolves its own beds — so the
+        // bank has to reach the timeline itself rather than stopping here.
+        // What it could not find comes back through the same request path the
+        // main player uses, so one loader thread serves both.
+        if let Some(Source::Timeline(timeline)) = current.as_mut().map(|cur| &mut cur.source) {
+            timeline.set_bank(bank.clone());
+            let asked_at = Instant::now();
+            for id in timeline.take_wanted_beds() {
+                if requested_beds.due(&id, asked_at, BED_RETRY) {
+                    let _ = bed_requests.send(id);
+                }
+            }
+            requested_beds.settled(&bank);
+        }
 
         if let Some(cur) = current.as_ref() {
             let filters: &[crate::audio::params::Filter] = if cur.settings.enabled {

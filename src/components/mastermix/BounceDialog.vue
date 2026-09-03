@@ -6,19 +6,24 @@
  * location picker. The bounce itself is offline: the same graph used for
  * audition, driven as fast as the CPU allows.
  */
-import { computed, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
 import PnmIcon from "../icons/PnmIcon.vue";
 import SelectMenu from "../SelectMenu.vue";
 import * as api from "@/lib/api";
-import type { BounceFormat, BounceOptions } from "@/lib/types";
+import { useBounceStore } from "@/stores/bounce";
+import type { BounceFormat, BounceOptions, FfmpegStatus } from "@/lib/types";
 
 const props = defineProps<{
   playlistId: string;
   playlistName: string;
+  /** Whether this playlist has a picture of its own to embed as the cover. */
+  hasArtwork?: boolean;
 }>();
 
 const emit = defineEmits<{ close: []; bounced: [path: string] }>();
+
+const bounce = useBounceStore();
 
 const format = ref<BounceFormat>("wav");
 const sampleRate = ref<"44100" | "48000" | "96000">("48000");
@@ -28,11 +33,46 @@ const mp3Bitrate = ref<"128" | "192" | "256" | "320">("320");
 const busy = ref(false);
 const error = ref<string | null>(null);
 
-const formatOptions = [
+/**
+ * WAV and FLAC are written by the app itself. MP3 is not — there is no encoder
+ * with a licence worth linking into this binary — so it is handed to whatever
+ * ffmpeg the machine has. Asking up front means the format either is not
+ * offered or works, rather than failing after a render that took minutes.
+ */
+const ffmpeg = ref<FfmpegStatus | null>(null);
+const checking = ref(false);
+const canMp3 = computed(() => ffmpeg.value?.mp3 === true);
+
+async function checkFfmpeg(again = false) {
+  checking.value = true;
+  try {
+    ffmpeg.value = await api.ffmpegStatus(again);
+    if (!canMp3.value && format.value === "mp3") format.value = "wav";
+  } catch {
+    // Treated exactly like a missing ffmpeg: MP3 is simply not on offer.
+    ffmpeg.value = { path: "", available: false, mp3: false, version: "" };
+  } finally {
+    checking.value = false;
+  }
+}
+
+onMounted(() => void checkFfmpeg());
+
+const mp3Note = computed(() => {
+  const status = ffmpeg.value;
+  if (!status || canMp3.value) return null;
+  return status.available
+    ? "MP3 needs ffmpeg built with libmp3lame; this system's was not."
+    : "MP3 needs ffmpeg, which was not found. WAV and FLAC need nothing installed.";
+});
+
+// MP3 is left out rather than shown greyed: an option that cannot be chosen
+// says less than the note underneath, which says what to install.
+const formatOptions = computed(() => [
   { id: "wav", label: "WAV" },
   { id: "flac", label: "FLAC" },
-  { id: "mp3", label: "MP3" },
-];
+  ...(canMp3.value ? [{ id: "mp3", label: "MP3" }] : []),
+]);
 const rateOptions = [
   { id: "44100", label: "44.1 kHz" },
   { id: "48000", label: "48 kHz" },
@@ -70,7 +110,15 @@ function options(): BounceOptions {
   };
 }
 
-async function bounce() {
+/**
+ * Start the render and get out of the way.
+ *
+ * The render itself happens in the background and reports to the strip above
+ * the player bar, so this dialog closes as soon as the job is accepted rather
+ * than holding the app still for the minutes a long mix takes. Only a failure
+ * to *start* is shown here, since after that there is somewhere better for it.
+ */
+async function startBounce() {
   error.value = null;
   const destination = await save({
     title: "Bounce mix",
@@ -80,7 +128,7 @@ async function bounce() {
   if (typeof destination !== "string") return;
   busy.value = true;
   try {
-    await api.bounceMasterMix(props.playlistId, destination, options());
+    await bounce.start(props.playlistId, props.playlistName, destination, options());
     emit("bounced", destination);
   } catch (e) {
     error.value = String(e);
@@ -101,7 +149,8 @@ async function bounce() {
       </header>
       <p class="dialog__subtitle">
         Render {{ playlistName }} to a single file, with mixer settings, fades and
-        keyframes baked in.
+        keyframes baked in.<template v-if="props.hasArtwork">
+          The playlist's image goes in as the file's cover art.</template>
       </p>
 
       <div class="dialog__fields">
@@ -127,14 +176,21 @@ async function bounce() {
         />
       </div>
 
+      <p v-if="mp3Note" class="dialog__note">
+        {{ mp3Note }}
+        <button class="dialog__recheck" type="button" :disabled="checking" @click="checkFfmpeg(true)">
+          {{ checking ? "Checking…" : "Check again" }}
+        </button>
+      </p>
+
       <p v-if="error" class="dialog__error" role="alert">{{ error }}</p>
 
       <footer class="dialog__foot">
         <button class="pill-button is-secondary" type="button" :disabled="busy" @click="emit('close')">
           Cancel
         </button>
-        <button class="pill-button" type="button" :disabled="busy" @click="bounce">
-          {{ busy ? "Bouncing…" : "Choose location…" }}
+        <button class="pill-button" type="button" :disabled="busy" @click="startBounce">
+          {{ busy ? "Starting…" : "Choose location…" }}
         </button>
       </footer>
     </div>
@@ -186,6 +242,23 @@ async function bounce() {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.dialog__note {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-tertiary);
+}
+
+.dialog__recheck {
+  color: var(--accent);
+  font-size: 11.5px;
+}
+
+.dialog__recheck:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .dialog__error {

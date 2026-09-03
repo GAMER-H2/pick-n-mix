@@ -114,10 +114,38 @@ export interface PlayContext {
   name: string;
 }
 
+/** Where one song begins inside a mix. */
+export interface MixChapter {
+  startSecs: number;
+  title: string;
+  artist: string;
+}
+
+/**
+ * A playlist that plays as a master mix, sitting in the queue as one block.
+ *
+ * Indivisible on purpose: its songs overlap inside an arrangement, so there is
+ * nothing finer than the whole mix to reorder or insert next to. The chapters
+ * are positions inside it, not entries of their own.
+ */
+export interface QueueMix {
+  playlistId: string;
+  name: string;
+  artwork: string | null;
+  artworkIds: string[];
+  durationSecs: number;
+  chapters: MixChapter[];
+}
+
+/** One row of the queue: a song, or a whole mix. */
+export type QueueEntry =
+  | { kind: "track"; track: Track }
+  | { kind: "mix"; mix: QueueMix };
+
 export interface QueueView {
-  items: Track[];
+  items: QueueEntry[];
   currentIndex: number | null;
-  upcoming: Track[];
+  upcoming: QueueEntry[];
   shuffle: boolean;
   repeat: Repeat;
   context: PlayContext | null;
@@ -310,6 +338,8 @@ export interface PlaylistSummary {
   description: string;
   trackCount: number;
   artwork: string | null;
+  /** Covers of the first few different songs, quilted when there is no artwork. */
+  artworkIds: string[];
   hasMixer: boolean;
   /** Whether a timeline has ever been built for this playlist. */
   hasMasterMix: boolean;
@@ -396,6 +426,27 @@ export interface MasterMixView {
   saved: boolean;
 }
 
+/**
+ * The playlist the engine is playing as a mix, for the player bar.
+ *
+ * While a mix plays there is no current track — the queue is empty and the
+ * engine holds one long timeline — so the bar shows the playlist itself and
+ * marks the songs along the scrubber.
+ */
+export interface MasterMixNowPlaying {
+  playlistId: string;
+  name: string;
+  description: string;
+  artwork: string | null;
+  artworkIds: string[];
+  trackCount: number;
+  durationSecs: number;
+  /** What the engine is summing: this many regions across this many tracks. */
+  laneCount: number;
+  blockCount: number;
+  chapters: MixChapter[];
+}
+
 /** Peak magnitudes for drawing one song's waveform. */
 export interface Waveform {
   /** 0-255, one per 1/peaksPerSec of audio. */
@@ -411,6 +462,15 @@ export interface MixAsset {
 }
 
 export type BounceFormat = "wav" | "flac" | "mp3";
+
+/** What this machine's ffmpeg, if any, can do. MP3 depends on it. */
+export interface FfmpegStatus {
+  path: string;
+  available: boolean;
+  /** True only when that ffmpeg was built with libmp3lame. */
+  mp3: boolean;
+  version: string;
+}
 
 export interface BounceOptions {
   format: BounceFormat;

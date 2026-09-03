@@ -4,6 +4,11 @@
  * Space and K play/pause, L skips forward, J skips back. Keys are ignored
  * while a text field has focus, so typing a playlist name never scrubs the
  * music, and modifier combinations are left to the OS.
+ *
+ * They are also ignored entirely while something else owns the transport —
+ * the Master Mixer, which has its own space bar and its own idea of what is
+ * playing. Two handlers reaching the engine on the same key press is how a
+ * pause turns into a stop.
  */
 
 import type { Router } from "vue-router";
@@ -25,10 +30,17 @@ function isTyping(target: EventTarget | null): boolean {
   );
 }
 
-export function installShortcuts(player: Player, ui?: Ui, router?: Router): () => void {
+export function installShortcuts(
+  player: Player,
+  ui?: Ui,
+  router?: Router,
+  /** True while another view owns playback and these keys must not fire. */
+  isSuspended?: () => boolean,
+): () => void {
   async function onKeydown(event: KeyboardEvent) {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     if (isTyping(event.target)) return;
+    if (isSuspended?.()) return;
 
     switch (event.key) {
       case "Escape":

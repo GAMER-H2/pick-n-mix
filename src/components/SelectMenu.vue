@@ -140,6 +140,17 @@ function onListKeydown(event: KeyboardEvent) {
   color: var(--text-tertiary);
 }
 
+/*
+ * The value and its caret sit at the trigger's right edge, which is where the
+ * menu opens from. In a row that hugs its content the two are the same place;
+ * in a stretched one — a dialog field, say — they are not, and without this
+ * the menu appears under the far right of a button whose text is at the far
+ * left, reading as though it belongs to something else.
+ */
+.select__value {
+  margin-left: auto;
+}
+
 .select__caret {
   color: var(--text-tertiary);
 }
@@ -149,7 +160,9 @@ function onListKeydown(event: KeyboardEvent) {
   top: calc(100% + 6px);
   right: 0;
   z-index: 300;
-  min-width: 168px;
+  /* Never narrower than the trigger, so the two line up on both edges rather
+     than only on the right. */
+  min-width: max(168px, 100%);
   padding: 5px;
   border-radius: var(--radius);
   background: var(--bg-elevated);

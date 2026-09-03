@@ -51,10 +51,75 @@ impl From<Track> for QueueItem {
     }
 }
 
+/// One song inside a mix, and where it starts on the timeline.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixChapter {
+    pub start_secs: f64,
+    pub title: String,
+    pub artist: String,
+}
+
+/// A playlist that plays as a master mix, sitting in the queue as one block.
+///
+/// A mix is a single arrangement with songs overlapping inside it, so it
+/// cannot be reordered, split, or have anything inserted into the middle of
+/// it. Making it one queue entry is what enforces that: there is nothing
+/// finer than the whole mix to address. Its songs are still listed — as
+/// chapters, which the queue draws inside the block and which can be jumped
+/// to — but they are positions in one thing, not entries in a list.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueMix {
+    pub playlist_id: String,
+    pub name: String,
+    pub artwork: Option<String>,
+    /// Covers to quilt when the playlist has no picture of its own.
+    pub artwork_ids: Vec<String>,
+    pub duration_secs: f64,
+    pub chapters: Vec<MixChapter>,
+}
+
+/// Something the queue holds: a song, or a whole mix.
+#[derive(Debug, Clone)]
+pub enum QueueEntry {
+    Track(QueueItem),
+    Mix(QueueMix),
+}
+
+impl QueueEntry {
+    pub fn track(&self) -> Option<&Track> {
+        match self {
+            QueueEntry::Track(item) => Some(&item.track),
+            QueueEntry::Mix(_) => None,
+        }
+    }
+
+    pub fn item(&self) -> Option<&QueueItem> {
+        match self {
+            QueueEntry::Track(item) => Some(item),
+            QueueEntry::Mix(_) => None,
+        }
+    }
+
+    pub fn mix(&self) -> Option<&QueueMix> {
+        match self {
+            QueueEntry::Mix(mix) => Some(mix),
+            QueueEntry::Track(_) => None,
+        }
+    }
+}
+
+impl From<QueueItem> for QueueEntry {
+    fn from(item: QueueItem) -> Self {
+        QueueEntry::Track(item)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Player {
     /// Queue entries in the order they were added.
-    queue: Vec<QueueItem>,
+    queue: Vec<QueueEntry>,
     /// Indices into `queue` giving playback order; differs when shuffling.
     order: Vec<usize>,
     /// Position within `order`.
@@ -67,15 +132,34 @@ pub struct Player {
     pub global_mixer: MixerSettings,
 }
 
+/// One row of the queue as the UI draws it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum QueueEntryView {
+    Track { track: Track },
+    Mix { mix: QueueMix },
+}
+
+impl From<&QueueEntry> for QueueEntryView {
+    fn from(entry: &QueueEntry) -> Self {
+        match entry {
+            QueueEntry::Track(item) => QueueEntryView::Track {
+                track: item.track.clone(),
+            },
+            QueueEntry::Mix(mix) => QueueEntryView::Mix { mix: mix.clone() },
+        }
+    }
+}
+
 /// Queue state shaped for the UI.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueView {
-    pub items: Vec<Track>,
-    /// Index into `items` of the track playing now.
+    pub items: Vec<QueueEntryView>,
+    /// Index into `items` of whatever is playing now.
     pub current_index: Option<usize>,
-    /// Upcoming tracks in play order, which is what the queue panel shows.
-    pub upcoming: Vec<Track>,
+    /// What is still to come, in play order, which is what the panel shows.
+    pub upcoming: Vec<QueueEntryView>,
     pub shuffle: bool,
     pub repeat: Repeat,
     pub context: Option<Context>,
@@ -86,12 +170,28 @@ impl Player {
         Player::default()
     }
 
+    /// The song playing now. `None` while a mix is playing: a mix is not one
+    /// song, and every caller that asks this question means "which song".
     pub fn current(&self) -> Option<&Track> {
-        self.current_item().map(|item| &item.track)
+        self.current_entry().and_then(QueueEntry::track)
     }
 
     pub fn current_item(&self) -> Option<&QueueItem> {
+        self.current_entry().and_then(QueueEntry::item)
+    }
+
+    pub fn current_entry(&self) -> Option<&QueueEntry> {
         self.order.get(self.cursor).and_then(|&i| self.queue.get(i))
+    }
+
+    /// Where the cursor is in the play order, which is what the queue's rows
+    /// are indexed by.
+    pub fn current_index(&self) -> Option<usize> {
+        (!self.order.is_empty()).then_some(self.cursor)
+    }
+
+    pub fn current_mix(&self) -> Option<&QueueMix> {
+        self.current_entry().and_then(QueueEntry::mix)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -116,7 +216,12 @@ impl Player {
 
     /// Replace the queue with entries that may carry their own overrides.
     pub fn set_queue_items(&mut self, items: Vec<QueueItem>, start_index: usize) {
-        self.queue = items;
+        self.set_queue_entries(items.into_iter().map(QueueEntry::from).collect(), start_index);
+    }
+
+    /// Replace the queue with anything it can hold, mixes included.
+    pub fn set_queue_entries(&mut self, entries: Vec<QueueEntry>, start_index: usize) {
+        self.queue = entries;
         self.rebuild_order(Some(start_index.min(self.queue.len().saturating_sub(1))));
     }
 
@@ -124,7 +229,11 @@ impl Player {
     /// playlist entry is edited while that playlist is playing.
     pub fn set_entry_mixer(&mut self, track_id: &str, mixer: Option<MixerSettings>) -> bool {
         let mut changed = false;
-        for item in self.queue.iter_mut().filter(|i| i.track.id == track_id) {
+        for entry in self.queue.iter_mut() {
+            let QueueEntry::Track(item) = entry else { continue };
+            if item.track.id != track_id {
+                continue;
+            }
             item.mixer = mixer.clone();
             changed = true;
         }
@@ -170,11 +279,18 @@ impl Player {
 
     /// As [`Player::play_next`], for entries that carry their own override.
     pub fn play_next_items(&mut self, items: Vec<QueueItem>) {
+        self.play_next_entries(items.into_iter().map(QueueEntry::from).collect());
+    }
+
+    /// Insert after whatever is playing — which, when that is a mix, means
+    /// after the whole mix. Nothing can be put inside one.
+    pub fn play_next_entries(&mut self, entries: Vec<QueueEntry>) {
+        let items = entries;
         if items.is_empty() {
             return;
         }
         if self.queue.is_empty() {
-            self.set_queue_items(items, 0);
+            self.set_queue_entries(items, 0);
             return;
         }
         let insert_at = self.queue.len();
@@ -192,15 +308,20 @@ impl Player {
 
     /// As [`Player::add_to_queue`], for entries that carry their own override.
     pub fn add_to_queue_items(&mut self, items: Vec<QueueItem>) {
-        if items.is_empty() {
+        self.add_to_queue_entries(items.into_iter().map(QueueEntry::from).collect());
+    }
+
+    /// Append anything the queue can hold to the end of the play order.
+    pub fn add_to_queue_entries(&mut self, entries: Vec<QueueEntry>) {
+        if entries.is_empty() {
             return;
         }
         if self.queue.is_empty() {
-            self.set_queue_items(items, 0);
+            self.set_queue_entries(entries, 0);
             return;
         }
         let start = self.queue.len();
-        self.queue.extend(items);
+        self.queue.extend(entries);
         self.order.extend(start..self.queue.len());
     }
 
@@ -251,16 +372,16 @@ impl Player {
 
     /// Step forward. `automatic` is true when a track ended by itself, which
     /// is the only case where repeat-one and end-of-queue behaviour differ.
-    pub fn advance(&mut self, automatic: bool) -> Option<&Track> {
+    pub fn advance(&mut self, automatic: bool) -> Option<&QueueEntry> {
         if self.order.is_empty() {
             return None;
         }
         if automatic && self.repeat == Repeat::One {
-            return self.current();
+            return self.current_entry();
         }
         if self.cursor + 1 < self.order.len() {
             self.cursor += 1;
-            return self.current();
+            return self.current_entry();
         }
         match self.repeat {
             Repeat::All => {
@@ -270,14 +391,14 @@ impl Player {
                 } else {
                     self.cursor = 0;
                 }
-                self.current()
+                self.current_entry()
             }
             // Pressing next at the end of the queue stops rather than wrapping.
             _ => None,
         }
     }
 
-    pub fn previous(&mut self) -> Option<&Track> {
+    pub fn previous(&mut self) -> Option<&QueueEntry> {
         if self.order.is_empty() {
             return None;
         }
@@ -286,16 +407,16 @@ impl Player {
         } else if self.repeat == Repeat::All {
             self.cursor = self.order.len() - 1;
         }
-        self.current()
+        self.current_entry()
     }
 
     /// Jump to a position in the play order.
-    pub fn jump_to(&mut self, order_index: usize) -> Option<&Track> {
+    pub fn jump_to(&mut self, order_index: usize) -> Option<&QueueEntry> {
         if order_index >= self.order.len() {
             return None;
         }
         self.cursor = order_index;
-        self.current()
+        self.current_entry()
     }
 
     /// The item that `advance(true)` would land on, without moving the
@@ -326,10 +447,17 @@ impl Player {
         None
     }
 
+    /// A queue position, when what is there is a song.
+    ///
+    /// A mix answers `None`: it is loaded as a whole timeline rather than
+    /// decoded as a track, so there is nothing for the crossfade engine to
+    /// prepare and it falls back to an instant cut into the mix — which is
+    /// what the start of an arrangement wants anyway.
     fn item_at(&self, order_index: usize) -> Option<(usize, &QueueItem)> {
         self.order
             .get(order_index)
             .and_then(|&i| self.queue.get(i))
+            .and_then(QueueEntry::item)
             .map(|item| (order_index, item))
     }
 
@@ -340,7 +468,7 @@ impl Player {
         let Some(queue_index) = self.order.get(order_index).copied() else {
             return false;
         };
-        let Some(item) = self.queue.get_mut(queue_index) else {
+        let Some(QueueEntry::Track(item)) = self.queue.get_mut(queue_index) else {
             return false;
         };
         if item.track.id != track.id {
@@ -355,10 +483,10 @@ impl Player {
     }
 
     pub fn view(&self) -> QueueView {
-        let items: Vec<Track> = self
+        let items: Vec<QueueEntryView> = self
             .order
             .iter()
-            .filter_map(|&i| self.queue.get(i).map(|item| item.track.clone()))
+            .filter_map(|&i| self.queue.get(i).map(QueueEntryView::from))
             .collect();
         let upcoming = items.iter().skip(self.cursor + 1).cloned().collect();
         QueueView {
@@ -428,6 +556,14 @@ pub(crate) fn shuffle_in_place<T>(items: &mut [T]) {
 
 #[cfg(test)]
 mod tests {
+    /// The track a queue row shows, for the assertions below.
+    fn row_track(row: &QueueEntryView) -> &Track {
+        match row {
+            QueueEntryView::Track { track } => track,
+            QueueEntryView::Mix { mix } => panic!("expected a song, found the mix {}", mix.name),
+        }
+    }
+
     use super::*;
     use crate::audio::params::Reverb;
 
@@ -453,13 +589,13 @@ mod tests {
     fn next_stops_at_the_end_unless_repeating() {
         let mut p = Player::new();
         p.set_queue(tracks(2), 0);
-        assert_eq!(p.advance(false).unwrap().id, "t1");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "t1");
         assert!(p.advance(false).is_none());
 
         p.set_queue(tracks(2), 0);
         p.set_repeat(Repeat::All);
         p.advance(false);
-        assert_eq!(p.advance(false).unwrap().id, "t0", "repeat all wraps");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "t0", "repeat all wraps");
     }
 
     #[test]
@@ -467,9 +603,9 @@ mod tests {
         let mut p = Player::new();
         p.set_queue(tracks(3), 0);
         p.set_repeat(Repeat::One);
-        assert_eq!(p.advance(true).unwrap().id, "t0", "auto-advance repeats");
+        assert_eq!(p.advance(true).unwrap().track().unwrap().id, "t0", "auto-advance repeats");
         assert_eq!(
-            p.advance(false).unwrap().id,
+            p.advance(false).unwrap().track().unwrap().id,
             "t1",
             "pressing next still moves on"
         );
@@ -484,8 +620,8 @@ mod tests {
             ..Default::default()
         }];
         p.play_next(extra);
-        assert_eq!(p.advance(false).unwrap().id, "x");
-        assert_eq!(p.advance(false).unwrap().id, "t1");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "x");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "t1");
     }
 
     /// A song queued out of a playlist brings that playlist's mixer with it,
@@ -514,10 +650,10 @@ mod tests {
         // The song it was queued from is unaffected.
         assert_eq!(p.effective_mixer().reverb.mix, Reverb::default().mix);
 
-        assert_eq!(p.advance(false).unwrap().id, "guest");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "guest");
         assert_eq!(p.effective_mixer().reverb.mix, 0.8, "the override applies");
 
-        assert_eq!(p.advance(false).unwrap().id, "t1");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "t1");
         assert_eq!(
             p.effective_mixer().reverb.mix,
             Reverb::default().mix,
@@ -543,7 +679,7 @@ mod tests {
             }),
         }]);
 
-        assert_eq!(p.advance(false).unwrap().id, "guest");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "guest");
         assert!(p.effective_mixer().lofi.enabled);
     }
 
@@ -555,8 +691,8 @@ mod tests {
             id: "x".into(),
             ..Default::default()
         }]);
-        assert_eq!(p.advance(false).unwrap().id, "t1");
-        assert_eq!(p.advance(false).unwrap().id, "x");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "t1");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "x");
     }
 
     #[test]
@@ -576,10 +712,10 @@ mod tests {
         let view = p.view();
         assert_eq!(view.items.len(), 3);
         assert_eq!(
-            view.items.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            view.items.iter().map(|r| row_track(r).id.as_str()).collect::<Vec<_>>(),
             ["t0", "t2", "t3"]
         );
-        assert_eq!(p.advance(false).unwrap().id, "t2");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "t2");
     }
 
     #[test]
@@ -601,8 +737,8 @@ mod tests {
 
         assert!(p.refresh_current_track(refreshed));
         assert_eq!(p.current().unwrap().location, "/new/effective.flac");
-        assert_eq!(p.view().items[0].location, "/m/0.flac");
-        assert_eq!(p.view().items[2].location, "/m/2.flac");
+        assert_eq!(row_track(&p.view().items[0]).location, "/m/0.flac");
+        assert_eq!(row_track(&p.view().items[2]).location, "/m/2.flac");
 
         let mut wrong = p.current().unwrap().clone();
         wrong.id = "different-song".into();
@@ -691,6 +827,14 @@ mod tests {
 
 #[cfg(test)]
 mod scope_tests {
+    /// The track a queue row shows, for the assertions below.
+    fn row_track(row: &QueueEntryView) -> &Track {
+        match row {
+            QueueEntryView::Track { track } => track,
+            QueueEntryView::Mix { mix } => panic!("expected a song, found the mix {}", mix.name),
+        }
+    }
+
     use super::*;
     use crate::audio::params::Reverb;
 
@@ -791,9 +935,62 @@ mod scope_tests {
         );
 
         let view = p.view();
-        let ids: Vec<&str> = view.items.iter().map(|t| t.id.as_str()).collect();
+        let ids: Vec<&str> = view.items.iter().map(|r| row_track(r).id.as_str()).collect();
         assert_eq!(ids, ["d", "a", "b", "c"]);
-        assert_eq!(p.advance(false).unwrap().id, "c");
+        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "c");
+    }
+
+    fn a_mix(name: &str) -> QueueMix {
+        QueueMix {
+            playlist_id: "pl_1".into(),
+            name: name.into(),
+            artwork: None,
+            artwork_ids: vec![],
+            duration_secs: 600.0,
+            chapters: vec![MixChapter {
+                start_secs: 0.0,
+                title: "First".into(),
+                artist: "A".into(),
+            }],
+        }
+    }
+
+    /// A mix is one entry, so everything queued while it plays lands behind
+    /// the whole arrangement. There is no position inside it to land on.
+    #[test]
+    fn nothing_can_be_queued_inside_a_playing_mix() {
+        let mut p = Player::new();
+        p.set_queue_entries(vec![QueueEntry::Mix(a_mix("Evening"))], 0);
+        p.play_next(vec![track("a")]);
+        p.add_to_queue(vec![track("b")]);
+
+        let view = p.view();
+        assert!(matches!(view.items[0], QueueEntryView::Mix { .. }));
+        assert_eq!(row_track(&view.items[1]).id, "a");
+        assert_eq!(row_track(&view.items[2]).id, "b");
+        assert_eq!(view.current_index, Some(0));
+    }
+
+    /// The mix is a queue entry like any other: when it ends, the queue goes on.
+    #[test]
+    fn a_mix_hands_on_to_what_was_queued_behind_it() {
+        let mut p = Player::new();
+        p.set_queue_entries(vec![QueueEntry::Mix(a_mix("Evening"))], 0);
+        p.add_to_queue(vec![track("a")]);
+
+        assert!(p.current().is_none(), "a mix is not a song");
+        assert!(p.current_mix().is_some());
+        assert_eq!(p.advance(true).unwrap().track().unwrap().id, "a");
+    }
+
+    /// Nothing crossfades into a timeline, so the engine is told there is
+    /// nothing to prepare rather than being handed the wrong kind of thing.
+    #[test]
+    fn a_mix_is_never_prepared_as_a_crossfade() {
+        let mut p = Player::new();
+        p.set_queue(vec![track("a")], 0);
+        p.add_to_queue_entries(vec![QueueEntry::Mix(a_mix("Evening"))]);
+        assert!(p.peek_next().is_none());
     }
 
     #[test]
@@ -813,7 +1010,7 @@ mod scope_tests {
             0,
         );
         assert!(p.move_item(1, 0));
-        assert_eq!(p.view().items[0].id, "b");
+        assert_eq!(row_track(&p.view().items[0]).id, "b");
         // Playing it now should still pick up its override.
         p.jump_to(0);
         assert_eq!(p.effective_mixer().reverb.mix, 0.7);
@@ -835,7 +1032,7 @@ mod scope_tests {
 
         let (idx, item) = p.peek_next().expect("a middle track has a successor");
         assert_eq!(item.track.id, "b");
-        assert_eq!(p.advance(true).unwrap().id, "b");
+        assert_eq!(p.advance(true).unwrap().track().unwrap().id, "b");
         assert_eq!(idx, 1);
     }
 
@@ -856,7 +1053,7 @@ mod scope_tests {
         let (idx, item) = p.peek_next().expect("repeat-all wraps");
         assert_eq!(item.track.id, "a");
         assert_eq!(idx, 0);
-        assert_eq!(p.advance(true).unwrap().id, "a");
+        assert_eq!(p.advance(true).unwrap().track().unwrap().id, "a");
     }
 
     #[test]

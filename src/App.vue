@@ -17,6 +17,7 @@ import AddToPlaylistDialog from "./components/AddToPlaylistDialog.vue";
 import DuplicateFilesDialog from "./components/DuplicateFilesDialog.vue";
 import SettingsModal from "./components/settings/SettingsModal.vue";
 import MasterMixModal from "./components/mastermix/MasterMixModal.vue";
+import BounceProgress from "./components/BounceProgress.vue";
 import { usePlayerStore } from "./stores/player";
 import { useLibraryStore } from "./stores/library";
 import { usePlaylistStore } from "./stores/playlists";
@@ -25,6 +26,7 @@ import { useCrossfadeStore } from "./stores/crossfade";
 import { useHomeStore } from "./stores/home";
 import { useUiStore } from "./stores/ui";
 import { useMasterMixStore } from "./stores/masterMix";
+import { useBounceStore } from "./stores/bounce";
 import { useSettingsStore } from "./stores/settings";
 import { installShortcuts } from "./lib/keyboard";
 import { registerScroller } from "./lib/viewState";
@@ -38,6 +40,7 @@ const crossfade = useCrossfadeStore();
 const home = useHomeStore();
 const ui = useUiStore();
 const masterMix = useMasterMixStore();
+const bounce = useBounceStore();
 const settings = useSettingsStore();
 const route = useRoute();
 const router = useRouter();
@@ -87,6 +90,17 @@ async function usesClientSideDecorations() {
   }
 }
 
+/**
+ * Whether the system's window buttons are floating over our own content.
+ *
+ * The user agent rather than a plugin: this only decides how much padding to
+ * leave, so being wrong costs a little space and nothing else, and the app
+ * already avoids adding a dependency for a single boolean.
+ */
+function isMacOverlay(): boolean {
+  return /Mac(intosh| OS X)/.test(navigator.userAgent);
+}
+
 /** Kept in step so the frame and its shadow drop away when maximised. */
 async function syncMaximized() {
   try {
@@ -125,6 +139,12 @@ let unlistenFocus: UnlistenFn | null = null;
 onMounted(async () => {
   await settings.initialise();
 
+  // macOS keeps its own decorations but floats the traffic lights over the
+  // webview's top-left corner, so anything drawn there has to leave room. The
+  // two cases are exclusive: a window either draws its own controls or has
+  // the system's laid over it.
+  if (isMacOverlay()) document.documentElement.classList.add("is-mac-overlay");
+
   if (await usesClientSideDecorations()) {
     usesCustomTitlebar.value = true;
     document.documentElement.classList.add("is-custom-titlebar");
@@ -146,7 +166,9 @@ onMounted(async () => {
 
   registerScroller(mainEl.value);
 
-  removeShortcuts = installShortcuts(player, ui, router);
+  // The Master Mixer runs its own transport against the same engine, so the
+  // global keys stand down for as long as it is open.
+  removeShortcuts = installShortcuts(player, ui, router, () => masterMix.open);
 
   unlisteners.value = await Promise.all([
     listen<PlaybackSnapshot>("playback", (e) => player.applySnapshot(e.payload)),
@@ -155,6 +177,9 @@ onMounted(async () => {
       // The track layer of the cascade changed with it, but the preset list
       // and filter catalogue did not, so avoid the disk-reading variant.
       mixer.refreshLayers();
+      // Starting a track is also how a mixed playlist stops being what plays,
+      // so the bar has to be told to stop showing one.
+      void player.refreshMasterMix();
     }),
     listen<QueueView>("queue-changed", (e) => (player.queue = e.payload)),
     listen<boolean>("playing-changed", () => player.refresh()),
@@ -171,6 +196,13 @@ onMounted(async () => {
       (e) => (library.scanProgress = e.payload),
     ),
     listen<string>("engine-error", (e) => ui.notify(e.payload, "error")),
+    listen<{ id: string; fraction: number }>("bounce-progress", (e) =>
+      bounce.onProgress(e.payload.id, e.payload.fraction),
+    ),
+    listen<{ id: string; path: string; error: string | null }>("bounce-finished", (e) => {
+      bounce.onFinished(e.payload.id, e.payload.path, e.payload.error);
+      if (e.payload.error) ui.notify(e.payload.error, "error");
+    }),
   ]);
 
   // Listeners first, then the initial fetch: an event emitted between the two
@@ -193,6 +225,7 @@ onBeforeUnmount(() => {
   unlistenFocus?.();
   registerScroller(null);
   document.documentElement.classList.remove("is-custom-titlebar");
+  document.documentElement.classList.remove("is-mac-overlay");
 });
 </script>
 
@@ -226,6 +259,8 @@ onBeforeUnmount(() => {
         <AdvancedMixer v-if="mixer.panelOpen && !masterMix.open" />
       </Transition>
     </div>
+
+    <BounceProgress />
 
     <NowPlayingBar />
 

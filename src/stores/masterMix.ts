@@ -1,7 +1,12 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as api from "@/lib/api";
-import { mixDuration, setBlockMixer as patchBlockMixer } from "@/lib/masterMix";
+import {
+  mixDuration,
+  scaleBlockForSpeed,
+  setBlockMixer as patchBlockMixer,
+  soundSignature,
+} from "@/lib/masterMix";
 import type { MasterMix, MixEntry, MixerSettings, Waveform } from "@/lib/types";
 
 /** Which of the three tools in the drawing is armed. */
@@ -13,6 +18,8 @@ const EMPTY: MasterMix = { enabled: false, revision: 0, lanes: [] };
 const UNDO_DEPTH = 100;
 /** Edits are batched into one write rather than one per drag frame. */
 const SAVE_DELAY_MS = 600;
+/** How far short of a requested position still counts as having arrived. */
+const STALE_TOLERANCE_SECS = 0.35;
 
 export const useMasterMixStore = defineStore("masterMix", () => {
   const open = ref(false);
@@ -31,8 +38,57 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   /** Where the playhead sits, in timeline seconds. Driven by the engine while
    *  auditioning and by the user's clicks otherwise. */
   const playhead = ref(0);
+  /**
+   * Where the last audition was started from.
+   *
+   * Stop returns here rather than to zero, which is what a timeline editor
+   * does: the playhead is a place you are working, and losing it every time
+   * the transport stops makes hearing one join twice a chore. Stopping when
+   * already parked there goes to the beginning instead.
+   */
+  const playStartSecs = ref(0);
+  /**
+   * Set to the position an audition was asked to start from, and cleared by
+   * the first engine report that has arrived there.
+   *
+   * The engine is polled five times a second, so a snapshot emitted just
+   * before a seek or a rebuild can land just after it — and if it were
+   * believed, the playhead would jump back to where it used to be and then
+   * forward again. That flicker is what makes the playhead look like it will
+   * not stay where it is put.
+   */
+  const expectedPosition = ref<number | null>(null);
   const previewing = ref(false);
   const previewPaused = ref(false);
+  /**
+   * The playback speed each block was last known to have, so a change to one
+   * can be told from the first time it is seen. Session-only: it is derived
+   * from the mixer cascade, not stored in the arrangement.
+   */
+  const blockSpeeds = ref<Record<string, number>>({});
+
+  /**
+   * Snapping to other blocks' edges, the playhead, and — with `gridSnapping`
+   * on — the ruler's own divisions. Alt overrides it for one drag, and it
+   * governs where the blade cuts as well as where a block lands.
+   */
+  const snapping = ref(true);
+  /**
+   * Add the ruler's marks to what snapping offers.
+   *
+   * Off by default: edge-to-edge is what butts two songs together, and a grid
+   * that is always on gets in the way of that. On, it is how a block is placed
+   * on an exact second rather than near one.
+   */
+  const gridSnapping = ref(false);
+  /**
+   * Scroll the timeline to keep a moving playhead on screen.
+   *
+   * Off by default: the timeline moving under the pointer while an edit is
+   * being lined up is worse than losing sight of the playhead, which the
+   * transport can always be asked for again.
+   */
+  const followPlayhead = ref(false);
 
   /** One waveform per playlist entry, fetched lazily and kept for the session. */
   const waveforms = ref<Record<number, Waveform>>({});
@@ -71,6 +127,9 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     waveforms.value = {};
     assetWaveforms.value = {};
     playhead.value = 0;
+    playStartSecs.value = 0;
+    expectedPosition.value = null;
+    blockSpeeds.value = {};
     previewing.value = false;
     previewPaused.value = false;
     try {
@@ -133,6 +192,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
    * release.
    */
   function commit(next: MasterMix) {
+    const before = soundSignature(mix.value);
     undoStack.value = [
       ...undoStack.value.slice(-(UNDO_DEPTH - 1)),
       snapshotMix(mix.value),
@@ -140,24 +200,31 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     redoStack.value = [];
     mix.value = next;
     scheduleSave();
+    // Moving a block should be audible without having to nudge the transport
+    // to notice. Renaming or recolouring a lane should not cost a re-seek.
+    if (soundSignature(next) !== before) schedulePreviewReload();
   }
 
   function undo() {
     const previous = undoStack.value.pop();
     if (!previous) return;
+    const before = soundSignature(mix.value);
     redoStack.value = [...redoStack.value, snapshotMix(mix.value)];
     mix.value = previous;
     pruneSelection();
     scheduleSave();
+    if (soundSignature(previous) !== before) schedulePreviewReload();
   }
 
   function redo() {
     const next = redoStack.value.pop();
     if (!next) return;
+    const before = soundSignature(mix.value);
     undoStack.value = [...undoStack.value, snapshotMix(mix.value)];
     mix.value = next;
     pruneSelection();
     scheduleSave();
+    if (soundSignature(next) !== before) schedulePreviewReload();
   }
 
   /** Undo can remove blocks that were selected; a stale id would break the
@@ -225,16 +292,15 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   async function play(fromSecs = playhead.value) {
     const token = sessionToken;
     if (!playlistId.value || !token) return;
+    const from = Math.max(0, fromSecs);
     try {
-      await api.playMasterMix(
-        playlistId.value,
-        mix.value,
-        Math.max(0, fromSecs),
-        token,
-      );
+      await api.playMasterMix(playlistId.value, mix.value, from, token);
       if (sessionToken !== token) return;
       previewing.value = true;
       previewPaused.value = false;
+      playStartSecs.value = from;
+      playhead.value = from;
+      expectedPosition.value = from;
       error.value = null;
     } catch (e) {
       if (sessionToken !== token) return;
@@ -263,11 +329,14 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     const token = sessionToken;
     const absolutePosition = playhead.value;
     const wasPaused = previewPaused.value;
+    const resumeFrom = playStartSecs.value;
     await play(absolutePosition);
     if (sessionToken !== token) return;
     // Polling can briefly report the replacement decoder at zero while it is
-    // loading. Reloading is an implementation detail, not a playhead move.
+    // loading. Reloading is an implementation detail, not a playhead move, so
+    // neither the playhead nor where Stop will return to may move with it.
     playhead.value = absolutePosition;
+    playStartSecs.value = resumeFrom;
     if (wasPaused && previewing.value) await pause();
   }
 
@@ -287,6 +356,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     if (!previewing.value || !token) return;
     previewing.value = false;
     previewPaused.value = false;
+    expectedPosition.value = null;
     try {
       await api.stopMasterMix(token);
     } catch {
@@ -294,10 +364,35 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     }
   }
 
+  /**
+   * Take a position reported by the engine, unless it is a stale one from
+   * before the seek or rebuild that is still settling.
+   *
+   * Reports are only ever *late*, never early, so a position short of what was
+   * asked for is the old plan still talking. Once one arrives at or past the
+   * target the guard is dropped and the playhead follows the engine again.
+   */
+  function applyEnginePosition(positionSecs: number) {
+    if (!previewing.value) return;
+    const expected = expectedPosition.value;
+    if (expected !== null) {
+      if (positionSecs + STALE_TOLERANCE_SECS < expected) return;
+      expectedPosition.value = null;
+    }
+    playhead.value = positionSecs;
+  }
+
+  /** Move the playhead by hand, which abandons any position the engine owes. */
+  function setPlayhead(secs: number) {
+    expectedPosition.value = null;
+    playhead.value = Math.max(0, secs);
+  }
+
   /** Called when the engine reports the arrangement has run out. */
   function previewEnded() {
     previewing.value = false;
     previewPaused.value = false;
+    expectedPosition.value = null;
   }
 
   async function loadWaveform(index: number) {
@@ -327,12 +422,29 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     }
   }
 
+  /** Remember a block's speed without acting on it — used when its mixer is
+   *  first opened, so the next change has something to compare against. */
+  function noteBlockSpeed(blockId: string, speed: number) {
+    if (speed > 0) blockSpeeds.value = { ...blockSpeeds.value, [blockId]: speed };
+  }
+
   /**
    * Write a block's mixer without an undo step. Knob moves would otherwise
    * bury the arrangement history in hundreds of snapshots.
+   *
+   * `speed` is the block's resolved varispeed after this edit. Changing it
+   * resizes the region so the same audio stays under it, which travels with
+   * the mixer write rather than being a separate undoable move — turning a
+   * pitch knob is one action, however many things it changes.
    */
-  function setBlockMixer(blockId: string, mixer: MixerSettings | null) {
-    mix.value = patchBlockMixer(mix.value, blockId, mixer);
+  function setBlockMixer(blockId: string, mixer: MixerSettings | null, speed?: number) {
+    let next = patchBlockMixer(mix.value, blockId, mixer);
+    if (speed !== undefined && speed > 0) {
+      const previous = blockSpeeds.value[blockId];
+      if (previous !== undefined) next = scaleBlockForSpeed(next, blockId, previous, speed);
+      noteBlockSpeed(blockId, speed);
+    }
+    mix.value = next;
     scheduleSave();
     schedulePreviewReload();
   }
@@ -372,8 +484,12 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     pixelsPerSecond,
     laneHeight,
     playhead,
+    playStartSecs,
     previewing,
     previewPaused,
+    snapping,
+    gridSnapping,
+    followPlayhead,
     waveforms,
     assetWaveforms,
     duration,
@@ -394,9 +510,13 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     reloadPreview,
     stop,
     previewEnded,
+    applyEnginePosition,
+    setPlayhead,
     loadWaveform,
     loadAssetWaveform,
     setBlockMixer,
+    noteBlockSpeed,
+    blockSpeeds,
     select,
     toggleSelected,
     zoom,

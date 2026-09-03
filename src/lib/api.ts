@@ -8,10 +8,12 @@ import type {
   Artist,
   CrossfadeCurve,
   CrossfadeSettings,
+  FfmpegStatus,
   FilterInfo,
   HomeShelves,
   BounceOptions,
   MasterMix,
+  MasterMixNowPlaying,
   MasterMixView,
   MixAsset,
   MixerSettings,
@@ -83,8 +85,9 @@ export const playTracks = (request: {
   context?: PlayContext | null;
   contextMixer?: MixerSettings | null;
 }) => invoke<void>("play_tracks", { request });
-export const playQueueIndex = (index: number) =>
-  invoke<void>("play_queue_index", { index });
+/** Jump to a queue row, optionally to a time inside it — a mix's chapter. */
+export const playQueueIndex = (index: number, positionSecs?: number) =>
+  invoke<void>("play_queue_index", { index, positionSecs });
 export const togglePlay = () => invoke<boolean>("toggle_play");
 export const nextTrack = () => invoke<void>("next_track");
 export const previousTrack = () => invoke<void>("previous_track");
@@ -221,6 +224,10 @@ export const setPlaylistArtwork = (id: string, sourcePath: string) =>
   invoke<string>("set_playlist_artwork", { id, sourcePath });
 export const clearPlaylistArtwork = (id: string) =>
   invoke<void>("clear_playlist_artwork", { id });
+/** Queue a whole playlist: its songs, or its mix as one block. */
+export const queuePlaylist = (playlistId: string, next: boolean) =>
+  invoke<void>("queue_playlist", { playlistId, next });
+
 /** Queue one entry, carrying that playlist's mixer for this play only. */
 export const queuePlaylistEntry = (
   playlistId: string,
@@ -249,6 +256,9 @@ export const resetMasterMix = (playlistId: string) =>
 export const entryWaveform = (playlistId: string, index: number) =>
   invoke<Waveform>("entry_waveform", { playlistId, index });
 /** Capture normal playback for the lifetime of an open Master Mixer. */
+/** The playlist being played as a mix, or null when a normal track plays. */
+export const masterMixNowPlaying = () =>
+  invoke<MasterMixNowPlaying | null>("master_mix_now_playing");
 export const beginMasterMixSession = () =>
   invoke<string>("begin_master_mix_session");
 /** Close the editor and restore the playback captured by its matching session. */
@@ -270,8 +280,18 @@ export const importMixAsset = (playlistId: string, path: string) =>
   invoke<MixAsset>("import_mix_asset", { playlistId, path });
 export const assetWaveform = (playlistId: string, file: string) =>
   invoke<Waveform>("asset_waveform", { playlistId, file });
+/** Start a render. Returns the job id its progress events carry. */
 export const bounceMasterMix = (
   playlistId: string,
   destination: string,
   options: BounceOptions,
-) => invoke<void>("bounce_master_mix", { playlistId, destination, options });
+) => invoke<string>("bounce_master_mix", { playlistId, destination, options });
+/**
+ * Whether an ffmpeg is present, and whether it can write MP3.
+ *
+ * MP3 is the one bounce format this app does not carry its own encoder for,
+ * so the dialog asks before offering it rather than failing at the end of a
+ * long render. `refresh` re-probes for someone who has just installed it.
+ */
+export const ffmpegStatus = (refresh = false) =>
+  invoke<FfmpegStatus>("ffmpeg_status", { refresh });

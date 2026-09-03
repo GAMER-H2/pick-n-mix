@@ -1,11 +1,11 @@
 Small Tasks:
 - Atmospheres shaders need more refinement (human task, all agents ignore)
-- Get rid of the mp3 encoder with a weird license, use ffmpeg detection for mp3 encoder support
-- Playback in the master mixer is conflicting with the main player. The main player needs to be completely disabled when the master mixer is open for consistent playback.
-- Spacebar should pause playback in the master mixer, not stop it, that's button only
+- Settings need ability to change keyboard shortcuts, new sub-section called shortcuts with all the keyboard shortcuts listed and the ability to record a new one
+- Save queue as playlist
 
 Medium Tasks:
 - Duplicate song handling - (working but needs some refinement as there are a lot of true negatives)
+- Favourite playlist, heart button for tracks, treated like a mix playlist
 
 Large Tasks:
 - Playlists can have custom crossfades between each song. These allow you to start fading anywhere in either song, sample a section of a song (or even import an audio file) to place at certain places on a timeline during the crossfade (including looping), add select DJ Mixer effects to any sample or just a specific part of one of the songs, and finally allow playlists to be exported as an MP3, FLAC, or WAV file (bounce the mix) that retains all of this and other settings.

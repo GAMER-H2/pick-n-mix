@@ -8,13 +8,26 @@
 import { nextTick, onMounted, ref } from "vue";
 import PnmIcon from "./icons/PnmIcon.vue";
 import Artwork from "./Artwork.vue";
+import PlaylistArtwork from "./PlaylistArtwork.vue";
 import { formatDuration, subtitleFor } from "@/lib/format";
 import { useDragReorder } from "@/lib/dragReorder";
-import type { Track } from "@/lib/types";
+import type { QueueMix, Track } from "@/lib/types";
+
+/**
+ * One row.
+ *
+ * A track may be null — the history list shows songs that have since left the
+ * library — while a mix is always whole: it is the playlist block, and the
+ * songs listed inside it are chapters of one entry rather than rows of their
+ * own. That is what stops anything being dropped into the middle of a mix.
+ */
+export type QueueRow =
+  | { kind: "track"; track: Track | null }
+  | { kind: "mix"; mix: QueueMix };
 
 const props = withDefaults(
   defineProps<{
-    items: Array<Track | null>;
+    items: QueueRow[];
     currentIndex: number | null;
     playing?: boolean;
     /** Larger rows for the full-screen view. */
@@ -22,9 +35,12 @@ const props = withDefaults(
     reorderable?: boolean;
     removable?: boolean;
     removeLabel?: string;
+    /** Where the current row has got to, for marking a mix's chapters. */
+    positionSecs?: number;
   }>(),
   {
     playing: false,
+    positionSecs: 0,
     roomy: false,
     reorderable: true,
     removable: true,
@@ -33,7 +49,8 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
-  play: [index: number];
+  /** `positionSecs` is set when a chapter inside a mix was clicked. */
+  play: [index: number, positionSecs?: number];
   remove: [index: number];
   move: [from: number, to: number];
   menu: [index: number, event: MouseEvent];
@@ -56,6 +73,16 @@ function play(track: Track | null, index: number) {
 
 function openMenu(track: Track | null, index: number, event: MouseEvent) {
   if (track) emit("menu", index, event);
+}
+
+/** Which song of a mix is sounding now, from where the player has got to. */
+function currentChapter(mix: QueueMix, index: number): number {
+  if (index !== props.currentIndex) return -1;
+  let at = -1;
+  mix.chapters.forEach((chapter, i) => {
+    if (chapter.startSecs <= props.positionSecs + 0.05) at = i;
+  });
+  return at;
 }
 
 /** The ancestor that actually scrolls this list. */
@@ -110,22 +137,115 @@ onMounted(async () => {
     class="queue-list"
     :class="{ 'is-roomy': roomy, 'is-dragging': reorderable && isDragging }"
   >
-    <template v-for="(track, index) in items" :key="`${track?.id ?? 'removed'}-${index}`">
+    <template
+      v-for="(row, index) in items"
+      :key="`${row.kind === 'mix' ? row.mix.playlistId : (row.track?.id ?? 'removed')}-${index}`"
+    >
       <div
         v-if="reorderable && dropAt === index && isDragging"
         class="queue-list__drop"
       />
 
+      <!--
+        A mix: one block, drawn as one thing. The songs in it are listed but
+        are not rows — there is no grip on them and nothing can be dropped
+        between them, which is exactly what the queue can and cannot do with
+        an arrangement.
+      -->
       <div
+        v-if="row.kind === 'mix'"
+        data-row
+        class="row mix-block"
+        :class="{
+          'is-current': index === currentIndex,
+          'is-lifted': reorderable && dragFrom === index,
+        }"
+      >
+        <button
+          v-if="reorderable"
+          class="row__grip"
+          title="Drag to reorder the whole mix"
+          aria-label="Drag to reorder the whole mix"
+          @pointerdown="onHandleDown($event, index)"
+          @pointermove="onHandleMove"
+          @pointerup="onHandleUp"
+          @pointercancel="onHandleCancel"
+        >
+          <PnmIcon name="grip" :size="15" />
+        </button>
+
+        <div class="mix-block__body">
+          <div class="mix-block__head">
+            <button
+              class="row__art"
+              :title="`Play ${row.mix.name}`"
+              :aria-label="`Play ${row.mix.name}`"
+              @click="emit('play', index)"
+            >
+              <PlaylistArtwork
+                :artwork="row.mix.artwork"
+                :artwork-ids="row.mix.artworkIds"
+                :size="roomy ? 44 : 38"
+                :radius="5"
+              />
+              <span class="row__overlay">
+                <PnmIcon
+                  :name="index === currentIndex && playing ? 'pause' : 'play'"
+                  :size="roomy ? 16 : 14"
+                />
+              </span>
+            </button>
+            <div class="row__text">
+              <div class="row__title clamp clamp-1" :title="row.mix.name">{{ row.mix.name }}</div>
+              <div class="row__subtitle clamp clamp-1">
+                <PnmIcon name="timeline" :size="11" class="mix-block__badge" />
+                Master mix · {{ row.mix.chapters.length }}
+                {{ row.mix.chapters.length === 1 ? "song" : "songs" }}
+              </div>
+            </div>
+            <span class="row__duration">{{ formatDuration(row.mix.durationSecs) }}</span>
+            <button
+              v-if="removable"
+              class="icon-button row__remove"
+              :aria-label="`Remove ${row.mix.name} from the queue`"
+              :title="`Remove ${row.mix.name} from the queue`"
+              @click.stop="emit('remove', index)"
+            >
+              <PnmIcon name="close" :size="15" />
+            </button>
+          </div>
+
+          <ol class="mix-block__chapters">
+            <li
+              v-for="(chapter, chapterIndex) in row.mix.chapters"
+              :key="`${chapter.startSecs}-${chapterIndex}`"
+            >
+              <button
+                class="mix-block__chapter"
+                :class="{ 'is-current': chapterIndex === currentChapter(row.mix, index) }"
+                :title="`Jump to ${chapter.title}`"
+                @click="emit('play', index, chapter.startSecs)"
+              >
+                <span class="mix-block__at">{{ formatDuration(chapter.startSecs) }}</span>
+                <span class="mix-block__song truncate">{{ chapter.title }}</span>
+                <span class="mix-block__artist truncate">{{ chapter.artist }}</span>
+              </button>
+            </li>
+          </ol>
+        </div>
+      </div>
+
+      <div
+        v-else
         data-row
         class="row"
         :class="{
-          'is-current': track && index === currentIndex,
+          'is-current': row.track && index === currentIndex,
           'is-lifted': reorderable && dragFrom === index,
-          'is-removed': !track,
+          'is-removed': !row.track,
         }"
-        @dblclick="play(track, index)"
-        @contextmenu.prevent="openMenu(track, index, $event)"
+        @dblclick="play(row.track, index)"
+        @contextmenu.prevent="openMenu(row.track, index, $event)"
       >
         <button
           v-if="reorderable"
@@ -142,13 +262,13 @@ onMounted(async () => {
 
         <button
           class="row__art"
-          :aria-label="track ? `Play ${track.title}` : 'Removed track'"
-          :title="track ? `Play ${track.title}` : 'Removed track'"
-          :disabled="!track"
-          @click="play(track, index)"
+          :aria-label="row.track ? `Play ${row.track.title}` : 'Removed track'"
+          :title="row.track ? `Play ${row.track.title}` : 'Removed track'"
+          :disabled="!row.track"
+          @click="play(row.track, index)"
         >
-          <Artwork :artwork-id="track?.artworkId ?? null" :size="roomy ? 44 : 38" :radius="5" />
-          <span v-if="track" class="row__overlay">
+          <Artwork :artwork-id="row.track?.artworkId ?? null" :size="roomy ? 44 : 38" :radius="5" />
+          <span v-if="row.track" class="row__overlay">
             <PnmIcon
               :name="index === currentIndex && playing ? 'pause' : 'play'"
               :size="roomy ? 16 : 14"
@@ -160,22 +280,26 @@ onMounted(async () => {
           <div
             class="row__title clamp"
             :class="{ 'clamp-1': !roomy }"
-            :title="track?.title ?? 'Removed track'"
+            :title="row.track?.title ?? 'Removed track'"
           >
-            {{ track?.title ?? "Removed track" }}
+            {{ row.track?.title ?? "Removed track" }}
           </div>
           <div
             class="row__subtitle clamp clamp-1"
-            :title="track ? subtitleFor([track.artist, track.album]) : 'No longer in library'"
+            :title="
+              row.track ? subtitleFor([row.track.artist, row.track.album]) : 'No longer in library'
+            "
           >
-            <slot name="subtitle" :track="track" :index="index">
-              {{ track ? subtitleFor([track.artist, track.album]) : "No longer in library" }}
+            <slot name="subtitle" :track="row.track" :index="index">
+              {{ row.track ? subtitleFor([row.track.artist, row.track.album]) : "No longer in library" }}
             </slot>
           </div>
         </div>
 
-        <slot name="meta" :track="track" :index="index">
-          <span v-if="track" class="row__duration">{{ formatDuration(track.durationSecs) }}</span>
+        <slot name="meta" :track="row.track" :index="index">
+          <span v-if="row.track" class="row__duration">
+            {{ formatDuration(row.track.durationSecs) }}
+          </span>
         </slot>
 
         <button
@@ -228,6 +352,95 @@ onMounted(async () => {
 
 .row:hover {
   background: var(--bg-hover);
+}
+
+/*
+ * The mix block.
+ *
+ * Drawn as one enclosed thing — its own surface, an accent edge down the side
+ * and the songs indented inside it — because that is what it is in the queue:
+ * a single entry nothing can be dropped into. The border is the whole point,
+ * so it is not a hover treatment.
+ */
+.mix-block {
+  align-items: stretch;
+  padding: 7px 8px;
+  border: 0.5px solid var(--separator-strong);
+  border-left: 2px solid var(--accent);
+  background: var(--bg-sunken);
+}
+
+.mix-block:hover {
+  background: var(--bg-sunken);
+}
+
+.mix-block.is-current {
+  border-left-color: var(--accent);
+  background: var(--accent-tint);
+}
+
+.mix-block__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.mix-block__head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.mix-block__badge {
+  vertical-align: -1px;
+  margin-right: 4px;
+  color: var(--accent);
+}
+
+.mix-block__chapters {
+  margin: 6px 0 0;
+  padding: 0 0 0 4px;
+  list-style: none;
+  border-left: 1px solid var(--separator);
+}
+
+.mix-block__chapter {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.mix-block__chapter:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+/* Which song is sounding now, inside a mix that has no rows to highlight. */
+.mix-block__chapter.is-current {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.mix-block__at {
+  flex: none;
+  width: 44px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+
+.mix-block__song {
+  min-width: 0;
+}
+
+.mix-block__artist {
+  min-width: 0;
+  margin-left: auto;
+  color: var(--text-tertiary);
 }
 
 .row.is-lifted {

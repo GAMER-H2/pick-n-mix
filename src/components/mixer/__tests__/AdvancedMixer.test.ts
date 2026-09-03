@@ -51,6 +51,21 @@ describe("AdvancedMixer panning", () => {
     const wrapper = mount(AdvancedMixer);
 
     expect(wrapper.find("[data-testid='panning-section']").exists()).toBe(true);
-    expect(wrapper.text()).not.toContain("Semitones");
+  });
+
+  /**
+   * Timeline voices carry their own varispeed and their own ambience beds, so
+   * both are offered on a block. Crossfade still is not: it describes a join
+   * between playlist entries, which a region on a timeline does not have.
+   */
+  it("offers pitch and atmospheres on a timeline block, but not crossfade", () => {
+    const mixer = useMixerStore();
+    mixer.target = { kind: "block", playlistId: "playlist", blockId: "block", name: "Clip" };
+
+    const wrapper = mount(AdvancedMixer);
+
+    expect(wrapper.text()).toContain("Semitones");
+    expect(wrapper.text()).toContain("Atmospheres");
+    expect(wrapper.text()).not.toContain("Crossfade");
   });
 });

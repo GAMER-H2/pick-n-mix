@@ -250,7 +250,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       <template v-if="!isEqPreset">
 
       <!-- Pitch ------------------------------------------------------------->
-      <section v-if="!isBlockTarget" class="panel__section">
+      <section class="panel__section">
         <SectionHeader
           title="Pitch"
           :overridden="overridden('pitch')"
@@ -270,6 +270,10 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         <p class="panel__hint">
           Varispeed: pitch and tempo move together, so this also changes speed by
           {{ tempoPercent(fx.pitch) > 0 ? "+" : "" }}{{ tempoPercent(fx.pitch).toFixed(1) }}%.
+          <template v-if="isBlockTarget">
+            The region on the timeline resizes to match, so it keeps covering the
+            same part of the song.
+          </template>
         </p>
       </section>
 
@@ -550,7 +554,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </section>
 
       <!-- Atmospheres ------------------------------------------------------->
-      <section v-if="!isBlockTarget" class="panel__section">
+      <section class="panel__section">
         <SectionHeader
           title="Atmospheres"
           :overridden="overridden('filters')"
@@ -563,6 +567,10 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           @toggle="presetEditor.toggleFilter"
           @volume="presetEditor.setFilterVolume"
         />
+        <p v-if="isBlockTarget" class="panel__hint">
+          A bed here plays for as long as this region does and fades with it,
+          rather than running under the whole mix.
+        </p>
       </section>
 
       <!-- Sample rate ------------------------------------------------------->

@@ -65,6 +65,36 @@ export function cloneMix(mix: MasterMix): MasterMix {
   };
 }
 
+/**
+ * Everything about a mix that changes what it sounds like, and nothing else.
+ *
+ * Used to decide whether an edit needs the audition rebuilt. Rebuilding is a
+ * re-seek — audible, and pointless after renaming a track or recolouring it —
+ * so the cheap thing is to ask whether the plan the backend would build has
+ * actually changed. Deriving it from the arrangement rather than tagging each
+ * edit site means a new kind of edit is covered the day it is written.
+ */
+export function soundSignature(mix: MasterMix): string {
+  return JSON.stringify(
+    mix.lanes.map((lane) => [
+      lane.muted,
+      lane.soloed,
+      lane.gainDb,
+      lane.blocks.map((block) => [
+        block.source,
+        block.startSecs,
+        block.offsetSecs,
+        block.durationSecs,
+        block.gainDb,
+        block.fadeInSecs,
+        block.fadeOutSecs,
+        block.automation,
+        block.mixer,
+      ]),
+    ]),
+  );
+}
+
 export function blockEnd(block: MixBlock): number {
   return block.startSecs + block.durationSecs;
 }
@@ -380,6 +410,24 @@ export function snapCandidates(mix: MasterMix, exclude: Set<string>): number[] {
   return times;
 }
 
+/**
+ * The ruler marks nearest each of `times`, so snapping to the grid costs
+ * nothing to offer.
+ *
+ * Enumerating every mark on a long timeline would be thousands of numbers to
+ * compare against on every pointer move, and all but two of them are further
+ * away than the two either side. Rounding gives those two directly.
+ */
+export function gridCandidates(times: number[], gridSecs: number): number[] {
+  if (!(gridSecs > 0)) return [];
+  const out: number[] = [];
+  for (const time of times) {
+    const at = time / gridSecs;
+    out.push(Math.max(0, Math.floor(at) * gridSecs), Math.max(0, Math.ceil(at) * gridSecs));
+  }
+  return out;
+}
+
 /** The closest candidate to `time`, and how far away it is. */
 function nearest(time: number, candidates: number[]): { time: number; distance: number } {
   let best = { time, distance: Infinity };
@@ -551,6 +599,43 @@ export function curveFromMidGain(fromDb: number, toDb: number, midDb: number): n
   if (Math.abs(span) < 0.01) return 1;
   const t = clamp((midDb - fromDb) / span, 0.05, 0.95);
   return clamp(Math.log(t) / Math.log(0.5), 0.05, 8);
+}
+
+/**
+ * Rescale a block so that changing its playback speed keeps the same stretch
+ * of the song under it.
+ *
+ * A block is laid out in timeline seconds, so pitching a region up would
+ * otherwise make it play *further* into the song in the same space. Shrinking
+ * the region instead is what a timeline editor does, and it is what makes the
+ * varispeed legible: the block visibly gets shorter as it speeds up.
+ *
+ * Fades and keyframes are in block time, so they scale with it and the shape
+ * of the envelope survives.
+ */
+export function scaleBlockForSpeed(
+  mix: MasterMix,
+  blockId: string,
+  fromSpeed: number,
+  toSpeed: number,
+): MasterMix {
+  const found = locate(mix, blockId);
+  if (!found) return mix;
+  if (!(fromSpeed > 0) || !(toSpeed > 0)) return mix;
+  const factor = fromSpeed / toSpeed;
+  if (!Number.isFinite(factor) || Math.abs(factor - 1) < 1e-9) return mix;
+
+  const block = found.block;
+  return withBlock(mix, blockId, {
+    ...block,
+    durationSecs: Math.max(MIN_BLOCK_SECS, block.durationSecs * factor),
+    fadeInSecs: block.fadeInSecs * factor,
+    fadeOutSecs: block.fadeOutSecs * factor,
+    automation: block.automation.map((point) => ({
+      ...point,
+      atSecs: point.atSecs * factor,
+    })),
+  });
 }
 
 export function setBlockMixer(

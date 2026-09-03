@@ -37,6 +37,9 @@ pub const MAX_AUTOMATION_POINTS: usize = 512;
 pub const MAX_TIMELINE_SECS: f64 = 24.0 * 60.0 * 60.0;
 /// Shorter than this and a block is not audible as anything but a click.
 pub const MIN_BLOCK_SECS: f64 = 0.02;
+/// How far apart two blocks of the same song have to be before the second one
+/// counts as starting that song again rather than continuing it.
+pub const CHAPTER_GAP_SECS: f64 = 0.5;
 /// Gain range shared by lanes, blocks and automation points.
 pub const MIN_GAIN_DB: f32 = -60.0;
 pub const MAX_GAIN_DB: f32 = 12.0;
@@ -183,6 +186,13 @@ impl Block {
     }
 }
 
+/// One point on the timeline where a new piece of music begins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChapterMark {
+    pub start_secs: f64,
+    pub source: BlockSource,
+}
+
 /// One horizontal lane. The mute and solo buttons in the drawing live here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -279,6 +289,48 @@ impl MasterMix {
             mix.lanes.push(lane);
         }
         mix
+    }
+
+    /// Where each new piece of music starts on the timeline.
+    ///
+    /// Used by the player bar, which shows a mixed playlist as one long track
+    /// and needs somewhere to put its chapter dots. Blocks are walked in time
+    /// order across every audible lane, and a block only opens a chapter when
+    /// it is a different source from the one before it, or the same source
+    /// picked up again after a gap. Splitting a song in two therefore does not
+    /// invent a chapter, and using the same song twice in the mix does.
+    pub fn chapter_marks(&self) -> Vec<ChapterMark> {
+        let mut blocks: Vec<&Block> = self
+            .lanes
+            .iter()
+            .filter(|lane| self.lane_audible(lane))
+            .flat_map(|lane| lane.blocks.iter())
+            .collect();
+        blocks.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
+
+        let mut marks: Vec<ChapterMark> = Vec::new();
+        // The source of the chapter being extended, and how far it reaches.
+        let mut current: Option<(BlockSource, f64)> = None;
+        for block in blocks {
+            let continues = match &current {
+                Some((source, end)) => {
+                    *source == block.source && block.start_secs <= end + CHAPTER_GAP_SECS
+                }
+                None => false,
+            };
+            if continues {
+                if let Some((_, end)) = current.as_mut() {
+                    *end = end.max(block.end_secs());
+                }
+                continue;
+            }
+            marks.push(ChapterMark {
+                start_secs: block.start_secs,
+                source: block.source.clone(),
+            });
+            current = Some((block.source.clone(), block.end_secs()));
+        }
+        marks
     }
 
     pub fn duration_secs(&self) -> f64 {
@@ -508,6 +560,58 @@ mod tests {
     fn mix_of(durations: &[f64]) -> MasterMix {
         let titles: Vec<String> = (0..durations.len()).map(|i| format!("Song {i}")).collect();
         MasterMix::build(&titles, durations)
+    }
+
+    #[test]
+    fn every_song_in_the_default_mix_opens_a_chapter() {
+        let mix = mix_of(&[100.0, 200.0, 50.0]);
+        let marks = mix.chapter_marks();
+        assert_eq!(marks.len(), 3);
+        assert_eq!(marks[0].start_secs, 0.0);
+        assert_eq!(marks[1].start_secs, 100.0);
+        assert_eq!(marks[2].start_secs, 300.0);
+        assert_eq!(marks[0].source, BlockSource::Entry { index: 0 });
+    }
+
+    #[test]
+    fn splitting_a_song_does_not_invent_a_chapter() {
+        let mut mix = mix_of(&[100.0, 100.0]);
+        // The blade, in effect: one block becomes two touching halves.
+        let mut right = mix.lanes[0].blocks[0].clone();
+        right.id = new_id("blk");
+        right.start_secs = 40.0;
+        right.offset_secs = 40.0;
+        right.duration_secs = 60.0;
+        mix.lanes[0].blocks[0].duration_secs = 40.0;
+        mix.lanes[0].blocks.push(right);
+
+        let marks = mix.chapter_marks();
+        assert_eq!(marks.len(), 2, "the split halves are still one song");
+        assert_eq!(marks[1].start_secs, 100.0);
+    }
+
+    #[test]
+    fn the_same_song_used_again_later_opens_a_second_chapter() {
+        let mut mix = mix_of(&[100.0, 100.0]);
+        mix.lanes[0].blocks.push(Block {
+            source: BlockSource::Entry { index: 0 },
+            start_secs: 200.0,
+            duration_secs: 30.0,
+            ..Default::default()
+        });
+        let marks = mix.chapter_marks();
+        assert_eq!(marks.len(), 3);
+        assert_eq!(marks[2].start_secs, 200.0);
+        assert_eq!(marks[2].source, BlockSource::Entry { index: 0 });
+    }
+
+    #[test]
+    fn a_muted_lane_contributes_no_chapter() {
+        let mut mix = mix_of(&[100.0, 100.0]);
+        mix.lanes[1].muted = true;
+        let marks = mix.chapter_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].source, BlockSource::Entry { index: 0 });
     }
 
     #[test]

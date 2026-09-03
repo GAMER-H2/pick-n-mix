@@ -10,6 +10,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { onBeforeRouteLeave, useRouter } from "vue-router";
 import PnmIcon from "./icons/PnmIcon.vue";
 import Artwork from "./Artwork.vue";
+import PlaylistArtwork from "./PlaylistArtwork.vue";
 import QueueList from "./QueueList.vue";
 import { artUrl, formatDuration, subtitleFor } from "@/lib/format";
 import * as api from "@/lib/api";
@@ -21,10 +22,24 @@ const ui = useUiStore();
 const router = useRouter();
 
 const track = computed(() => player.track);
+/**
+ * The playlist, when a mix is what is playing.
+ *
+ * A mix has no current track, so the screen shows what it is actually playing:
+ * the playlist, its picture, and how far through the arrangement it is.
+ */
+const mix = computed(() => player.masterMix);
 // Blown up 1.6x and blurred 64px, so detail beyond this is invisible; no
 // reason to decode the original multi-megapixel picture for it.
-const backdrop = computed(() => artUrl(track.value?.artworkId, 640));
-const subtitle = computed(() => subtitleFor([track.value?.artist, track.value?.album]));
+const backdrop = computed(() =>
+  artUrl(mix.value ? (mix.value.artwork ?? mix.value.artworkIds[0] ?? null) : track.value?.artworkId, 640),
+);
+const subtitle = computed(() =>
+  mix.value
+    ? `Master mix · ${mix.value.trackCount} ${mix.value.trackCount === 1 ? "song" : "songs"}`
+    : subtitleFor([track.value?.artist, track.value?.album]),
+);
+const title = computed(() => mix.value?.name ?? track.value?.title ?? "Nothing Playing");
 const items = computed(() => player.queue.items);
 const current = computed(() => player.queue.currentIndex);
 const queueReady = ref(false);
@@ -69,12 +84,13 @@ onBeforeUnmount(() => {
 });
 
 /** Clicking the row that is already playing toggles it instead of restarting. */
-async function jump(index: number) {
-  if (index === current.value && player.playing) {
+async function jump(index: number, positionSecs?: number) {
+  // A chapter inside the playing mix is a place to go, not a play/pause.
+  if (positionSecs === undefined && index === current.value && player.playing) {
     await player.toggle();
     return;
   }
-  await api.playQueueIndex(index);
+  await api.playQueueIndex(index, positionSecs);
 }
 
 async function remove(index: number) {
@@ -88,8 +104,10 @@ async function move(from: number, to: number) {
 }
 
 function openMenu(index: number, event: MouseEvent) {
-  const item = items.value[index];
-  if (item) ui.openContextMenu({ x: event.clientX, y: event.clientY, tracks: [item] });
+  // A mix is one block: there is no per-song menu inside it.
+  const row = items.value[index];
+  if (row?.kind !== "track") return;
+  ui.openContextMenu({ x: event.clientX, y: event.clientY, tracks: [row.track] });
 }
 </script>
 
@@ -118,11 +136,17 @@ function openMenu(index: number, event: MouseEvent) {
 
     <div class="screen__body">
       <div class="screen__art">
-        <Artwork :artwork-id="track?.artworkId" :size="380" :radius="12" shadow />
+        <PlaylistArtwork
+          v-if="mix"
+          :artwork="mix.artwork"
+          :artwork-ids="mix.artworkIds"
+          :size="380"
+          :radius="12"
+          shadow
+        />
+        <Artwork v-else :artwork-id="track?.artworkId" :size="380" :radius="12" shadow />
         <div class="screen__meta">
-          <h1 class="clamp" :title="track?.title ?? ''">
-            {{ track?.title ?? "Nothing Playing" }}
-          </h1>
+          <h1 class="clamp" :title="title">{{ title }}</h1>
           <p class="clamp" :title="subtitle">{{ subtitle }}</p>
           <p v-if="player.duration > 0" class="screen__time">
             {{ formatDuration(player.position) }} / {{ formatDuration(player.duration) }}
@@ -138,6 +162,7 @@ function openMenu(index: number, event: MouseEvent) {
             :items="items"
             :current-index="current"
             :playing="player.playing"
+            :position-secs="player.position"
             roomy
             @play="jump"
             @remove="remove"

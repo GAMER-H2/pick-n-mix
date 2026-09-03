@@ -19,6 +19,8 @@ const props = defineProps<{
   block: MixBlock;
   entry: MixEntry | null;
   waveform: Waveform | null;
+  /** Varispeed, as source seconds per timeline second. */
+  speed: number;
   pixelsPerSecond: number;
   height: number;
   selected: boolean;
@@ -39,6 +41,8 @@ const emit = defineEmits<{
       gainDb: number;
     },
   ): void;
+  /** Double-click, which every editor uses to open what was clicked. */
+  (e: "openMixer"): void;
 }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -198,7 +202,10 @@ function draw() {
   const middle = cssHeight / 2;
   const fromPeak = Math.floor(props.block.offsetSecs * waveform.peaksPerSec);
   const loopPeaks = Math.max(0, waveform.peaks.length - fromPeak);
-  const peaksPerPixel = (props.block.durationSecs * waveform.peaksPerSec) / cssWidth;
+  // Source seconds, not timeline seconds: a region playing at double speed
+  // covers twice as much of the song in the same width.
+  const sourceSecs = props.block.durationSecs * Math.max(props.speed, 0.01);
+  const peaksPerPixel = (sourceSecs * waveform.peaksPerSec) / cssWidth;
 
   // Timeline peaks beyond EOF wrap to the block's offset. This mirrors the
   // audio source, so extending a region shows each repeated pass explicitly.
@@ -226,6 +233,7 @@ watch(
     props.hue,
     props.block.offsetSecs,
     props.block.durationSecs,
+    props.speed,
   ],
   () => draw(),
 );
@@ -243,6 +251,7 @@ watch(
     :style="{ left: `${left}px`, width: `${width}px`, '--lane-hue': hue }"
     :title="label"
     @pointerdown.stop="onBodyDown"
+    @dblclick.stop="emit('openMixer')"
   >
     <div class="block__label">{{ label }}</div>
     <canvas ref="canvas" class="block__wave" />

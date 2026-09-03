@@ -610,7 +610,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
             <QueueList
               v-else
               class="history-queue"
-              :items="settings.history.map((record) => record.track)"
+              :items="settings.history.map((record) => ({ kind: 'track', track: record.track }) as const)"
               :current-index="null"
               :playing="player.playing"
               :reorderable="false"

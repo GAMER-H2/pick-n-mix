@@ -6,6 +6,7 @@
 import { computed } from "vue";
 import PnmIcon from "./icons/PnmIcon.vue";
 import Artwork from "./Artwork.vue";
+import PlaylistArtwork from "./PlaylistArtwork.vue";
 import { formatBytes, formatDuration, formatHz } from "@/lib/format";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";
@@ -14,6 +15,17 @@ const ui = useUiStore();
 const player = usePlayerStore();
 
 const track = computed(() => ui.infoTrack);
+
+/**
+ * The mix, when the bubble was opened on one.
+ *
+ * Read from the player rather than copied when the bubble opened: a mix is
+ * something in progress, so if it stops there is nothing left to describe and
+ * this closes with it.
+ */
+const mix = computed(() => (ui.infoMixOpen ? player.masterMix : null));
+/** The stream the engine built out of the arrangement: one file's worth. */
+const mixStream = computed(() => (mix.value ? player.snapshot.stream : null));
 const isCurrent = computed(() => !!track.value && player.track?.id === track.value.id);
 /** Stream facts are only meaningful for the track actually being decoded. */
 const stream = computed(() => (isCurrent.value ? player.snapshot.stream : null));
@@ -27,7 +39,81 @@ const effectiveRate = computed(() => {
 
 <template>
   <Transition name="pop">
-    <div v-if="track" class="info" role="dialog" aria-label="Track information">
+    <!--
+      A mix is not a song: there is no file, no album and no track gain, but
+      there is a playlist, one summed stream, and the same output as anything
+      else. That is what this shows in a song's place.
+    -->
+    <div v-if="mix" class="info" role="dialog" aria-label="Mix information">
+      <header class="info__head">
+        <PlaylistArtwork
+          :artwork="mix.artwork"
+          :artwork-ids="mix.artworkIds"
+          :size="56"
+          :radius="6"
+        />
+        <div class="info__title">
+          <div class="info__name clamp" :title="mix.name">{{ mix.name }}</div>
+          <div class="info__artist clamp clamp-1">Master mix</div>
+        </div>
+        <button class="icon-button" aria-label="Close" @click="ui.infoMixOpen = false">
+          <PnmIcon name="close" :size="16" />
+        </button>
+      </header>
+
+      <dl class="info__list">
+        <div><dt>Playlist</dt><dd class="clamp" :title="mix.name">{{ mix.name }}</dd></div>
+        <div v-if="mix.description">
+          <dt>Description</dt>
+          <dd class="clamp" :title="mix.description">{{ mix.description }}</dd>
+        </div>
+        <div><dt>Songs</dt><dd>{{ mix.trackCount }}</dd></div>
+        <div><dt>Arrangement</dt><dd>{{ mix.blockCount }} regions on {{ mix.laneCount }} tracks</dd></div>
+        <div><dt>Length</dt><dd>{{ formatDuration(mix.durationSecs) }}</dd></div>
+        <div>
+          <dt>ID</dt>
+          <dd class="info__mono clamp clamp-1">{{ mix.playlistId }}</dd>
+        </div>
+      </dl>
+
+      <div class="info__section">Mixed Audio</div>
+
+      <dl class="info__list">
+        <div>
+          <dt>File Type</dt>
+          <dd>
+            Rendered live
+            <span class="info__tag">no file</span>
+          </dd>
+        </div>
+        <div v-if="mixStream"><dt>Codec</dt><dd>{{ mixStream.codec }}</dd></div>
+        <div v-if="mixStream">
+          <dt>Mix Rate</dt>
+          <dd>
+            {{ formatHz(mixStream.sampleRate) }}
+            <span v-if="mixStream.bitsPerSample"> · {{ mixStream.bitsPerSample }} bit float</span>
+          </dd>
+        </div>
+        <div v-if="mixStream"><dt>Channels</dt><dd>{{ mixStream.channels }}</dd></div>
+        <div><dt>Duration</dt><dd>{{ formatDuration(player.duration) }}</dd></div>
+        <div><dt>Position</dt><dd>{{ formatDuration(player.position) }}</dd></div>
+      </dl>
+
+      <div class="info__section">Output</div>
+      <dl class="info__list">
+        <div>
+          <dt>Device</dt>
+          <dd class="clamp clamp-1">{{ player.snapshot.deviceName || "Unknown" }}</dd>
+        </div>
+        <div><dt>Device Rate</dt><dd>{{ formatHz(player.snapshot.deviceSampleRate) }}</dd></div>
+        <div v-if="Math.abs(player.snapshot.speed - 1) > 0.001">
+          <dt>Playback Rate</dt>
+          <dd><span class="info__tag">{{ player.snapshot.speed.toFixed(3) }}x</span></dd>
+        </div>
+      </dl>
+    </div>
+
+    <div v-else-if="track" class="info" role="dialog" aria-label="Track information">
       <header class="info__head">
         <Artwork :artwork-id="track.artworkId" :size="56" :radius="6" />
         <div class="info__title">

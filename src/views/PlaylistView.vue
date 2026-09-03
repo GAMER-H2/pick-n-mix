@@ -41,9 +41,21 @@ const available = computed(() => items.value.filter((i) => i.track !== null));
 const totalDuration = computed(() =>
   items.value.reduce((sum, i) => sum + (i.track?.durationSecs ?? i.entry.durationSecs), 0),
 );
-const artworkId = computed(
-  () => playlist.value?.artwork ?? available.value.find((i) => i.track?.artworkId)?.track?.artworkId,
-);
+const artworkId = computed(() => playlist.value?.artwork ?? null);
+
+/**
+ * Covers of the first four different songs, which is what a playlist with no
+ * picture of its own is drawn as.
+ */
+const artworkIds = computed(() => {
+  const seen: string[] = [];
+  for (const item of available.value) {
+    const id = item.track?.artworkId;
+    if (id && !seen.includes(id)) seen.push(id);
+    if (seen.length === 4) break;
+  }
+  return seen;
+});
 
 const meta = computed(() => {
   const p = playlist.value;
@@ -144,7 +156,9 @@ async function shuffle() {
 async function openPlaylistMixer() {
   const p = playlist.value;
   if (!p) return;
-  await mixer.editPlaylist(p.id, p.name, p.mixer);
+  // A playlist that plays as a mix ignores the global mixer, so the panel is
+  // told not to show it underneath what is being edited here.
+  await mixer.editPlaylist(p.id, p.name, p.mixer, !!p.masterMix?.enabled);
   mixer.panelOpen = true;
 }
 
@@ -161,9 +175,10 @@ async function openMasterMix() {
   await masterMix.openFor(p.id);
 }
 
+/** The render has been started, not finished: it reports its own progress. */
 function onBounced(path: string) {
   bounceOpen.value = false;
-  ui.notify(`Bounced mix to ${path}`);
+  ui.notify(`Bouncing to ${path.split(/[/\\]/).pop() ?? path}…`);
 }
 
 /**
@@ -182,6 +197,18 @@ function startEditingDescription() {
   editingDescription.value = true;
 }
 
+/**
+ * Queue this playlist as a whole.
+ *
+ * Used only for a playlist that plays as a mix: the arrangement goes in as one
+ * block, since its songs overlap and cannot be spread across a queue.
+ */
+async function queueWholePlaylist(next: boolean) {
+  const p = playlist.value;
+  if (!p) return;
+  await api.queuePlaylist(p.id, next);
+}
+
 async function saveDescription() {
   const p = playlist.value;
   if (!p) return;
@@ -197,6 +224,7 @@ async function saveDescription() {
       :title="playlist.name"
       :meta="meta"
       :artwork-id="artworkId"
+      :artwork-ids="artworkIds"
       :mixer-active="!!playlist.mixer"
       :disabled="available.length === 0"
       @play="play(0)"
@@ -211,6 +239,9 @@ async function saveDescription() {
             id: playlist!.id,
             shuffleOnly: playlist!.shuffleOnly,
             hasArtwork: !!playlist!.artwork,
+            masterMixEnabled: !!playlist!.masterMix?.enabled,
+            onPlayNext: () => queueWholePlaylist(true),
+            onAddToQueue: () => queueWholePlaylist(false),
             onToggleShuffleOnly: toggleShuffleOnly,
             onChooseArtwork: chooseArtwork,
             onClearArtwork: clearArtwork,
@@ -219,15 +250,22 @@ async function saveDescription() {
       "
     >
       <template #actions>
+        <!-- Named, like Play and Shuffle beside it: the master mixer is one
+             of the things you do to a playlist, not a setting hidden behind a
+             glyph. -->
         <button
-          class="icon-button"
-          :class="{ 'is-active': playlist!.masterMix?.enabled }"
-          title="Master mixer: arrange this playlist on a timeline"
-          aria-label="Open the master mixer"
+          class="pill-button"
+          :class="{ 'is-secondary': !playlist!.masterMix?.enabled }"
+          :title="
+            playlist!.masterMix?.enabled
+              ? 'Master mixer: this playlist plays as a mix'
+              : 'Master mixer: arrange this playlist on a timeline'
+          "
           :disabled="available.length === 0"
           @click="openMasterMix"
         >
-          <PnmIcon name="timeline" :size="18" />
+          <PnmIcon name="timeline" :size="14" />
+          <span>Master Mix</span>
         </button>
         <button
           class="icon-button"
@@ -330,6 +368,7 @@ async function saveDescription() {
     v-if="bounceOpen && playlist"
     :playlist-id="playlist.id"
     :playlist-name="playlist.name"
+    :has-artwork="!!playlist.artwork"
     @close="bounceOpen = false"
     @bounced="onBounced"
   />

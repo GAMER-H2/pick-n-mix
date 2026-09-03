@@ -11,6 +11,7 @@ import { computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
 import Artwork from "@/components/Artwork.vue";
+import PlaylistArtwork from "@/components/PlaylistArtwork.vue";
 import MixCard from "@/components/home/MixCard.vue";
 import * as api from "@/lib/api";
 import { useHomeStore } from "@/stores/home";
@@ -167,7 +168,13 @@ async function openPlaylistMenu(playlist: PlaylistSummary, event: MouseEvent) {
             @click="router.push({ name: 'playlist', params: { id: playlist.id } })"
             @contextmenu.prevent="openPlaylistMenu(playlist, $event)"
           >
-            <Artwork :artwork-id="playlist.artwork" :size="140" :radius="7" shadow />
+            <PlaylistArtwork
+              :artwork="playlist.artwork"
+              :artwork-ids="playlist.artworkIds"
+              :size="140"
+              :radius="7"
+              shadow
+            />
             <div class="card__title truncate">{{ playlist.name }}</div>
             <div class="card__subtitle truncate">
               {{ playlist.trackCount }} {{ playlist.trackCount === 1 ? "song" : "songs" }}

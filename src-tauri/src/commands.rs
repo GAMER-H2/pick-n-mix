@@ -137,6 +137,9 @@ pub fn set_preferred_track_file(
 
 #[tauri::command]
 pub fn preview_track_file(state: State<'_, AppState>, song_id: String, file_id: String) -> Cmd<()> {
+    if master_mix_owns_playback(&state) {
+        return Ok(());
+    }
     let file = state
         .db
         .file_by_id(&file_id)
@@ -340,6 +343,12 @@ pub(crate) fn start_current(app: &AppHandle, state: &AppState) -> Cmd<()> {
 
 fn load_current(app: &AppHandle, state: &AppState, position_secs: f64, playing: bool) -> Cmd<bool> {
     state.cancel_preview();
+    let entry = state.player.lock().current_entry().cloned();
+    // A mix is a whole timeline rather than a file, so it is loaded by its own
+    // path — but it is reached the same way anything else in the queue is.
+    if let Some(crate::player::QueueEntry::Mix(mix)) = entry {
+        return load_queued_mix(app, state, &mix, position_secs, playing);
+    }
     let Some(song_id) = state.player.lock().current().map(|track| track.id.clone()) else {
         state.engine.clear();
         state.end_play();
@@ -412,6 +421,9 @@ pub struct PlayRequest {
 
 #[tauri::command]
 pub fn play_tracks(app: AppHandle, state: State<'_, AppState>, request: PlayRequest) -> Cmd<()> {
+    if master_mix_owns_playback(&state) {
+        return Ok(());
+    }
     state.cancel_preview();
     let tracks = load_tracks(&state, &request.track_ids)?;
     if tracks.is_empty() {
@@ -427,8 +439,35 @@ pub fn play_tracks(app: AppHandle, state: State<'_, AppState>, request: PlayRequ
 }
 
 /// Jump to a position in the current play order.
+///
+/// `position_secs` is for the songs listed inside a queued mix: they are
+/// chapters of one entry rather than entries of their own, so jumping to one
+/// means starting that entry at a time. Asking for a position inside the mix
+/// that is already playing seeks it instead of rebuilding it, which is the
+/// difference between a jump and a stutter.
 #[tauri::command]
-pub fn play_queue_index(app: AppHandle, state: State<'_, AppState>, index: usize) -> Cmd<()> {
+pub fn play_queue_index(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    index: usize,
+    position_secs: Option<f64>,
+) -> Cmd<()> {
+    if master_mix_owns_playback(&state) {
+        return Ok(());
+    }
+    let position = position_secs.unwrap_or(0.0).max(0.0);
+    if let Some(secs) = position_secs {
+        let playing_here = {
+            let player = state.player.lock();
+            player.current_index() == Some(index) && player.current_mix().is_some()
+        };
+        if playing_here && enabled_mix_playing(&state).is_some() {
+            state.engine.seek(secs.max(0.0));
+            state.engine.play();
+            let _ = app.emit("playing-changed", true);
+            return Ok(());
+        }
+    }
     state.cancel_preview();
     {
         let mut player = state.player.lock();
@@ -436,11 +475,62 @@ pub fn play_queue_index(app: AppHandle, state: State<'_, AppState>, index: usize
             return Ok(());
         }
     }
-    start_current(&app, &state)
+    let loaded = load_current(&app, &state, position, true)?;
+    let _ = app.emit("playing-changed", loaded);
+    Ok(())
+}
+
+/// Whether the Master Mixer currently owns the engine.
+///
+/// While its modal is open the mixer has captured normal playback — the queue
+/// is paused and its position remembered — and the engine is either idle or
+/// playing a timeline. Letting the ordinary transport through in that state is
+/// how the main player and the mixer end up fighting: a spacebar or a media
+/// key would pause the audition behind the editor's back, or worse, load a
+/// queue track over the top of the timeline and silently discard it.
+///
+/// So the transport is refused rather than reinterpreted. The frontend hides
+/// those controls too, but the check has to live here as well: media keys and
+/// the OS transport never pass through the frontend at all.
+pub(crate) fn master_mix_owns_playback(state: &AppState) -> bool {
+    state.master_mix_session.lock().is_some()
+}
+
+/// The playlist whose saved mix is playing as ordinary playback, if one is.
+///
+/// This is the other half of [`master_mix_owns_playback`]: no modal is open,
+/// the engine is simply playing a timeline instead of a queue track because
+/// the playlist that was started has its master mix switched on. The transport
+/// belongs to the user in that state, so the commands below act on the
+/// timeline rather than routing through the queue — which is empty, and whose
+/// preview-cancelling path would unload the mix mid-play.
+pub(crate) fn enabled_mix_playing(state: &AppState) -> Option<String> {
+    if state.master_mix_session.lock().is_some() {
+        return None;
+    }
+    match state.master_mix_playback.lock().as_ref() {
+        Some(MasterMixPlayback::Enabled { playlist_id }) => Some(playlist_id.clone()),
+        _ => None,
+    }
 }
 
 #[tauri::command]
 pub fn toggle_play(app: AppHandle, state: State<'_, AppState>) -> Cmd<bool> {
+    if master_mix_owns_playback(&state) {
+        return Ok(state.engine.is_playing());
+    }
+    // A loaded mix is already the whole arrangement, so playing and pausing it
+    // is the engine's own flag and nothing else.
+    if enabled_mix_playing(&state).is_some() {
+        let now_playing = !state.engine.is_playing();
+        if now_playing {
+            state.engine.play();
+        } else {
+            state.engine.pause();
+        }
+        let _ = app.emit("playing-changed", now_playing);
+        return Ok(now_playing);
+    }
     let playing = state.engine.is_playing();
     if let Some(preview) = state.cancel_preview() {
         let normal_was_playing = preview
@@ -474,6 +564,12 @@ pub fn toggle_play(app: AppHandle, state: State<'_, AppState>) -> Cmd<bool> {
 
 #[tauri::command]
 pub fn next_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
+    if master_mix_owns_playback(&state) {
+        return Ok(());
+    }
+    if let Some(playlist_id) = enabled_mix_playing(&state) {
+        return seek_chapter(&app, &state, &playlist_id, 1);
+    }
     state.cancel_preview();
     let has_next = state.player.lock().advance(false).is_some();
     if !has_next {
@@ -487,7 +583,13 @@ pub fn next_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
 /// that it restarts the current one, which is what every player does.
 #[tauri::command]
 pub fn previous_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
+    if master_mix_owns_playback(&state) {
+        return Ok(());
+    }
     const RESTART_AFTER_SECS: f64 = 3.0;
+    if let Some(playlist_id) = enabled_mix_playing(&state) {
+        return seek_chapter(&app, &state, &playlist_id, -1);
+    }
     let cancelled = state.cancel_preview();
     let position = cancelled
         .as_ref()
@@ -513,6 +615,13 @@ pub fn previous_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
 
 #[tauri::command]
 pub fn seek(app: AppHandle, state: State<'_, AppState>, position_secs: f64) -> Cmd<()> {
+    if master_mix_owns_playback(&state) {
+        return Ok(());
+    }
+    if enabled_mix_playing(&state).is_some() {
+        state.engine.seek(position_secs.max(0.0));
+        return Ok(());
+    }
     if let Some(preview) = state.cancel_preview() {
         let playing = preview
             .original
@@ -1051,6 +1160,9 @@ pub fn delete_filter(state: State<'_, AppState>, id: String) -> Cmd<Vec<FilterIn
 // Playlists
 // ---------------------------------------------------------------------------
 
+/// How many covers a playlist without its own picture is drawn from.
+pub const PLAYLIST_COVERS: usize = 4;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistSummary {
@@ -1059,6 +1171,9 @@ pub struct PlaylistSummary {
     pub description: String,
     pub track_count: usize,
     pub artwork: Option<String>,
+    /// Covers of the first few different songs, for a playlist with no picture
+    /// of its own: four of them are drawn as a quilt.
+    pub artwork_ids: Vec<String>,
     pub has_mixer: bool,
     /// Whether a timeline has ever been built for this playlist.
     pub has_master_mix: bool,
@@ -1073,11 +1188,17 @@ pub fn list_playlists(state: State<'_, AppState>) -> Cmd<Vec<PlaylistSummary>> {
     Ok(playlist::list(&state.paths.playlists)
         .into_iter()
         .map(|(path, p)| PlaylistSummary {
-            id: p.id,
-            name: p.name,
-            description: p.description,
+            id: p.id.clone(),
+            name: p.name.clone(),
+            description: p.description.clone(),
             track_count: p.tracks.len(),
-            artwork: p.artwork,
+            // Only worth looking up when there is no picture to fall back from.
+            artwork_ids: if p.artwork.is_some() {
+                Vec::new()
+            } else {
+                p.covers(&state.db, PLAYLIST_COVERS)
+            },
+            artwork: p.artwork.clone(),
             has_mixer: p.mixer.is_some(),
             has_master_mix: p.master_mix.is_some(),
             master_mix_enabled: p.master_mix.as_ref().is_some_and(|m| m.enabled),
@@ -1119,6 +1240,8 @@ pub fn create_playlist(
         name: p.name,
         description: p.description,
         track_count: 0,
+        // Nothing in it yet, so there is nothing to quilt.
+        artwork_ids: Vec::new(),
         artwork: p.artwork,
         has_mixer: false,
         has_master_mix: false,
@@ -1387,13 +1510,18 @@ pub fn play_playlist(
     id: String,
     start_index: Option<usize>,
 ) -> Cmd<()> {
+    if master_mix_owns_playback(&state) {
+        return Ok(());
+    }
     state.cancel_preview();
-    let Some((path, p)) = find_playlist(&state, &id) else {
+    let Some((_, p)) = find_playlist(&state, &id) else {
         return Err("playlist not found".into());
     };
-    if p.master_mix.as_ref().is_some_and(|m| m.enabled) {
-        match play_enabled_mix(&app, &state, &p, &path, start_index) {
+    if let Some(mix) = queue_mix_for(&state, &p) {
+        match play_enabled_mix(&app, &state, &p, mix, start_index) {
             Ok(true) => return Ok(()),
+            // Nothing in the arrangement resolves on this machine, so fall
+            // through and play the playlist as the plain list it also is.
             Ok(false) => {}
             Err(e) => return Err(e),
         }
@@ -1444,6 +1572,81 @@ pub fn play_playlist(
         player.set_queue_items(items, adjusted_start);
     }
     start_current(&app, &state)
+}
+
+/// Add a whole playlist to the queue: its songs, or — when it plays as a
+/// master mix — the mix as one block.
+///
+/// A mix cannot be spread across the queue as songs, because its songs overlap
+/// and are shaped by an arrangement. It goes in whole or not at all, which is
+/// also what makes it impossible to drop something into the middle of one.
+#[tauri::command]
+pub fn queue_playlist(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    playlist_id: String,
+    next: bool,
+) -> Cmd<()> {
+    if master_mix_owns_playback(&state) {
+        return Ok(());
+    }
+    state.cancel_preview();
+    let Some((_, p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+
+    let entries: Vec<crate::player::QueueEntry> = match queue_mix_for(&state, &p) {
+        Some(mix) => vec![crate::player::QueueEntry::Mix(mix)],
+        None => {
+            let resolved = p.clone().resolve(&state.db).map_err(err)?;
+            resolved
+                .items
+                .iter()
+                .filter_map(|item| {
+                    item.track.as_ref().map(|track| {
+                        crate::player::QueueEntry::Track(QueueItem {
+                            track: track.clone(),
+                            // The playlist's own layer is folded in, as it
+                            // is for a single queued entry: this play of these
+                            // songs, and nothing else. Crossfade is dropped
+                            // because it belongs to the playlist's own
+                            // transitions, not to a queue.
+                            mixer: {
+                                let empty = MixerSettings::default();
+                                let mut mixer = p
+                                    .mixer
+                                    .as_ref()
+                                    .unwrap_or(&empty)
+                                    .overlay(item.entry.mixer.as_ref().unwrap_or(&empty));
+                                mixer.crossfade = None;
+                                (mixer != MixerSettings::default()).then_some(mixer)
+                            },
+                        })
+                    })
+                })
+                .collect()
+        }
+    };
+    if entries.is_empty() {
+        return Err("none of this playlist's tracks are in your library".into());
+    }
+
+    let was_empty = {
+        let mut player = state.player.lock();
+        let empty = player.is_empty();
+        if next {
+            player.play_next_entries(entries);
+        } else {
+            player.add_to_queue_entries(entries);
+        }
+        empty
+    };
+    if was_empty {
+        return start_current(&app, &state);
+    }
+    state.engine.cancel_next();
+    let _ = app.emit("queue-changed", state.player.lock().view());
+    Ok(())
 }
 
 /// Add one playlist entry to the queue without playing the playlist.
@@ -1653,6 +1856,9 @@ pub fn play_mix(
     kind: String,
     start_index: Option<usize>,
 ) -> Cmd<()> {
+    if master_mix_owns_playback(&state) {
+        return Ok(());
+    }
     let tracks = state.mix(&kind).map_err(err)?;
     if tracks.is_empty() {
         return Ok(());
@@ -1770,6 +1976,11 @@ pub fn save_mix_to_playlist(
     let _ = app.emit("playlists-changed", ());
 
     Ok(PlaylistSummary {
+        artwork_ids: if playlist.artwork.is_some() {
+            Vec::new()
+        } else {
+            playlist.covers(&state.db, PLAYLIST_COVERS)
+        },
         id: playlist.id,
         name: playlist.name,
         description: playlist.description,
@@ -2224,7 +2435,7 @@ pub fn end_master_mix_session(
                 .player
                 .lock()
                 .jump_to(order_index)
-                .map(|track| track.id.clone());
+                .and_then(|entry| entry.track().map(|track| track.id.clone()));
             if restored_id.as_deref() != Some(track_id.as_str()) {
                 state.engine.clear();
                 return Err("the captured queue track is no longer available".into());
@@ -2474,13 +2685,57 @@ pub async fn asset_waveform(
         .map_err(err)
 }
 
+/// What this machine's ffmpeg can do, so the bounce dialog can offer MP3 only
+/// when it will actually work.
+///
+/// `refresh` looks again instead of answering from the cached probe, which is
+/// what the "check again" button after installing ffmpeg needs.
 #[tauri::command]
-pub async fn bounce_master_mix(
+pub fn ffmpeg_status(refresh: Option<bool>) -> Cmd<crate::audio::ffmpeg::FfmpegStatus> {
+    Ok(if refresh.unwrap_or(false) {
+        crate::audio::ffmpeg::refresh()
+    } else {
+        crate::audio::ffmpeg::status()
+    })
+}
+
+/// How far along a bounce is, sent as it runs.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BounceProgress {
+    pub id: String,
+    /// 0 to 1. Reaches 1 only when the file is written.
+    pub fraction: f64,
+}
+
+/// A bounce that has stopped, one way or the other.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BounceFinished {
+    pub id: String,
+    pub path: String,
+    /// Null when the file was written.
+    pub error: Option<String>,
+}
+
+/// Start rendering a mix to a file, and return before it has finished.
+///
+/// Everything that needs the playlist, the library and the engine is done here
+/// on the command thread; the render itself is handed to a blocking task and
+/// reports through `bounce-progress` and `bounce-finished` events. A bounce of
+/// a long mix takes minutes, and there is no reason the rest of the app should
+/// be sitting behind a modal for them.
+///
+/// The returned id is what the two events carry, so several bounces can be in
+/// flight without the interface having to guess which is which.
+#[tauri::command]
+pub fn bounce_master_mix(
+    app: AppHandle,
     state: State<'_, AppState>,
     playlist_id: String,
     destination: String,
     options: crate::audio::bounce::BounceOptions,
-) -> Cmd<()> {
+) -> Cmd<String> {
     let Some((path, p)) = find_playlist(&state, &playlist_id) else {
         return Err("playlist not found".into());
     };
@@ -2490,48 +2745,380 @@ pub async fn bounce_master_mix(
     if plan.is_empty() {
         return Err("there is nothing in this mix to bounce".into());
     }
-    let global = state.player.lock().global_mixer.clone();
-    let resolved = MixerSettings::resolve(&[&global]);
+    // The engine runs a mix through the master limiter's defaults, not the
+    // global mixer's — see `build_plan` — so the bounce uses them too and the
+    // file matches what was auditioned.
+    let normalisation = crate::audio::params::Normalisation::default();
+    // Only a picture the user chose for this playlist: with no custom image a
+    // playlist borrows the first song's cover, which is that album's art and
+    // not this mix's.
+    let cover = p
+        .artwork
+        .as_ref()
+        .map(|id| state.paths.artwork.join(id))
+        .filter(|path| path.is_file());
     let dest = PathBuf::from(destination);
+    // Nothing decodes a bed part-way through an offline render, so everything
+    // the plan asks for is loaded up front. A bed with no audio behind it is
+    // skipped rather than failing the bounce: the mix is still what the user
+    // arranged, minus one atmosphere they have not supplied a file for.
+    let bank = std::sync::Arc::new(bounce_bank(&state, &plan));
+    // A counter rather than a clock: two bounces started in the same second
+    // would otherwise share an id, and their progress would fight over one row.
+    static NEXT_BOUNCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = format!(
+        "bounce_{}",
+        NEXT_BOUNCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let reported = id.clone();
+    let finished = id.clone();
+    let path_out = dest.display().to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        crate::audio::bounce::render(plan, &dest, &options, &resolved.normalisation)
-    })
-    .await
-    .map_err(err)?
-    .map_err(err)
+        let progress = |fraction: f64| {
+            let _ = app.emit(
+                "bounce-progress",
+                BounceProgress {
+                    id: reported.clone(),
+                    fraction,
+                },
+            );
+        };
+        let result = crate::audio::bounce::render(
+            plan,
+            &dest,
+            &options,
+            &normalisation,
+            bank,
+            cover.as_deref(),
+            &progress,
+        );
+        let _ = app.emit(
+            "bounce-finished",
+            BounceFinished {
+                id: finished,
+                path: path_out,
+                error: result.err().map(|e| e.to_string()),
+            },
+        );
+    });
+    Ok(id)
 }
 
+/// Decode every ambience bed any block in `plan` asks for.
+///
+/// Beds the engine has already decoded are reused; the rest are read now. This
+/// runs on the command thread rather than the audio one, so a slow decode
+/// delays the bounce starting and nothing else.
+fn bounce_bank(state: &AppState, plan: &crate::audio::timeline::Plan) -> ambience::Bank {
+    let mut bank = (*state.engine.bank()).clone();
+    let mut wanted: Vec<String> = Vec::new();
+    for block in &plan.blocks {
+        for filter in block.filters() {
+            if filter.enabled && !bank.contains_key(&filter.id) && !wanted.contains(&filter.id) {
+                wanted.push(filter.id.clone());
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return bank;
+    }
+
+    let rate = state.engine.device_sample_rate();
+    let catalogue =
+        ambience::catalogue(state.paths.bundled_ambience.as_deref(), &state.paths.filters);
+    for id in wanted {
+        let Some(path) = catalogue
+            .iter()
+            .find(|item| item.id == id && item.available)
+            .and_then(|item| item.path.clone())
+        else {
+            continue;
+        };
+        match ambience::load_bed(Path::new(&path), rate) {
+            Ok(samples) => {
+                bank.insert(id, samples);
+            }
+            Err(error) => eprintln!("bounce: could not load ambience {id}: {error}"),
+        }
+    }
+    bank
+}
+
+/// Load the mix sitting at the queue's cursor.
+///
+/// The queue is left exactly as it is: unlike ordinary playback, which asks
+/// the library for a file, this hands the engine an arrangement built from the
+/// playlist on disk. Anything queued after the mix is still there and still
+/// plays when the mix runs out.
+fn load_queued_mix(
+    app: &AppHandle,
+    state: &AppState,
+    mix: &crate::player::QueueMix,
+    position_secs: f64,
+    playing: bool,
+) -> Cmd<bool> {
+    let Some((path, p)) = find_playlist(state, &mix.playlist_id) else {
+        return Err(format!("{} is no longer in your playlists", mix.name));
+    };
+    state.end_play();
+    let loaded = load_enabled_mix(state, &p, &path, position_secs.max(0.0), playing, false)?;
+    if !loaded {
+        return Err(format!("there is nothing left to play in {}", mix.name));
+    }
+    // No song is playing, and the bar has to be told so or it goes on showing
+    // whatever was current before the mix started.
+    let _ = app.emit("track-changed", Option::<Track>::None);
+    let _ = app.emit("queue-changed", state.player.lock().view());
+    Ok(true)
+}
+
+/// Describe a playlist as the queue block a master mix plays from.
+///
+/// `None` when the playlist has no mix switched on, which is the caller's cue
+/// to queue its songs one by one as it always has.
+fn queue_mix_for(state: &AppState, p: &Playlist) -> Option<crate::player::QueueMix> {
+    let mut mix = p.master_mix.clone().filter(|m| m.enabled)?;
+    mix.normalise(p.tracks.len());
+    Some(crate::player::QueueMix {
+        playlist_id: p.id.clone(),
+        name: p.name.clone(),
+        artwork_ids: if p.artwork.is_some() {
+            Vec::new()
+        } else {
+            p.covers(&state.db, PLAYLIST_COVERS)
+        },
+        artwork: p.artwork.clone(),
+        duration_secs: mix.duration_secs(),
+        chapters: chapters_of(p, &mix),
+    })
+}
+
+/// A playlist being played as a mix, described as the one long thing it is.
+///
+/// The queue is empty while a mix plays — there is no "current track" to
+/// report — so the bar is given the playlist instead, plus where inside the
+/// arrangement each song begins.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterMixNowPlaying {
+    pub playlist_id: String,
+    pub name: String,
+    pub description: String,
+    pub artwork: Option<String>,
+    /// Covers to fall back to when the playlist has no picture of its own.
+    pub artwork_ids: Vec<String>,
+    pub track_count: usize,
+    pub duration_secs: f64,
+    /// What the engine is actually playing: this many regions across this many
+    /// tracks, summed into one stream.
+    pub lane_count: usize,
+    pub block_count: usize,
+    pub chapters: Vec<crate::player::MixChapter>,
+}
+
+/// What the engine is playing, when what it is playing is a saved mix.
+///
+/// `None` while an ordinary track plays, and also while the Master Mixer modal
+/// is open: that audition belongs to the editor, which draws its own playhead.
+#[tauri::command]
+pub fn master_mix_now_playing(state: State<'_, AppState>) -> Cmd<Option<MasterMixNowPlaying>> {
+    let Some(playlist_id) = enabled_mix_playing(&state) else {
+        return Ok(None);
+    };
+    let Some((_, p)) = find_playlist(&state, &playlist_id) else {
+        return Ok(None);
+    };
+    let Some(mut mix) = p.master_mix.clone() else {
+        return Ok(None);
+    };
+    mix.normalise(p.tracks.len());
+    Ok(Some(MasterMixNowPlaying {
+        playlist_id: p.id.clone(),
+        name: p.name.clone(),
+        description: p.description.clone(),
+        artwork_ids: if p.artwork.is_some() {
+            Vec::new()
+        } else {
+            p.covers(&state.db, PLAYLIST_COVERS)
+        },
+        artwork: p.artwork.clone(),
+        track_count: p.tracks.len(),
+        duration_secs: mix.duration_secs(),
+        lane_count: mix.lanes.len(),
+        block_count: mix.lanes.iter().map(|lane| lane.blocks.len()).sum(),
+        chapters: chapters_of(&p, &mix),
+    }))
+}
+
+/// Name every chapter from the playlist's own entries rather than the library.
+///
+/// A block whose song is missing locally is silent, but the playlist still
+/// says what it was meant to be, and a dot with a name on it is more use than
+/// a gap.
+fn chapters_of(p: &Playlist, mix: &crate::master_mix::MasterMix) -> Vec<crate::player::MixChapter> {
+    use crate::master_mix::BlockSource;
+    mix.chapter_marks()
+        .into_iter()
+        .map(|mark| {
+            let (title, artist) = match &mark.source {
+                BlockSource::Entry { index } => p
+                    .tracks
+                    .get(*index)
+                    .map(|entry| (entry.title.clone(), entry.artist.clone()))
+                    .unwrap_or_default(),
+                // An imported file has no metadata here beyond what it is called.
+                BlockSource::Asset { file } => (file.clone(), String::new()),
+            };
+            crate::player::MixChapter {
+                start_secs: mark.start_secs,
+                title,
+                artist,
+            }
+        })
+        .collect()
+}
+
+/// Leave a finished mix for whatever is queued behind it.
+///
+/// Called both when the arrangement runs out on its own and when next is
+/// pressed at its last song, so a mix ends the same way either way.
+pub(crate) fn advance_past_mix(app: &AppHandle, state: &AppState) -> Cmd<()> {
+    let has_next = state.player.lock().advance(false).is_some();
+    if !has_next {
+        state.engine.pause();
+        let _ = app.emit("playing-changed", false);
+        return Ok(());
+    }
+    start_current(app, state)
+}
+
+/// Step back out of a mix to whatever was queued in front of it.
+///
+/// Nothing before it means staying put at the top of the arrangement, which is
+/// what pressing back at the start of a queue does.
+fn retreat_before_mix(app: &AppHandle, state: &AppState) -> Cmd<()> {
+    let at_start = state.player.lock().current_index() == Some(0);
+    if at_start {
+        state.engine.seek(0.0);
+        return Ok(());
+    }
+    if state.player.lock().previous().is_none() {
+        state.engine.seek(0.0);
+        return Ok(());
+    }
+    start_current(app, state)
+}
+
+/// Skip between the songs of a playing mix.
+///
+/// The queue's next and previous have nothing to move through while a mix is
+/// loaded, so they move through its chapters instead. Going back behaves the
+/// way it does everywhere else: part-way into a song it returns to the top of
+/// that song, and only then to the one before.
+fn seek_chapter(
+    app: &AppHandle,
+    state: &AppState,
+    playlist_id: &str,
+    direction: i32,
+) -> Cmd<()> {
+    const RESTART_AFTER_SECS: f64 = 3.0;
+    /// Enough to be past the mark we are sitting on, short enough not to skip
+    /// a chapter that genuinely starts here.
+    const EPSILON: f64 = 0.05;
+
+    let Some((_, p)) = find_playlist(state, playlist_id) else {
+        return Ok(());
+    };
+    let Some(mut mix) = p.master_mix.clone() else {
+        return Ok(());
+    };
+    mix.normalise(p.tracks.len());
+    let marks = mix.chapter_marks();
+    let position = state.engine.snapshot().position_secs;
+
+    if direction > 0 {
+        match marks.iter().find(|mark| mark.start_secs > position + EPSILON) {
+            Some(next) => state.engine.seek(next.start_secs),
+            // Past the last song, next leaves the mix the way it would leave
+            // any queue entry: on to whatever was queued behind it.
+            None => return advance_past_mix(app, state),
+        }
+        return Ok(());
+    }
+
+    let current = marks
+        .iter()
+        .rev()
+        .find(|mark| mark.start_secs <= position + EPSILON);
+    let target = match current {
+        Some(mark) if position - mark.start_secs > RESTART_AFTER_SECS => Some(mark.start_secs),
+        Some(mark) => marks
+            .iter()
+            .rev()
+            .find(|other| other.start_secs < mark.start_secs - EPSILON)
+            .map(|other| other.start_secs),
+        None => Some(0.0),
+    };
+    match target {
+        Some(secs) => state.engine.seek(secs),
+        // Before the mix's first song there is only whatever came before the
+        // mix in the queue, which is where back goes everywhere else too.
+        None => return retreat_before_mix(app, state),
+    }
+    Ok(())
+}
+
+/// Play a playlist as its mix: one block in the queue, and nothing else.
+///
+/// Starting a playlist replaces the queue whether it is mixed or not, so the
+/// mix goes in as the only entry. What makes it a queue entry rather than a
+/// mode is what comes next: anything queued afterwards lands behind it and
+/// plays when the arrangement ends.
 fn play_enabled_mix(
     app: &AppHandle,
     state: &AppState,
     p: &Playlist,
-    path: &Path,
+    mix: crate::player::QueueMix,
     start_index: Option<usize>,
 ) -> Cmd<bool> {
-    use crate::master_mix::BlockSource;
-    let Some(existing) = p.master_mix.clone() else {
-        return Ok(false);
-    };
-    let mut mix = existing;
-    mix.normalise(p.tracks.len());
-    let mut position = 0.0;
-    if let Some(index) = start_index {
-        position = mix
-            .lanes
-            .iter()
-            .flat_map(|lane| lane.blocks.iter())
-            .filter(|block| matches!(&block.source, BlockSource::Entry { index: i } if *i == index))
-            .map(|block| block.start_secs)
-            .fold(f64::INFINITY, f64::min);
-        if !position.is_finite() {
-            position = 0.0;
-        }
+    let position = start_index
+        .and_then(|index| entry_start_secs(p, index))
+        .unwrap_or(0.0);
+    {
+        let mut player = state.player.lock();
+        player.clear();
+        player.context = Some(Context {
+            kind: "playlist".into(),
+            id: p.id.clone(),
+            name: p.name.clone(),
+        });
+        player.context_mixer = p.mixer.clone();
+        player.set_queue_entries(vec![crate::player::QueueEntry::Mix(mix)], 0);
     }
-    let loaded = load_enabled_mix(state, p, path, position, true, true)?;
+    let loaded = load_current(app, state, position, true)?;
     if loaded {
         let _ = app.emit("playing-changed", true);
+    } else {
+        // Nothing playable in the arrangement: leave the queue as it was
+        // rather than stranding the player on a block it cannot load.
+        state.player.lock().clear();
     }
     Ok(loaded)
+}
+
+/// Where a playlist entry first appears on its own timeline, if it does.
+fn entry_start_secs(p: &Playlist, index: usize) -> Option<f64> {
+    use crate::master_mix::BlockSource;
+    let mut mix = p.master_mix.clone()?;
+    mix.normalise(p.tracks.len());
+    let start = mix
+        .lanes
+        .iter()
+        .flat_map(|lane| lane.blocks.iter())
+        .filter(|block| matches!(&block.source, BlockSource::Entry { index: i } if *i == index))
+        .map(|block| block.start_secs)
+        .fold(f64::INFINITY, f64::min);
+    start.is_finite().then_some(start)
 }
 
 fn load_enabled_mix(
@@ -2581,6 +3168,14 @@ fn load_enabled_mix(
 /// machine and the mixer cascade that applies to it. Inaudible lanes remain in
 /// the plan at zero gain so mute/solo does not shorten or empty the timeline.
 ///
+/// The cascade deliberately starts at the *playlist*, not at the global mixer.
+/// A master mix is an arrangement someone built and can bounce to a file, and
+/// it has to sound the same whatever the DJ mixer happens to be set to at the
+/// time — otherwise a reverb left on downstairs quietly rewrites the mix, and
+/// the bounce disagrees with the audition. Global settings are ignored for a
+/// mixed playlist everywhere: here, in the bounce, and in the editor's own
+/// block mixer.
+///
 /// A block whose song is not here is dropped rather than failing the whole
 /// mix — the roadmap's open question, answered the way that keeps a shared
 /// playlist usable: you hear what you have.
@@ -2593,7 +3188,6 @@ fn build_plan(
     use crate::master_mix::BlockSource;
 
     let resolved = p.clone().resolve(&state.db)?;
-    let global = state.player.lock().global_mixer.clone();
     let playlist_layer = p.mixer.clone().unwrap_or_default();
     let assets = Playlist::assets_dir(playlist_path);
 
@@ -2635,7 +3229,7 @@ fn build_plan(
 
             let block_layer = block.mixer.clone().unwrap_or_default();
             let settings =
-                MixerSettings::resolve(&[&global, &playlist_layer, &entry_layer, &block_layer]);
+                MixerSettings::resolve(&[&playlist_layer, &entry_layer, &block_layer]);
             blocks.push(crate::audio::timeline::PlanBlock {
                 path,
                 block: block.clone(),

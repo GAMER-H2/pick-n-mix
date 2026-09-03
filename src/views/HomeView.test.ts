@@ -81,6 +81,7 @@ const shelves: HomeShelves = {
     description: "",
     trackCount: 1,
     artwork: null,
+    artworkIds: [],
     hasMixer: false,
     hasMasterMix: false,
     masterMixEnabled: false,

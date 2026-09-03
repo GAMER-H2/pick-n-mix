@@ -77,11 +77,20 @@ const items = computed<Item[]>(() => {
       ? { playlistId: m.playlistId, index: m.entryIndex }
       : null;
 
+  // A mixed playlist goes into the queue whole; see `PlaylistMenuOptions`.
+  const asMix = m.playlistOptions?.masterMixEnabled ? m.playlistOptions : null;
+
   const list: Item[] = [
     {
       label: "Play Next",
       icon: "playNext",
       action: async () => {
+        if (asMix) {
+          await asMix.onPlayNext();
+          await player.refreshQueue();
+          ui.notify("Playing the mix next");
+          return;
+        }
         if (fromPlaylistEntry) {
           await api.queuePlaylistEntry(
             fromPlaylistEntry.playlistId,
@@ -101,6 +110,12 @@ const items = computed<Item[]>(() => {
       label: "Add to Queue",
       icon: "addToQueue",
       action: async () => {
+        if (asMix) {
+          await asMix.onAddToQueue();
+          await player.refreshQueue();
+          ui.notify("Added the mix to the queue");
+          return;
+        }
         if (fromPlaylistEntry) {
           await api.queuePlaylistEntry(
             fromPlaylistEntry.playlistId,

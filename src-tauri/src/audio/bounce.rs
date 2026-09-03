@@ -8,10 +8,12 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::audio::ambience::Bank;
 use crate::audio::dsp::{Limiter, CHANNELS};
 use crate::audio::params::Normalisation;
 use crate::audio::timeline::{Plan, TimelineSource};
@@ -49,11 +51,23 @@ impl Default for BounceOptions {
 }
 
 /// Render `plan` into `dest`, applying the master limiter with `normalisation`.
+///
+/// `bank` supplies the decoded ambience beds any block asks for. A bounce is
+/// offline, so there is nobody to decode one late: a bed missing from the bank
+/// is simply absent from the file, which is why the caller loads them all
+/// before getting here.
+///
+/// `cover` is an image file to embed as the finished track's artwork — the
+/// playlist's own picture, so a bounced mix arrives in another player looking
+/// like the playlist it came from.
 pub fn render(
     plan: Plan,
     dest: &Path,
     options: &BounceOptions,
     normalisation: &Normalisation,
+    bank: Arc<Bank>,
+    cover: Option<&Path>,
+    progress: &dyn Fn(f64),
 ) -> Result<()> {
     if plan.is_empty() {
         anyhow::bail!("there is nothing in this mix to bounce");
@@ -62,15 +76,69 @@ pub fn render(
         44_100 | 48_000 | 96_000 => options.sample_rate,
         other => anyhow::bail!("unsupported sample rate {other}"),
     };
-    let mut mix = OfflineMix::new(plan, rate, normalisation);
+    let mut mix = OfflineMix::new(plan, rate, normalisation, bank);
+    mix.progress = Some(progress);
     match options.format {
         BounceFormat::Wav => write_wav(&mut mix, dest, options.wav_bit_depth),
-        BounceFormat::Flac => write_flac(&mut mix, dest, options.flac_compression),
+        // FLAC carries its picture in a metadata block this module writes
+        // itself; see `write_flac`.
+        BounceFormat::Flac => write_flac(&mut mix, dest, options.flac_compression, cover),
         BounceFormat::Mp3 => write_mp3(&mut mix, dest, options.mp3_bitrate),
+    }?;
+    if let Some(cover) = cover.filter(|_| options.format != BounceFormat::Flac) {
+        // The audio is already on disk and correct. A picture that will not go
+        // in — an unreadable image, or a container this build of lofty has no
+        // tag for — is not worth throwing the render away for.
+        if let Err(error) = embed_cover(dest, cover) {
+            eprintln!("bounce: could not embed the playlist artwork: {error:#}");
+        }
     }
+    progress(1.0);
+    Ok(())
 }
 
-struct OfflineMix {
+/// Write `cover` into a finished WAV or MP3 as its front-cover picture.
+///
+/// Done afterwards rather than during encoding because both containers are
+/// tagged differently and lofty knows them both. The tag is read back first so
+/// an encoder that wrote one of its own — ffmpeg does — is added to rather
+/// than replaced.
+///
+/// FLAC is deliberately not sent through here. lofty appends its `PICTURE`
+/// block without clearing the last-metadata-block flag on the `STREAMINFO`
+/// before it, which leaves a file every decoder reads the picture out of as
+/// though it were audio: a burst of noise and then a stream it has to
+/// resynchronise into. `write_flac` writes that block itself instead, in the
+/// right place and with the right flags.
+fn embed_cover(dest: &Path, cover: &Path) -> Result<()> {
+    use lofty::config::WriteOptions;
+    use lofty::file::TaggedFileExt;
+    use lofty::picture::{Picture, PictureType};
+    use lofty::probe::Probe;
+    use lofty::tag::{Tag, TagExt};
+
+    let data = std::fs::read(cover).with_context(|| format!("reading {}", cover.display()))?;
+    let mut picture = Picture::from_reader(&mut std::io::Cursor::new(data))
+        .with_context(|| format!("reading the image in {}", cover.display()))?;
+    picture.set_pic_type(PictureType::CoverFront);
+
+    let tagged = Probe::open(dest)
+        .with_context(|| format!("opening {}", dest.display()))?
+        .read()
+        .with_context(|| format!("reading tags from {}", dest.display()))?;
+    let tag_type = tagged.primary_tag_type();
+    let mut tag = tagged
+        .primary_tag()
+        .cloned()
+        .unwrap_or_else(|| Tag::new(tag_type));
+    tag.remove_picture_type(PictureType::CoverFront);
+    tag.push_picture(picture);
+    tag.save_to_path(dest, WriteOptions::default())
+        .with_context(|| format!("writing artwork into {}", dest.display()))?;
+    Ok(())
+}
+
+struct OfflineMix<'a> {
     source: TimelineSource,
     limiter: Limiter,
     interleaved: Vec<f32>,
@@ -78,15 +146,24 @@ struct OfflineMix {
     rate: u32,
     flushing: bool,
     flush_left: usize,
+    /// Frames handed out so far, against the length the arrangement claims —
+    /// which is all a progress bar needs, and costs one add per block.
+    produced: usize,
+    expected: f64,
+    reported: f64,
+    progress: Option<&'a dyn Fn(f64)>,
 }
 
-impl OfflineMix {
-    fn new(plan: Plan, rate: u32, normalisation: &Normalisation) -> Self {
+impl<'a> OfflineMix<'a> {
+    fn new(plan: Plan, rate: u32, normalisation: &Normalisation, bank: Arc<Bank>) -> Self {
         let mut limiter = Limiter::new();
         limiter.prepare(rate as f32);
         limiter.update(normalisation, rate as f32);
+        let mut source = TimelineSource::new(plan, rate);
+        source.set_bank(bank);
+        let expected = (source.info().duration_secs * rate as f64).max(1.0);
         OfflineMix {
-            source: TimelineSource::new(plan, rate),
+            source,
             limiter,
             interleaved: vec![0.0; BLOCK * CHANNELS],
             planar: vec![vec![0.0; BLOCK]; CHANNELS],
@@ -95,7 +172,25 @@ impl OfflineMix {
             // A few limiter lookahead windows of silence so the delay line
             // drains into the file rather than being cut off with it.
             flush_left: ((5.0 / 1000.0) * rate as f32).ceil() as usize + BLOCK,
+            produced: 0,
+            expected,
+            reported: 0.0,
+            progress: None,
         }
+    }
+
+    /// Tell whoever is watching how far in we are.
+    ///
+    /// Throttled to whole half-percents: a bounce reads a thousand blocks a
+    /// second, and an event per block would cost more than the encoding.
+    fn report(&mut self) {
+        let Some(progress) = self.progress else { return };
+        let fraction = (self.produced as f64 / self.expected).clamp(0.0, 0.999);
+        if fraction < self.reported + 0.005 {
+            return;
+        }
+        self.reported = fraction;
+        progress(fraction);
     }
 
     /// Fill `planar` with the next `frames` of limited audio. 0 means the mix
@@ -134,6 +229,8 @@ impl OfflineMix {
             }
         }
         self.limiter.process(&mut self.planar, got);
+        self.produced += got;
+        self.report();
         Ok(got)
     }
 
@@ -149,7 +246,7 @@ impl OfflineMix {
     }
 }
 
-fn write_wav(mix: &mut OfflineMix, dest: &Path, bit_depth: u16) -> Result<()> {
+fn write_wav(mix: &mut OfflineMix<'_>, dest: &Path, bit_depth: u16) -> Result<()> {
     let bits = match bit_depth {
         16 | 24 | 32 => bit_depth,
         other => anyhow::bail!("WAV bit depth must be 16, 24 or 32, not {other}"),
@@ -214,111 +311,228 @@ fn write_wav(mix: &mut OfflineMix, dest: &Path, bit_depth: u16) -> Result<()> {
     Ok(())
 }
 
-fn write_flac(mix: &mut OfflineMix, dest: &Path, compression: u8) -> Result<()> {
+/// Encode the mix as FLAC, one block at a time, straight to the file.
+///
+/// Written by hand around `flacenc`'s frame encoder rather than through its
+/// whole-stream entry point, for two reasons:
+///
+/// * **Memory.** That entry point takes every sample at once and gives back
+///   every frame at once. A 48-minute mix is a gigabyte of samples, another
+///   gigabyte of encoded frames and a third of output buffer before a byte
+///   reaches the disk. Here a block is read, encoded, written and forgotten,
+///   so a mix of any length costs a few kilobytes.
+/// * **The picture.** A FLAC cover is a metadata block, which has to be
+///   written before the audio and with the flags around it kept straight.
+///
+/// `STREAMINFO` is written twice: once as a placeholder, and once at the end
+/// when the frame sizes and the true length are known. Its MD5 field is left
+/// zero, which the format defines as "not computed", rather than filled with
+/// the digest of the zero-padded final block, which would be wrong.
+fn write_flac(
+    mix: &mut OfflineMix<'_>,
+    dest: &Path,
+    compression: u8,
+    cover: Option<&Path>,
+) -> Result<()> {
     use flacenc::bitsink::ByteSink;
-    use flacenc::component::BitRepr;
+    use flacenc::component::{BitRepr, StreamInfo};
     use flacenc::config;
-    use flacenc::encode_with_fixed_block_size;
+    use flacenc::encode_fixed_size_frame;
     use flacenc::error::Verify;
-    use flacenc::source::MemSource;
+    use flacenc::source::{Fill, FrameBuf};
 
-    let mut samples: Vec<i32> = Vec::new();
-    loop {
-        let frames = mix.next_planar(BLOCK)?;
-        if frames == 0 {
-            break;
-        }
-        for f in 0..frames {
-            for ch in 0..CHANNELS {
-                let sample = mix.planar[ch][f].clamp(-1.0, 1.0);
-                samples.push((sample * 8_388_607.0).round() as i32);
-            }
-        }
-    }
-    if samples.is_empty() {
-        anyhow::bail!("the mix produced no audio");
-    }
-
-    let mut encoder = config::Encoder::default();
-    encoder.block_size = if compression >= 8 {
+    let block_size = if compression >= 8 {
         4096
     } else if compression == 0 {
         1024
     } else {
         2048
     };
-    let block_size = encoder.block_size;
-    let verified = encoder
+    let mut encoder = config::Encoder::default();
+    encoder.block_size = block_size;
+    let config = encoder
         .into_verified()
         .map_err(|(_, e)| anyhow!("flac config: {e}"))?;
-    let source = MemSource::from_samples(&samples, CHANNELS, 24, mix.rate as usize);
-    let stream = encode_with_fixed_block_size(&verified, source, block_size)
-        .map_err(|e| anyhow!("flac encode: {e:?}"))?;
-    let mut sink = ByteSink::new();
-    stream
-        .write(&mut sink)
-        .map_err(|e| anyhow!("flac write: {e:?}"))?;
-    std::fs::write(dest, sink.as_slice()).with_context(|| format!("writing {}", dest.display()))
-}
 
-fn write_mp3(mix: &mut OfflineMix, dest: &Path, bitrate: u16) -> Result<()> {
-    use mp3lame_encoder::{Bitrate, Builder, DualPcm, FlushNoGap, Quality};
-
-    let mut builder = Builder::new().ok_or_else(|| anyhow!("could not start the MP3 encoder"))?;
-    builder
-        .set_num_channels(CHANNELS as u8)
-        .map_err(|e| anyhow!("mp3 channels: {e:?}"))?;
-    builder
-        .set_sample_rate(mix.rate)
-        .map_err(|e| anyhow!("mp3 sample rate: {e:?}"))?;
-    let brate = match bitrate {
-        128 => Bitrate::Kbps128,
-        192 => Bitrate::Kbps192,
-        256 => Bitrate::Kbps256,
-        _ => Bitrate::Kbps320,
+    let mut info = StreamInfo::new(mix.rate as usize, CHANNELS, FLAC_BITS)
+        .map_err(|e| anyhow!("flac stream info: {e:?}"))?;
+    let picture = match cover {
+        Some(path) => picture_block(path)
+            .map_err(|error| {
+                eprintln!("bounce: could not embed the playlist artwork: {error:#}");
+                error
+            })
+            .ok(),
+        None => None,
     };
-    builder
-        .set_brate(brate)
-        .map_err(|e| anyhow!("mp3 bitrate: {e:?}"))?;
-    builder
-        .set_quality(Quality::Best)
-        .map_err(|e| anyhow!("mp3 quality: {e:?}"))?;
-    let mut encoder = builder.build().map_err(|e| anyhow!("mp3 encoder: {e:?}"))?;
 
     let mut file = File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
-    let mut left = Vec::new();
-    let mut right = Vec::new();
-    let mut out = Vec::new();
+    write_flac_header(&mut file, &info, picture.as_deref())?;
+
+    let mut framebuf =
+        FrameBuf::with_size(CHANNELS, block_size).map_err(|e| anyhow!("flac buffer: {e:?}"))?;
+    let mut interleaved: Vec<i32> = vec![0; block_size * CHANNELS];
+    let mut sink = ByteSink::new();
+    let mut frame_number = 0usize;
+    let mut total_samples = 0usize;
 
     loop {
-        let frames = mix.next_planar(BLOCK)?;
-        if frames == 0 {
+        // A block is filled from as many reads as it takes: the mix hands out
+        // audio in its own block size, which is not this one.
+        let mut filled = 0;
+        while filled < block_size {
+            let got = mix.next_planar(block_size - filled)?;
+            if got == 0 {
+                break;
+            }
+            for f in 0..got {
+                for ch in 0..CHANNELS {
+                    let sample = mix.planar[ch][f].clamp(-1.0, 1.0);
+                    interleaved[(filled + f) * CHANNELS + ch] =
+                        (sample * FLAC_FULL_SCALE).round() as i32;
+                }
+            }
+            filled += got;
+        }
+        if filled == 0 {
             break;
         }
-        left.clear();
-        right.clear();
-        for f in 0..frames {
-            left.push(mix.planar[0][f].clamp(-1.0, 1.0));
-            right.push(mix.planar[1][f].clamp(-1.0, 1.0));
+        // The last block is padded with silence and trimmed by the total
+        // sample count in the header, which is what a fixed-block-size stream
+        // is required to do.
+        for value in interleaved[filled * CHANNELS..].iter_mut() {
+            *value = 0;
         }
-        out.clear();
-        out.reserve(mp3lame_encoder::max_required_buffer_size(frames));
-        encoder
-            .encode_to_vec(
-                DualPcm {
-                    left: &left,
-                    right: &right,
-                },
-                &mut out,
-            )
-            .map_err(|e| anyhow!("mp3 encode: {e:?}"))?;
-        file.write_all(&out)?;
+
+        framebuf
+            .fill_interleaved(&interleaved)
+            .map_err(|e| anyhow!("flac buffer: {e:?}"))?;
+        let frame = encode_fixed_size_frame(&config, &framebuf, frame_number, &info)
+            .map_err(|e| anyhow!("flac encode: {e:?}"))?;
+        sink.clear();
+        frame
+            .write(&mut sink)
+            .map_err(|e| anyhow!("flac write: {e:?}"))?;
+        file.write_all(sink.as_slice())?;
+
+        info.update_frame_info(&frame);
+        frame_number += 1;
+        total_samples += filled;
+        if filled < block_size {
+            break;
+        }
     }
-    out.clear();
-    out.reserve(7200);
-    encoder
-        .flush_to_vec::<FlushNoGap>(&mut out)
-        .map_err(|e| anyhow!("mp3 flush: {e:?}"))?;
-    file.write_all(&out)?;
+
+    if total_samples == 0 {
+        anyhow::bail!("the mix produced no audio");
+    }
+    info.set_total_samples(total_samples);
+    file.seek(SeekFrom::Start(0))?;
+    write_flac_header(&mut file, &info, picture.as_deref())?;
     Ok(())
+}
+
+/// 24-bit, matching what the WAV writer defaults to and what the limiter feeds.
+const FLAC_BITS: usize = 24;
+const FLAC_FULL_SCALE: f32 = 8_388_607.0;
+
+/// "fLaC", then `STREAMINFO`, then the picture if there is one.
+///
+/// The last-metadata-block flag belongs to whichever of them comes last, and
+/// getting that wrong is exactly the bug that made an embedded cover play as
+/// noise; see [`embed_cover`].
+fn write_flac_header(
+    file: &mut File,
+    info: &flacenc::component::StreamInfo,
+    picture: Option<&[u8]>,
+) -> Result<()> {
+    use flacenc::bitsink::ByteSink;
+    use flacenc::component::BitRepr;
+
+    let mut sink = ByteSink::new();
+    info.write(&mut sink)
+        .map_err(|e| anyhow!("flac stream info: {e:?}"))?;
+    let body = sink.as_slice();
+
+    file.write_all(b"fLaC")?;
+    file.write_all(&[if picture.is_some() { 0x00 } else { 0x80 }])?;
+    file.write_all(&[
+        ((body.len() >> 16) & 0xff) as u8,
+        ((body.len() >> 8) & 0xff) as u8,
+        (body.len() & 0xff) as u8,
+    ])?;
+    file.write_all(body)?;
+
+    if let Some(picture) = picture {
+        // Type 6 is PICTURE, and it is last.
+        file.write_all(&[0x86])?;
+        file.write_all(&[
+            ((picture.len() >> 16) & 0xff) as u8,
+            ((picture.len() >> 8) & 0xff) as u8,
+            (picture.len() & 0xff) as u8,
+        ])?;
+        file.write_all(picture)?;
+    }
+    Ok(())
+}
+
+/// The body of a FLAC `PICTURE` block holding `path` as the front cover.
+///
+/// Dimensions and colour depth are filled in where the image can be read and
+/// left as "unknown" — zero, which the format allows — where it cannot, since
+/// a player that wants them can always measure the picture itself.
+fn picture_block(path: &Path) -> Result<Vec<u8>> {
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let mime = match image_kind(&data) {
+        Some(kind) => kind,
+        None => anyhow::bail!("{} is not an image FLAC can carry", path.display()),
+    };
+    let (width, height) = image::image_dimensions(path).unwrap_or((0, 0));
+    let depth: u32 = if width == 0 { 0 } else { 24 };
+
+    let mut out = Vec::with_capacity(data.len() + 64);
+    out.extend_from_slice(&3u32.to_be_bytes()); // front cover
+    out.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+    out.extend_from_slice(mime.as_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // no description
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&depth.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // not an indexed-colour image
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(&data);
+    Ok(out)
+}
+
+/// The MIME type of an image, from its own first bytes rather than its name.
+fn image_kind(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if data.len() > 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+/// MP3 goes out through ffmpeg rather than a linked encoder; see
+/// [`crate::audio::ffmpeg`] for why. The limiter and every fade have already
+/// run by the time a sample reaches the pipe, so what is encoded is what the
+/// audition played.
+fn write_mp3(mix: &mut OfflineMix<'_>, dest: &Path, bitrate: u16) -> Result<()> {
+    crate::audio::ffmpeg::encode_mp3(dest, mix.rate, bitrate, CHANNELS, |out| {
+        let frames = mix.next_planar(out.len() / CHANNELS)?;
+        for f in 0..frames {
+            for ch in 0..CHANNELS {
+                out[f * CHANNELS + ch] = mix.planar[ch][f].clamp(-1.0, 1.0);
+            }
+        }
+        Ok(frames)
+    })
 }

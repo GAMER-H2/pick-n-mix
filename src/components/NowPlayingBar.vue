@@ -9,6 +9,7 @@ import { useRoute, useRouter } from "vue-router";
 import { useDismiss } from "@/lib/dismiss";
 import PnmIcon from "./icons/PnmIcon.vue";
 import Artwork from "./Artwork.vue";
+import PlaylistArtwork from "./PlaylistArtwork.vue";
 import AppSlider from "./AppSlider.vue";
 import MixerPopover from "./mixer/MixerPopover.vue";
 import InfoPopover from "./InfoPopover.vue";
@@ -17,10 +18,12 @@ import { stableAlbumId, stableArtistId } from "@/lib/ids";
 import { usePlayerStore } from "@/stores/player";
 import { useMixerStore } from "@/stores/mixer";
 import { useUiStore } from "@/stores/ui";
+import { useMasterMixStore } from "@/stores/masterMix";
 
 const player = usePlayerStore();
 const mixer = useMixerStore();
 const ui = useUiStore();
+const masterMix = useMasterMixStore();
 const route = useRoute();
 const router = useRouter();
 
@@ -29,6 +32,51 @@ const SKIP_SECONDS = 10;
 const VOLUME_DETENTS = [0, 0.25, 0.5, 0.75, 1];
 
 const track = computed(() => player.track);
+
+/**
+ * The playlist being played as a mix, if that is what is playing.
+ *
+ * A mix has no current track: the engine holds one long timeline, so the bar
+ * shows the playlist in a song's place and marks the songs along the scrubber.
+ */
+const mix = computed(() => player.masterMix);
+
+/**
+ * Where each song starts, as dots on the scrubber — but only the ones far
+ * enough apart to read.
+ *
+ * A crossfaded join can put two starts a second apart, which at this width is
+ * one smudge rather than two marks, so anything within a fiftieth of the
+ * timeline of the mark before it is dropped. The two ends are left clear as
+ * well: a dot under the handle's parked position says nothing.
+ */
+const chapterMarks = computed(() => {
+  const current = mix.value;
+  const total = player.duration;
+  if (!current || total <= 0) return [];
+  const apart = total / 50;
+  const marks: number[] = [];
+  for (const chapter of current.chapters) {
+    const at = chapter.startSecs;
+    if (at <= apart || at >= total - apart) continue;
+    if (marks.length > 0 && at - marks[marks.length - 1] < apart) continue;
+    marks.push(at);
+  }
+  return marks;
+});
+
+function goToPlaylist() {
+  const current = mix.value;
+  if (current) router.push({ name: "playlist", params: { id: current.playlistId } });
+}
+
+/**
+ * The Master Mixer captures normal playback for as long as it is open, so the
+ * queue is paused and the engine is playing a timeline instead. The transport
+ * here would be reporting one thing's position under another thing's name, and
+ * pressing it would fight the audition — so it stands aside and says so.
+ */
+const suspended = computed(() => masterMix.open);
 
 const volumeIcon = computed(() => {
   const level = player.snapshot.volume;
@@ -74,11 +122,27 @@ useDismiss(
   { ignore: [mixerButton] },
 );
 useDismiss(
-  () => ui.infoTrack !== null,
-  () => (ui.infoTrack = null),
+  () => infoOpen.value,
+  () => {
+    ui.infoTrack = null;
+    ui.infoMixOpen = false;
+  },
   infoPopover,
   { ignore: [infoButton] },
 );
+
+/** The bubble describes whichever of the two things is playing. */
+const infoOpen = computed(() => ui.infoTrack !== null || ui.infoMixOpen);
+
+function toggleInfo() {
+  if (infoOpen.value) {
+    ui.infoTrack = null;
+    ui.infoMixOpen = false;
+    return;
+  }
+  if (mix.value) ui.infoMixOpen = true;
+  else ui.infoTrack = track.value;
+}
 
 function onScrubStart() {
   player.scrubbing = true;
@@ -133,8 +197,35 @@ async function openMixer(event: MouseEvent) {
   <footer class="bar">
     <!-- Left: what is playing -->
     <div class="bar__now">
-      <Artwork :artwork-id="track?.artworkId" :size="46" :radius="5" shadow />
-      <div class="bar__text">
+      <PlaylistArtwork
+        v-if="mix"
+        :artwork="mix.artwork"
+        :artwork-ids="mix.artworkIds"
+        :size="46"
+        :radius="5"
+        shadow
+      />
+      <Artwork v-else :artwork-id="track?.artworkId" :size="46" :radius="5" shadow />
+      <!-- A mix plays as one thing, so it is named as one thing. -->
+      <div v-if="mix" class="bar__text">
+        <div class="bar__title truncate" :title="mix.name">
+          <PnmIcon
+            name="timeline"
+            :size="13"
+            class="bar__badge"
+            title="Playing as a master mix"
+          />
+          <span class="truncate">{{ mix.name }}</span>
+        </div>
+        <div class="bar__subtitle truncate">
+          <button class="bar__link" :title="`Go to ${mix.name}`" @click="goToPlaylist">
+            Master mix
+          </button>
+          <span class="bar__sep">·</span>
+          <span>{{ mix.trackCount }} {{ mix.trackCount === 1 ? "song" : "songs" }}</span>
+        </div>
+      </div>
+      <div v-else class="bar__text">
         <div class="bar__title truncate" :title="track?.title ?? ''">
           {{ track?.title ?? "Nothing Playing" }}
         </div>
@@ -163,14 +254,14 @@ async function openMixer(event: MouseEvent) {
         <button
           ref="infoButton"
           class="icon-button"
-          :disabled="!track"
-          aria-label="Track information"
-          @click="ui.infoTrack = ui.infoTrack ? null : track"
+          :disabled="!player.hasPlayback"
+          :aria-label="mix ? 'Mix information' : 'Track information'"
+          @click="toggleInfo"
         >
           <PnmIcon name="info" :size="17" />
         </button>
         <Teleport to="body">
-          <div v-if="ui.infoTrack" ref="infoPopover" class="pnm-popover pnm-popover--info">
+          <div v-if="infoOpen" ref="infoPopover" class="pnm-popover pnm-popover--info">
             <InfoPopover />
           </div>
         </Teleport>
@@ -178,11 +269,14 @@ async function openMixer(event: MouseEvent) {
     </div>
 
     <!-- Middle: transport -->
-    <div class="bar__transport">
+    <div v-if="suspended" class="bar__transport bar__transport--suspended">
+      <span>Playback is in the Master Mixer</span>
+    </div>
+    <div v-else class="bar__transport">
       <div class="bar__buttons">
         <button
           class="icon-button"
-          :disabled="!track"
+          :disabled="!player.hasPlayback"
           :title="`Back ${SKIP_SECONDS} seconds`"
           aria-label="Skip back ten seconds"
           @click="skip(-SKIP_SECONDS)"
@@ -191,8 +285,8 @@ async function openMixer(event: MouseEvent) {
         </button>
         <button
           class="icon-button"
-          :disabled="!track"
-          title="Previous"
+          :disabled="!player.hasPlayback"
+          :title="mix ? 'Previous song in the mix' : 'Previous'"
           aria-label="Previous track"
           @click="player.previous()"
         >
@@ -200,7 +294,7 @@ async function openMixer(event: MouseEvent) {
         </button>
         <button
           class="bar__play"
-          :disabled="!track"
+          :disabled="!player.hasPlayback"
           :title="player.playing ? 'Pause' : 'Play'"
           :aria-label="player.playing ? 'Pause' : 'Play'"
           @click="player.toggle()"
@@ -209,8 +303,8 @@ async function openMixer(event: MouseEvent) {
         </button>
         <button
           class="icon-button"
-          :disabled="!track"
-          title="Next"
+          :disabled="!player.hasPlayback"
+          :title="mix ? 'Next song in the mix' : 'Next'"
           aria-label="Next track"
           @click="player.next()"
         >
@@ -218,7 +312,7 @@ async function openMixer(event: MouseEvent) {
         </button>
         <button
           class="icon-button"
-          :disabled="!track"
+          :disabled="!player.hasPlayback"
           :title="`Forward ${SKIP_SECONDS} seconds`"
           aria-label="Skip forward ten seconds"
           @click="skip(SKIP_SECONDS)"
@@ -234,7 +328,8 @@ async function openMixer(event: MouseEvent) {
           :min="0"
           :max="Math.max(player.duration, 0.1)"
           :step="0.1"
-          :disabled="!track"
+          :disabled="!player.hasPlayback"
+          :markers="chapterMarks"
           subtle
           @start="onScrubStart"
           @update:model-value="onScrub"
@@ -342,8 +437,18 @@ async function openMixer(event: MouseEvent) {
 }
 
 .bar__title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
   font-size: 13px;
   font-weight: 500;
+}
+
+/* Small, and in the accent, so "this is a mix" reads without a word for it. */
+.bar__badge {
+  flex: none;
+  color: var(--accent);
 }
 
 .bar__subtitle {
@@ -423,6 +528,14 @@ async function openMixer(event: MouseEvent) {
   gap: 9px;
   width: 100%;
   max-width: 520px;
+}
+
+.bar__transport--suspended {
+  justify-content: center;
+  /* The column layout above centres nothing when there is one line in it. */
+  flex-direction: row;
+  font-size: 12px;
+  color: var(--text-tertiary);
 }
 
 .bar__time {

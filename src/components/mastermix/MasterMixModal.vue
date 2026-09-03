@@ -18,9 +18,12 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
+import AppSlider from "../AppSlider.vue";
 import AdvancedMixer from "../mixer/AdvancedMixer.vue";
 import MixBlockView from "./MixBlockView.vue";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   MAX_GAIN_DB,
   MIN_GAIN_DB,
@@ -31,6 +34,7 @@ import {
   curveFromMidGain,
   deleteBlocks,
   duplicateBlocks,
+  gridCandidates,
   locate,
   mixDuration,
   moveAutomationPoint,
@@ -49,6 +53,8 @@ import {
   updateLane,
 } from "@/lib/masterMix";
 import { formatDuration } from "@/lib/format";
+import { pitchRatio, resolve } from "@/lib/mixer";
+import { useDismiss } from "@/lib/dismiss";
 import { useMasterMixStore, type Tool } from "@/stores/masterMix";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
@@ -89,10 +95,39 @@ const laneHeight = computed(() => store.laneHeight);
 const contentSecs = computed(() => Math.max(store.duration, 30) + TAIL_SECS);
 const contentWidth = computed(() => contentSecs.value * pps.value);
 const step = computed(() => rulerStep(pps.value));
-const colorLaneId = ref<string | null>(null);
+/**
+ * The lane colour picker.
+ *
+ * Drawn in a fixed layer rather than inside the lane header: the header is a
+ * sticky, stacked element inside a scrolling grid, so a menu opened in it is
+ * painted underneath every lane below and clipped by the scroller. Anchoring
+ * it to the swatch's position on screen puts it above everything and lets it
+ * flip up when there is no room below.
+ */
+const colorLane = ref<{ index: number; x: number; y: number; flip: boolean } | null>(null);
+const paletteEl = ref<HTMLElement | null>(null);
+const colorAnchor = ref<HTMLElement | null>(null);
+const PALETTE_HEIGHT = 108;
 const renamingLaneId = ref<string | null>(null);
 const renameValue = ref("");
 const COLOR_HUES = [8, 32, 55, 105, 165, 205, 245, 285, 325] as const;
+
+function toggleColorPicker(laneIndex: number, event: MouseEvent) {
+  if (colorLane.value?.index === laneIndex) {
+    colorLane.value = null;
+    return;
+  }
+  const swatch = event.currentTarget as HTMLElement;
+  const box = swatch.getBoundingClientRect();
+  const flip = box.bottom + PALETTE_HEIGHT > window.innerHeight;
+  colorAnchor.value = swatch;
+  colorLane.value = {
+    index: laneIndex,
+    x: box.left,
+    y: flip ? box.top - 5 : box.bottom + 5,
+    flip,
+  };
+}
 
 const ticks = computed(() => {
   const out: { secs: number; label: string }[] = [];
@@ -101,6 +136,79 @@ const ticks = computed(() => {
   }
   return out;
 });
+
+/**
+ * Unlabelled divisions between the labelled ones, so a position can be read
+ * off the ruler to better than the nearest label. Dropped when they would be
+ * closer together than they are tall, which is where they stop being marks and
+ * start being a grey band.
+ */
+const minorTicks = computed(() => {
+  const spacing = (step.value / 4) * pps.value;
+  if (spacing < 12) return [];
+  const out: number[] = [];
+  for (let t = step.value / 4; t <= contentSecs.value; t += step.value / 4) {
+    if (Math.abs(t / step.value - Math.round(t / step.value)) > 1e-6) out.push(t);
+  }
+  return out;
+});
+
+/**
+ * The ruler division a snap lines up with: whatever the finest mark on screen
+ * is, so "snap to the second points above the tracks" means the marks the user
+ * can actually see rather than a hidden grid of its own.
+ */
+const gridSecs = computed(() => (minorTicks.value.length > 0 ? step.value / 4 : step.value));
+/** "0.25s", "2s", "1:00" — how far apart those marks currently are. */
+const gridLabel = computed(() =>
+  gridSecs.value < 60 ? `${Number(gridSecs.value.toFixed(2))}s` : formatDuration(gridSecs.value),
+);
+
+/**
+ * Everything a gesture may snap to.
+ *
+ * The edges of every block it is not itself moving, the playhead — lining an
+ * edit up with where you were just listening is the commonest thing to want —
+ * and, when the grid toggle is on, the ruler marks either side of `times`.
+ */
+function snapTargets(source: MasterMix, exclude: Set<string>, times: number[]): number[] {
+  const candidates = snapCandidates(source, exclude);
+  candidates.push(store.playhead);
+  if (store.gridSnapping) candidates.push(...gridCandidates(times, gridSecs.value));
+  return candidates;
+}
+
+/**
+ * Where the thing being dragged, trimmed or cut has locked on, in timeline
+ * seconds, or null when nothing has.
+ *
+ * Snapping without this is guesswork: a block lands on a neighbour's edge and
+ * the only evidence is that it looks about right. The line says which edge,
+ * and — with the grid on — that it was a ruler mark rather than a block.
+ */
+const snapLine = ref<number | null>(null);
+/**
+ * Whether that line is a snap or just the cursor.
+ *
+ * The blade draws a line wherever it is, so the cut is never a guess; it only
+ * *locks* when something is within reach, and the two have to look different
+ * or the line would claim an accuracy it does not have.
+ */
+const snapLocked = ref(false);
+
+/**
+ * Which of `times` actually landed on a candidate, if any.
+ *
+ * Asked after the snap rather than during it, so one rule covers moving,
+ * trimming and the blade: whatever the gesture ended up at, if it coincides
+ * with something offered, that is what it snapped to.
+ */
+function snappedAt(times: number[], candidates: number[]): number | null {
+  for (const time of times) {
+    if (candidates.some((candidate) => Math.abs(candidate - time) < 1e-6)) return time;
+  }
+  return null;
+}
 
 /** Use a persisted lane colour when set, otherwise spread defaults apart. */
 function hueFor(laneIndex: number): number {
@@ -112,6 +220,23 @@ function entryFor(block: MixBlock) {
   if (block.source.kind !== "entry") return null;
   const index = block.source.index;
   return store.entries.find((e) => e.index === index) ?? null;
+}
+
+/**
+ * How fast a block plays, resolved through the layers this editor can see.
+ *
+ * The drawing needs it as much as the engine does: at double speed a region
+ * covers twice as much of the song, so the waveform under it has to be read
+ * twice as fast or the picture stops matching the sound.
+ *
+ * The playlist-entry layer is left out — the timeline has no way to show or
+ * edit it — so a per-song pitch override set from the playlist would draw as
+ * though it were absent while still being heard. The global layer is left out
+ * because a mix ignores it outright; see `build_plan` in `commands.rs`.
+ */
+function speedFor(block: MixBlock): number {
+  const resolved = resolve([playlists.open?.mixer ?? {}, block.mixer ?? {}]);
+  return resolved.enabled ? pitchRatio(resolved.pitch) : 1;
 }
 
 function waveformFor(block: MixBlock) {
@@ -156,13 +281,35 @@ watch(
 // Geometry
 // ---------------------------------------------------------------------------
 
-/** Timeline seconds under a pointer event. */
-function timeAt(event: PointerEvent | MouseEvent): number {
+/**
+ * Timeline seconds at a window x coordinate.
+ *
+ * Split from the event form because a file drop does not arrive as a pointer
+ * event: Tauri reports it separately, with a position of its own.
+ */
+function timeAtClientX(clientX: number): number {
   const element = scroller.value;
   if (!element) return 0;
   const box = element.getBoundingClientRect();
-  const x = event.clientX - box.left + element.scrollLeft - HEADER_WIDTH;
+  const x = clientX - box.left + element.scrollLeft - HEADER_WIDTH;
   return Math.max(0, x / pps.value);
+}
+
+/** Timeline seconds under a pointer event. */
+function timeAt(event: PointerEvent | MouseEvent): number {
+  return timeAtClientX(event.clientX);
+}
+
+/** Which lane a window y coordinate falls on; the lane count means "a new one". */
+function laneIndexAtClientY(clientY: number): number {
+  const element = scroller.value;
+  if (!element) return mix.value.lanes.length;
+  const box = element.getBoundingClientRect();
+  const y = clientY - box.top + element.scrollTop - RULER_HEIGHT;
+  const index = Math.floor(y / laneHeight.value);
+  if (index < 0) return 0;
+  if (index >= mix.value.lanes.length) return mix.value.lanes.length;
+  return index;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,9 +342,22 @@ function onGrab(
   if (event.button !== 0) return;
 
   if (store.tool === "blade" && mode === "move") {
-    const at = timeAt(event);
+    // The blade snaps like a drag does: to where the other songs start and
+    // end, and to the playhead. Cutting one song exactly where the next one
+    // comes in is the reason to reach for it at all, and by hand that is a
+    // few pixels of luck. Alt inverts it, as everywhere else.
+    const wanted = timeAt(event);
+    const snapping = store.snapping !== event.altKey;
+    const at = snapping
+      ? snapTime(
+          wanted,
+          snapTargets(mix.value, new Set([blockId]), [wanted]),
+          SNAP_PIXELS / pps.value,
+        )
+      : wanted;
     const next = splitBlock(mix.value, blockId, at);
     if (next !== mix.value) store.commit(next);
+    snapLine.value = null;
     return;
   }
   if (store.tool !== "select") return;
@@ -235,15 +395,24 @@ function onDragMove(event: PointerEvent) {
   if (!current.moved && Math.abs(dx) < 2 && Math.abs(dy) < 2) return;
   current.moved = true;
 
-  // Alt is the universal "ignore snapping" modifier in timeline editors.
-  const tolerance = event.altKey ? 0 : SNAP_PIXELS / pps.value;
+  // Alt is the universal "ignore snapping" modifier in timeline editors, and
+  // inverts the toggle rather than only turning snapping off — so it is also
+  // how you snap one drag while snapping is otherwise disabled.
+  const snapping = store.snapping !== event.altKey;
+  const tolerance = snapping ? SNAP_PIXELS / pps.value : 0;
   const found = locate(current.origin, current.blockId);
   if (!found) return;
-  const candidates = snapCandidates(current.origin, new Set(current.ids));
+  const excluded = new Set(current.ids);
 
   if (current.mode === "move") {
     const wanted = found.block.startSecs + dx / pps.value;
+    const candidates = snapTargets(current.origin, excluded, [
+      wanted,
+      wanted + found.block.durationSecs,
+    ]);
     const snapped = snapDrag(wanted, found.block.durationSecs, candidates, tolerance);
+    snapLine.value = snappedAt([snapped, snapped + found.block.durationSecs], candidates);
+    snapLocked.value = true;
     const laneDelta = Math.round(dy / laneHeight.value);
     store.mix = moveBlocks(current.origin, current.ids, snapped - found.block.startSecs, laneDelta);
     return;
@@ -251,7 +420,11 @@ function onDragMove(event: PointerEvent) {
 
   const edge = current.mode === "trim-start" ? "start" : "end";
   const anchor = edge === "start" ? found.block.startSecs : found.block.startSecs + found.block.durationSecs;
-  const wanted = snapTime(anchor + dx / pps.value, candidates, tolerance);
+  const dragged = anchor + dx / pps.value;
+  const trimCandidates = snapTargets(current.origin, excluded, [dragged]);
+  const wanted = snapTime(dragged, trimCandidates, tolerance);
+  snapLine.value = snappedAt([wanted], trimCandidates);
+  snapLocked.value = true;
   store.mix = trimBlock(current.origin, current.blockId, edge, wanted);
 }
 
@@ -276,6 +449,7 @@ function onDragCancel() {
 
 function stopDragListening() {
   drag.value = null;
+  snapLine.value = null;
   window.removeEventListener("pointermove", onDragMove);
   window.removeEventListener("pointerup", onDragEnd);
   window.removeEventListener("pointercancel", onDragCancel);
@@ -383,13 +557,192 @@ function stopAutomationListening() {
   window.removeEventListener("pointercancel", onAutomationCancel);
 }
 
+/**
+ * The blade's line, following the pointer before anything has been cut.
+ *
+ * A cut is one click with nothing to undo it but undo, so where it will land
+ * has to be visible before it happens. Only the snapped position is drawn:
+ * with snapping off there is nothing to show that the cursor does not already
+ * say.
+ */
+function onBladeHover(event: PointerEvent) {
+  if (store.tool !== "blade" || drag.value) {
+    snapLine.value = null;
+    return;
+  }
+  // Over the lane headers there is no time under the pointer to draw at.
+  const element = scroller.value;
+  const box = element?.getBoundingClientRect();
+  if (!box || event.clientX < box.left + HEADER_WIDTH) {
+    snapLine.value = null;
+    return;
+  }
+
+  const wanted = timeAt(event);
+  if (!(store.snapping !== event.altKey)) {
+    snapLine.value = wanted;
+    snapLocked.value = false;
+    return;
+  }
+  const over = blockAt(wanted, laneIndexAtClientY(event.clientY));
+  const candidates = snapTargets(mix.value, new Set(over ? [over.id] : []), [wanted]);
+  const at = snapTime(wanted, candidates, SNAP_PIXELS / pps.value);
+  const locked = snappedAt([at], candidates);
+  snapLine.value = locked ?? wanted;
+  snapLocked.value = locked !== null;
+}
+
+/** The block covering `atSecs` on `laneIndex`, if there is one. */
+function blockAt(atSecs: number, laneIndex: number): MixBlock | null {
+  const lane = mix.value.lanes[laneIndex];
+  if (!lane) return null;
+  return (
+    lane.blocks.find(
+      (block) => atSecs >= block.startSecs && atSecs <= block.startSecs + block.durationSecs,
+    ) ?? null
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Marquee selection
+// ---------------------------------------------------------------------------
+
+/**
+ * Dragging across empty track space selects everything the box touches, which
+ * is how every timeline editor selects a passage rather than a region. A plain
+ * click with no drag falls out of the same gesture as "select nothing", which
+ * is what clicking the background is expected to do.
+ */
+const marquee = ref<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+let marqueeBase: string[] = [];
+
+const marqueeBox = computed(() => {
+  const box = marquee.value;
+  if (!box) return null;
+  return {
+    left: Math.min(box.x0, box.x1),
+    top: Math.min(box.y0, box.y1),
+    width: Math.abs(box.x1 - box.x0),
+    height: Math.abs(box.y1 - box.y0),
+  };
+});
+
+/** A pointer position in the scrolling grid's own coordinates. */
+function gridPoint(event: PointerEvent): { x: number; y: number } {
+  const element = scroller.value;
+  if (!element) return { x: 0, y: 0 };
+  const box = element.getBoundingClientRect();
+  return {
+    x: event.clientX - box.left + element.scrollLeft,
+    y: event.clientY - box.top + element.scrollTop,
+  };
+}
+
+function onLaneBackgroundDown(event: PointerEvent) {
+  if (event.button !== 0 || store.tool !== "select") return;
+  const additive = event.shiftKey || event.metaKey || event.ctrlKey;
+  marqueeBase = additive ? [...store.selection] : [];
+  if (!additive) store.select([]);
+  const point = gridPoint(event);
+  marquee.value = { x0: point.x, y0: point.y, x1: point.x, y1: point.y };
+  window.addEventListener("pointermove", onMarqueeMove);
+  window.addEventListener("pointerup", onMarqueeEnd);
+  window.addEventListener("pointercancel", onMarqueeEnd);
+}
+
+function onMarqueeMove(event: PointerEvent) {
+  const box = marquee.value;
+  if (!box) return;
+  const point = gridPoint(event);
+  marquee.value = { ...box, x1: point.x, y1: point.y };
+
+  const fromSecs = (Math.min(box.x0, point.x) - HEADER_WIDTH) / pps.value;
+  const toSecs = (Math.max(box.x0, point.x) - HEADER_WIDTH) / pps.value;
+  const fromLane = Math.floor((Math.min(box.y0, point.y) - RULER_HEIGHT) / laneHeight.value);
+  const toLane = Math.floor((Math.max(box.y0, point.y) - RULER_HEIGHT) / laneHeight.value);
+
+  const hit = new Set(marqueeBase);
+  mix.value.lanes.forEach((lane, laneIndex) => {
+    if (laneIndex < fromLane || laneIndex > toLane) return;
+    for (const block of lane.blocks) {
+      // Touching counts, as in Logic: a box has to be dragged around a region
+      // to *contain* it, but brushing it is what people mean.
+      if (block.startSecs <= toSecs && block.startSecs + block.durationSecs >= fromSecs) {
+        hit.add(block.id);
+      }
+    }
+  });
+  store.select([...hit]);
+}
+
+function onMarqueeEnd() {
+  marquee.value = null;
+  marqueeBase = [];
+  window.removeEventListener("pointermove", onMarqueeMove);
+  window.removeEventListener("pointerup", onMarqueeEnd);
+  window.removeEventListener("pointercancel", onMarqueeEnd);
+}
+
 // ---------------------------------------------------------------------------
 // Playhead
 // ---------------------------------------------------------------------------
 
 const scrubbing = ref(false);
 
+/**
+ * Where the playhead is *drawn*, which is not quite where the engine says it
+ * is.
+ *
+ * The engine is polled five times a second. That is plenty to know where the
+ * music has got to and nowhere near enough to draw a line that looks like it
+ * is moving — at 200ms a piece the playhead visibly hops. So between reports
+ * it is carried forward by the wall clock, and every report that arrives
+ * re-anchors it. The audio stays the authority; only the frames in between
+ * are invented.
+ */
+const renderPlayhead = ref(0);
+let anchorSecs = 0;
+let anchorAt = 0;
+let frame = 0;
+
+function anchorPlayhead() {
+  anchorSecs = store.playhead;
+  anchorAt = performance.now();
+  renderPlayhead.value = anchorSecs;
+}
+
+/** Re-anchor on every position the store accepts, wherever it came from. */
+watch(() => store.playhead, anchorPlayhead);
+watch(() => store.previewing && !store.previewPaused, anchorPlayhead);
+
+function onFrame() {
+  frame = requestAnimationFrame(onFrame);
+  if (!store.previewing || store.previewPaused || scrubbing.value) return;
+  const elapsed = (performance.now() - anchorAt) / 1000;
+  renderPlayhead.value = Math.min(anchorSecs + elapsed, Math.max(store.duration, 0));
+  if (store.followPlayhead) keepPlayheadVisible();
+}
+
+/**
+ * Scroll so a running playhead stays on screen — Logic's "catch playhead".
+ *
+ * Only once it has actually left the visible timeline, and then placed a
+ * quarter of the way in rather than hard against the edge, so what comes next
+ * is on screen instead of what has already been heard.
+ */
+function keepPlayheadVisible() {
+  const element = scroller.value;
+  if (!element) return;
+  const visible = element.clientWidth - HEADER_WIDTH;
+  if (visible <= 0) return;
+  const x = renderPlayhead.value * pps.value;
+  const from = element.scrollLeft;
+  if (x >= from && x <= from + visible - 24) return;
+  element.scrollLeft = Math.max(0, x - visible * 0.25);
+}
+
 function onRulerDown(event: PointerEvent) {
+  if (event.button !== 0) return;
   scrubbing.value = true;
   (event.currentTarget as Element).setPointerCapture?.(event.pointerId);
   movePlayhead(event);
@@ -407,14 +760,29 @@ async function onRulerUp() {
 }
 
 function movePlayhead(event: PointerEvent) {
-  store.playhead = Math.min(timeAt(event), Math.max(store.duration, 0));
+  seekTo(timeAt(event));
 }
 
-/** While the engine is playing the mix, the playhead is its position. */
+/** Put the playhead somewhere, clamped to the arrangement. */
+function seekTo(secs: number) {
+  store.setPlayhead(Math.min(Math.max(secs, 0), Math.max(store.duration, 0)));
+}
+
+/** Move the playhead and, if something is playing, take the audio with it. */
+async function jumpTo(secs: number) {
+  seekTo(secs);
+  if (store.previewing) await store.reloadPreview();
+}
+
+/**
+ * While the engine is playing the mix, the playhead is its position — but only
+ * once the position being reported belongs to the plan that is now loaded.
+ * The store holds that gate; see `applyEnginePosition`.
+ */
 watch(
   () => player.snapshot.positionSecs,
   (position) => {
-    if (store.previewing && !scrubbing.value) store.playhead = position;
+    if (!scrubbing.value) store.applyEnginePosition(position);
   },
 );
 
@@ -431,9 +799,18 @@ async function pause() {
   await store.pause();
 }
 
+/**
+ * Stop, and put the playhead back where playing began — not at zero.
+ *
+ * A timeline editor's playhead is a place you are working, and hearing the
+ * same join twice should not mean finding it again. Stopping when already
+ * parked at the start position does go to the beginning, so there is still a
+ * one-key way back.
+ */
 async function stop() {
+  const start = store.playStartSecs;
   await store.stop();
-  store.playhead = 0;
+  seekTo(Math.abs(store.playhead - start) < 0.01 ? 0 : start);
 }
 
 function deleteSelection() {
@@ -474,27 +851,102 @@ function cancelLaneRename() {
 
 function setLaneColor(laneIndex: number, colorHue: number) {
   store.commit(updateLane(mix.value, laneIndex, { colorHue }));
-  colorLaneId.value = null;
+  colorLane.value = null;
 }
+
+useDismiss(
+  () => colorLane.value !== null,
+  () => (colorLane.value = null),
+  paletteEl,
+  { ignore: [colorAnchor] },
+);
 
 function addCustomLane() {
   store.commit(addLane(mix.value, `Track ${mix.value.lanes.length + 1}`));
 }
 
 function dropLane(laneIndex: number) {
+  colorLane.value = null;
   store.commit(removeLane(mix.value, laneIndex));
 }
 
-async function toggleMute(laneIndex: number) {
+// Mute, solo and everything else audible get their audition rebuilt by
+// `commit` itself, so an edit is heard without touching the transport.
+function toggleMute(laneIndex: number) {
   const lane = mix.value.lanes[laneIndex];
   store.commit(updateLane(mix.value, laneIndex, { muted: !lane.muted }));
-  await store.reloadPreview();
 }
 
-async function toggleSolo(laneIndex: number) {
+function toggleSolo(laneIndex: number) {
   const lane = mix.value.lanes[laneIndex];
   store.commit(updateLane(mix.value, laneIndex, { soloed: !lane.soloed }));
-  await store.reloadPreview();
+}
+
+/**
+ * The lane fader.
+ *
+ * A drag would otherwise put one undo step on the stack per frame, so the
+ * arrangement is written straight through while the pointer is down and the
+ * whole gesture is committed once on release — the same bargain the block
+ * mixer's knobs make.
+ */
+let gainBeforeDrag: MasterMix | null = null;
+
+function startLaneGain() {
+  gainBeforeDrag = cloneMix(mix.value);
+}
+
+function onLaneGain(laneIndex: number, gainDb: number) {
+  store.mix = updateLane(mix.value, laneIndex, { gainDb });
+}
+
+function endLaneGain() {
+  const before = gainBeforeDrag;
+  gainBeforeDrag = null;
+  if (!before) return;
+  const result = mix.value;
+  store.mix = before;
+  store.commit(result);
+}
+
+/**
+ * Typing a level into a lane's readout.
+ *
+ * The field shows the lane's own gain until it is focused, and the draft
+ * afterwards: without that, every keystroke would be overwritten by the
+ * formatted value and a level could only ever be dragged to. What is typed is
+ * read on the way out, so a half-finished number never reaches the mix.
+ */
+const editingGainLaneId = ref<string | null>(null);
+const gainDraft = ref("");
+
+function gainText(lane: { id: string; gainDb: number }): string {
+  if (editingGainLaneId.value === lane.id) return gainDraft.value;
+  return `${lane.gainDb > 0 ? "+" : ""}${lane.gainDb.toFixed(1)}`;
+}
+
+function startGainEdit(laneIndex: number) {
+  const lane = mix.value.lanes[laneIndex];
+  if (!lane) return;
+  editingGainLaneId.value = lane.id;
+  gainDraft.value = lane.gainDb.toFixed(1);
+}
+
+function finishGainEdit(laneIndex: number) {
+  const lane = mix.value.lanes[laneIndex];
+  if (!lane || editingGainLaneId.value !== lane.id) return;
+  editingGainLaneId.value = null;
+  const wanted = Number.parseFloat(gainDraft.value);
+  // Nonsense simply puts the fader's own value back, rather than silencing a
+  // lane because a stray character was typed into it.
+  if (!Number.isFinite(wanted)) return;
+  const gainDb =
+    Math.round(Math.min(MAX_GAIN_DB, Math.max(MIN_GAIN_DB, wanted)) * 10) / 10;
+  if (gainDb !== lane.gainDb) store.commit(updateLane(mix.value, laneIndex, { gainDb }));
+}
+
+function cancelGainEdit() {
+  editingGainLaneId.value = null;
 }
 
 const hasSolo = computed(() => mix.value.lanes.some((lane) => lane.soloed));
@@ -540,19 +992,12 @@ async function openBlockMixer() {
     entryFor(block)?.title ??
     (block.source.kind === "asset" ? block.source.file : "Audio block");
   const playlistMixer = playlists.open?.mixer ?? null;
+  // Recorded before the panel can write anything, so the first pitch change
+  // has a speed to be measured against and the region resizes by the right
+  // amount rather than from a standing start.
+  store.noteBlockSpeed(block.id, speedFor(block));
   await mixer.editMixBlock(store.playlistId, block.id, name, block.mixer, playlistMixer);
   mixer.panelOpen = true;
-}
-
-function laneIndexAt(event: PointerEvent | DragEvent): number {
-  const element = scroller.value;
-  if (!element) return mix.value.lanes.length;
-  const box = element.getBoundingClientRect();
-  const y = event.clientY - box.top + element.scrollTop - RULER_HEIGHT;
-  const index = Math.floor(y / laneHeight.value);
-  if (index < 0) return 0;
-  if (index >= mix.value.lanes.length) return mix.value.lanes.length;
-  return index;
 }
 
 async function importPaths(paths: string[], startSecs: number, laneIndex: number) {
@@ -590,35 +1035,47 @@ function isAudioPath(path: string): boolean {
   return !!ext && (AUDIO_EXTENSIONS as readonly string[]).includes(ext);
 }
 
-function pathsFromDrop(event: DragEvent): string[] {
-  const files = event.dataTransfer?.files;
-  if (!files) return [];
-  return Array.from(files)
-    .map((file) => (file as File & { path?: string }).path)
-    .filter((path): path is string => typeof path === "string" && isAudioPath(path));
-}
-
 const dropping = ref(false);
+let unlistenDrop: UnlistenFn | null = null;
 
-function onFileDrag(event: DragEvent) {
-  if (!event.dataTransfer?.types.includes("Files")) return;
-  event.preventDefault();
-  dropping.value = true;
-}
-
-function onFileDragLeave(event: DragEvent) {
-  if (event.currentTarget === event.target) dropping.value = false;
-}
-
-async function onFileDrop(event: DragEvent) {
-  event.preventDefault();
-  dropping.value = false;
-  const paths = pathsFromDrop(event);
-  if (paths.length === 0) {
-    ui.notify("Only MP3, FLAC and WAV files can become blocks");
-    return;
+/**
+ * Files dropped from the desktop.
+ *
+ * Not through HTML drag and drop: Tauri intercepts the webview's native drop
+ * so it can hand over real paths, which means the DOM's `drop` never fires and
+ * `File.path` — an Electron-ism — does not exist here anyway. The window
+ * reports the drop instead, with a position in *physical* pixels that has to
+ * be brought back to CSS pixels before it means anything to the layout.
+ */
+async function listenForDrops() {
+  if (!("__TAURI_INTERNALS__" in window)) return;
+  try {
+    unlistenDrop = await getCurrentWebview().onDragDropEvent(async ({ payload }) => {
+      if (payload.type === "leave") {
+        dropping.value = false;
+        return;
+      }
+      if (payload.type === "enter" || payload.type === "over") {
+        dropping.value = store.open;
+        return;
+      }
+      dropping.value = false;
+      if (!store.open) return;
+      const ratio = window.devicePixelRatio || 1;
+      const x = payload.position.x / ratio;
+      const y = payload.position.y / ratio;
+      const paths = payload.paths.filter(isAudioPath);
+      if (paths.length === 0) {
+        ui.notify("Only MP3, FLAC and WAV files can become blocks");
+        return;
+      }
+      await importPaths(paths, timeAtClientX(x), laneIndexAtClientY(y));
+    });
+  } catch (error) {
+    // Without the drop listener the Import button still works, so this is not
+    // worth interrupting the user for.
+    console.error("Master mixer: file drops are unavailable:", error);
   }
-  await importPaths(paths, timeAt(event as unknown as PointerEvent), laneIndexAt(event));
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -638,6 +1095,13 @@ function onKeydown(event: KeyboardEvent) {
     duplicateSelection();
     return;
   }
+  if (modifier && event.key.toLowerCase() === "a") {
+    event.preventDefault();
+    selectAll();
+    return;
+  }
+  if (modifier) return;
+
   switch (event.key) {
     case "Escape":
       event.preventDefault();
@@ -645,6 +1109,8 @@ function onKeydown(event: KeyboardEvent) {
       else void close();
       break;
     case " ":
+      // Pause, never stop. Stopping is the button, and Logic's own space bar
+      // leaves the playhead where the music got to.
       event.preventDefault();
       if (store.previewing && !store.previewPaused) void pause();
       else void play();
@@ -653,6 +1119,32 @@ function onKeydown(event: KeyboardEvent) {
     case "Delete":
       event.preventDefault();
       deleteSelection();
+      break;
+    // Return to the start, and Logic's own "go to end".
+    case "Enter":
+    case "Home":
+      event.preventDefault();
+      void jumpTo(0);
+      break;
+    case "End":
+      event.preventDefault();
+      void jumpTo(store.duration);
+      break;
+    // With something selected the arrows nudge it; with nothing selected they
+    // walk the playhead, one ruler division at a time.
+    case "ArrowLeft":
+    case "ArrowRight": {
+      event.preventDefault();
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      if (store.selection.length > 0) nudgeSelection(direction * nudgeSecs(event));
+      else void jumpTo(store.playhead + direction * nudgeSecs(event));
+      break;
+    }
+    case "ArrowUp":
+    case "ArrowDown":
+      if (store.selection.length === 0) break;
+      event.preventDefault();
+      nudgeSelectionLanes(event.key === "ArrowDown" ? 1 : -1);
       break;
     case "v":
       store.tool = "select";
@@ -668,6 +1160,61 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+/** A whole ruler division normally, a tenth of one with Shift held. */
+function nudgeSecs(event: KeyboardEvent): number {
+  return event.shiftKey ? step.value / 10 : step.value;
+}
+
+function nudgeSelection(deltaSecs: number) {
+  store.commit(moveBlocks(mix.value, store.selection, deltaSecs));
+}
+
+function nudgeSelectionLanes(delta: number) {
+  store.commit(moveBlocks(mix.value, store.selection, 0, delta));
+}
+
+function selectAll() {
+  store.select(mix.value.lanes.flatMap((lane) => lane.blocks.map((block) => block.id)));
+}
+
+/**
+ * Zoom the time axis while holding one timeline position still on screen.
+ *
+ * The buttons hold the playhead, so zooming in on the join you are working on
+ * does not send it off the edge; the wheel holds the pointer, which is what a
+ * wheel over a timeline is expected to do.
+ */
+function zoomAround(factor: number, atSecs: number, screenX: number) {
+  const element = scroller.value;
+  store.zoom(factor);
+  if (!element) return;
+  void nextTick(() => {
+    element.scrollLeft = Math.max(0, atSecs * store.pixelsPerSecond - screenX);
+  });
+}
+
+function zoomTime(factor: number) {
+  const element = scroller.value;
+  const visible = element ? element.clientWidth - HEADER_WIDTH : 0;
+  const from = element?.scrollLeft ?? 0;
+  const held = renderPlayhead.value;
+  // A playhead that is not on screen is no use as an anchor; hold the middle
+  // of what the user is actually looking at instead.
+  const onScreen = held * pps.value >= from && held * pps.value <= from + visible;
+  const anchorSeconds = onScreen ? held : (from + visible / 2) / pps.value;
+  zoomAround(factor, anchorSeconds, anchorSeconds * pps.value - from);
+}
+
+/** Fit the whole arrangement across the timeline, with a little air. */
+function zoomToFit() {
+  const element = scroller.value;
+  if (!element) return;
+  const visible = element.clientWidth - HEADER_WIDTH;
+  const span = Math.max(store.duration, 1);
+  store.zoom(((visible - 24) / span) / pps.value);
+  void nextTick(() => (element.scrollLeft = 0));
+}
+
 /** Continuous, restrained zoom: Option adjusts lane height, Cmd/Ctrl adjusts time. */
 function onWheel(event: WheelEvent) {
   const factor = Math.exp(-event.deltaY * 0.0015);
@@ -680,25 +1227,28 @@ function onWheel(event: WheelEvent) {
   event.preventDefault();
   const element = scroller.value;
   if (!element) return;
-  const before = timeAt(event as unknown as PointerEvent);
-  store.zoom(factor);
-  void nextTick(() => {
-    const box = element.getBoundingClientRect();
-    const wanted = event.clientX - box.left - HEADER_WIDTH;
-    element.scrollLeft = before * store.pixelsPerSecond - wanted;
-  });
+  const before = timeAtClientX(event.clientX);
+  const box = element.getBoundingClientRect();
+  zoomAround(factor, before, event.clientX - box.left - HEADER_WIDTH);
 }
 
 onMounted(() => {
   window.addEventListener("keydown", onKeydown);
   loadVisibleWaveforms();
   dialog.value?.focus();
+  anchorPlayhead();
+  frame = requestAnimationFrame(onFrame);
+  void listenForDrops();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKeydown);
+  cancelAnimationFrame(frame);
+  unlistenDrop?.();
+  unlistenDrop = null;
   stopDragListening();
   stopAutomationListening();
+  onMarqueeEnd();
 });
 
 const summary = computed(() => {
@@ -708,15 +1258,7 @@ const summary = computed(() => {
 </script>
 
 <template>
-  <div
-    class="mm-scrim"
-    :class="{ 'is-drop': dropping }"
-    @pointerdown.self="close"
-    @dragenter="onFileDrag"
-    @dragover="onFileDrag"
-    @dragleave="onFileDragLeave"
-    @drop="onFileDrop"
-  >
+  <div class="mm-scrim" :class="{ 'is-drop': dropping }" @pointerdown.self="close">
     <div class="mm__workspace" :class="{ 'is-editing': blockMixerOpen }">
     <section
       ref="dialog"
@@ -794,7 +1336,7 @@ const summary = computed(() => {
         <button class="icon-button" type="button" aria-label="Stop" :disabled="!store.previewing" @click="stop">
           <PnmIcon name="stop" :size="15" />
         </button>
-        <span class="mm__timecode">{{ timecode(store.playhead) }}</span>
+        <span class="mm__timecode">{{ timecode(renderPlayhead) }}</span>
 
         <span class="mm__divider" />
 
@@ -819,13 +1361,50 @@ const summary = computed(() => {
 
         <span class="mm__divider" />
 
+        <button
+          class="mm__toggle"
+          type="button"
+          :class="{ 'is-on': store.snapping }"
+          :aria-pressed="store.snapping"
+          title="Snap to other blocks' edges and the playhead, when dragging, trimming or cutting. Hold Alt to invert this."
+          @click="store.snapping = !store.snapping"
+        >
+          Snap
+        </button>
+        <button
+          class="mm__toggle"
+          type="button"
+          :class="{ 'is-on': store.gridSnapping }"
+          :aria-pressed="store.gridSnapping"
+          :disabled="!store.snapping"
+          :title="`Also snap to the ruler's marks above the tracks, currently every ${gridLabel}`"
+          @click="store.gridSnapping = !store.gridSnapping"
+        >
+          Grid
+        </button>
+        <button
+          class="mm__toggle"
+          type="button"
+          :class="{ 'is-on': store.followPlayhead }"
+          :aria-pressed="store.followPlayhead"
+          title="Scroll to keep the playhead on screen while the mix plays"
+          @click="store.followPlayhead = !store.followPlayhead"
+        >
+          Follow
+        </button>
+
+        <span class="mm__divider" />
+
         <div class="mm__zoom-group" role="group" aria-label="Timeline zoom">
           <span>Time</span>
-          <button class="icon-button" type="button" aria-label="Zoom timeline out" @click="store.zoom(1 / 1.4)">
+          <button class="icon-button" type="button" aria-label="Zoom timeline out" @click="zoomTime(1 / 1.4)">
             <PnmIcon name="minimize" :size="16" />
           </button>
-          <button class="icon-button" type="button" aria-label="Zoom timeline in" @click="store.zoom(1.4)">
+          <button class="icon-button" type="button" aria-label="Zoom timeline in" @click="zoomTime(1.4)">
             <PnmIcon name="plus" :size="16" />
+          </button>
+          <button class="mm__toggle" type="button" title="Fit the whole mix on screen" @click="zoomToFit">
+            Fit
           </button>
         </div>
         <div class="mm__zoom-group" role="group" aria-label="Track height">
@@ -859,6 +1438,8 @@ const summary = computed(() => {
         class="mm__body"
         :class="{ 'is-blade': store.tool === 'blade' }"
         @wheel="onWheel"
+        @pointermove="onBladeHover"
+        @pointerleave="snapLine = null"
         @pointerdown.self="store.select([])"
       >
         <div class="mm__grid" :style="{ width: `${HEADER_WIDTH + contentWidth}px` }">
@@ -873,12 +1454,23 @@ const summary = computed(() => {
               @pointercancel="onRulerUp"
             >
               <span
+                v-for="secs in minorTicks"
+                :key="`m${secs}`"
+                class="mm__tick mm__tick--minor"
+                :style="{ left: `${secs * pps}px` }"
+              />
+              <span
                 v-for="tick in ticks"
                 :key="tick.secs"
                 class="mm__tick"
                 :style="{ left: `${tick.secs * pps}px` }"
                 >{{ tick.label }}</span
               >
+              <span
+                class="mm__playhead-head"
+                :style="{ left: `${renderPlayhead * pps}px` }"
+                aria-hidden="true"
+              />
             </div>
           </div>
 
@@ -893,85 +1485,114 @@ const summary = computed(() => {
             :style="{ height: `${laneHeight}px` }"
           >
             <div class="mm__lane-head" :style="{ width: `${HEADER_WIDTH}px` }">
-              <div class="mm__color-wrap">
-                <button
-                  type="button"
-                  class="mm__lane-swatch"
-                  :style="{ background: `hsl(${hueFor(laneIndex)} 60% 62%)` }"
-                  :aria-label="`Choose colour for ${lane.name}`"
-                  :aria-expanded="colorLaneId === lane.id"
-                  @click="colorLaneId = colorLaneId === lane.id ? null : lane.id"
-                />
-                <div v-if="colorLaneId === lane.id" class="mm__palette" role="menu" aria-label="Track colours">
-                  <button
-                    v-for="colorHue in COLOR_HUES"
-                    :key="colorHue"
-                    type="button"
-                    class="mm__palette-color"
-                    :class="{ 'is-selected': hueFor(laneIndex) === colorHue }"
-                    :style="{ background: `hsl(${colorHue} 60% 62%)` }"
-                    :aria-label="`Use hue ${colorHue}`"
-                    @click="setLaneColor(laneIndex, colorHue)"
+              <button
+                type="button"
+                class="mm__lane-swatch"
+                :style="{ background: `hsl(${hueFor(laneIndex)} 60% 62%)` }"
+                :aria-label="`Choose colour for ${lane.name}`"
+                :aria-expanded="colorLane?.index === laneIndex"
+                @click="toggleColorPicker(laneIndex, $event)"
+              />
+              <div class="mm__lane-body">
+                <div class="mm__lane-row">
+                  <input
+                    v-if="renamingLaneId === lane.id"
+                    v-model="renameValue"
+                    class="mm__lane-name mm__lane-name-input"
+                    :data-lane-id="lane.id"
+                    :aria-label="`Rename ${lane.name}`"
+                    @keydown.enter.prevent="finishLaneRename(laneIndex); ($event.target as HTMLInputElement).blur()"
+                    @keydown.escape.prevent="cancelLaneRename(); ($event.target as HTMLInputElement).blur()"
+                    @blur="finishLaneRename(laneIndex)"
+                  />
+                  <span
+                    v-else
+                    class="mm__lane-name"
+                    :title="`${lane.name} — double-click to rename`"
+                    @dblclick="startLaneRename(laneIndex)"
+                  >{{ lane.name || `Track ${laneIndex + 1}` }}</span>
+                  <div class="mm__lane-buttons">
+                    <button
+                      type="button"
+                      class="mm__ms"
+                      :class="{ 'is-on': lane.muted }"
+                      :aria-pressed="lane.muted"
+                      :title="`${lane.muted ? 'Unmute' : 'Mute'} ${lane.name}`"
+                      :aria-label="`${lane.muted ? 'Unmute' : 'Mute'} ${lane.name}`"
+                      @click="toggleMute(laneIndex)"
+                    >
+                      M
+                    </button>
+                    <button
+                      type="button"
+                      class="mm__ms mm__ms--solo"
+                      :class="{ 'is-on': lane.soloed }"
+                      :aria-pressed="lane.soloed"
+                      :title="`${lane.soloed ? 'Unsolo' : 'Solo'} ${lane.name}`"
+                      :aria-label="`${lane.soloed ? 'Unsolo' : 'Solo'} ${lane.name}`"
+                      @click="toggleSolo(laneIndex)"
+                    >
+                      S
+                    </button>
+                    <button
+                      type="button"
+                      class="mm__ms mm__ms--drop"
+                      :title="`Delete ${lane.name}`"
+                      @click="dropLane(laneIndex)"
+                    >
+                      <PnmIcon name="close" :size="11" />
+                    </button>
+                </div>
+                </div>
+
+                <!-- The lane fader, which the arrangement has always stored
+                     and nothing could reach. Hidden on short lanes, as Logic
+                     hides a track's controls when there is no room. -->
+                <div v-if="laneHeight >= 62" class="mm__lane-gain">
+                  <AppSlider
+                    :model-value="lane.gainDb"
+                    :min="MIN_GAIN_DB"
+                    :max="MAX_GAIN_DB"
+                    :step="0.5"
+                    :origin="0"
+                    :detents="[0]"
+                    subtle
+                    @start="startLaneGain"
+                    @update:model-value="onLaneGain(laneIndex, $event)"
+                    @end="endLaneGain"
+                  />
+                  <!-- Typed as well as dragged: a fader is for finding a level,
+                       and a number is for matching one exactly. -->
+                  <input
+                    class="mm__lane-db"
+                    type="text"
+                    inputmode="decimal"
+                    spellcheck="false"
+                    :value="gainText(lane)"
+                    :aria-label="`Level for ${lane.name}, in decibels`"
+                    :title="`Level for ${lane.name} in decibels, between ${MIN_GAIN_DB} and +${MAX_GAIN_DB}`"
+                    @focus="startGainEdit(laneIndex); ($event.target as HTMLInputElement).select()"
+                    @input="gainDraft = ($event.target as HTMLInputElement).value"
+                    @keydown.enter.prevent="($event.target as HTMLInputElement).blur()"
+                    @keydown.escape.prevent="cancelGainEdit(); ($event.target as HTMLInputElement).blur()"
+                    @blur="finishGainEdit(laneIndex)"
                   />
                 </div>
               </div>
-              <input
-                v-if="renamingLaneId === lane.id"
-                v-model="renameValue"
-                class="mm__lane-name mm__lane-name-input"
-                :data-lane-id="lane.id"
-                :aria-label="`Rename ${lane.name}`"
-                @keydown.enter.prevent="finishLaneRename(laneIndex); ($event.target as HTMLInputElement).blur()"
-                @keydown.escape.prevent="cancelLaneRename(); ($event.target as HTMLInputElement).blur()"
-                @blur="finishLaneRename(laneIndex)"
-              />
-              <span
-                v-else
-                class="mm__lane-name"
-                :title="`${lane.name} — double-click to rename`"
-                @dblclick="startLaneRename(laneIndex)"
-              >{{ lane.name || `Track ${laneIndex + 1}` }}</span>
-              <div class="mm__lane-buttons">
-                <button
-                  type="button"
-                  class="mm__ms"
-                  :class="{ 'is-on': lane.muted }"
-                  :aria-pressed="lane.muted"
-                  :title="`${lane.muted ? 'Unmute' : 'Mute'} ${lane.name}`"
-                  :aria-label="`${lane.muted ? 'Unmute' : 'Mute'} ${lane.name}`"
-                  @click="toggleMute(laneIndex)"
-                >
-                  M
-                </button>
-                <button
-                  type="button"
-                  class="mm__ms mm__ms--solo"
-                  :class="{ 'is-on': lane.soloed }"
-                  :aria-pressed="lane.soloed"
-                  :title="`${lane.soloed ? 'Unsolo' : 'Solo'} ${lane.name}`"
-                  :aria-label="`${lane.soloed ? 'Unsolo' : 'Solo'} ${lane.name}`"
-                  @click="toggleSolo(laneIndex)"
-                >
-                  S
-                </button>
-                <button
-                  type="button"
-                  class="mm__ms mm__ms--drop"
-                  :title="`Delete ${lane.name}`"
-                  @click="dropLane(laneIndex)"
-                >
-                  <PnmIcon name="close" :size="11" />
-                </button>
-              </div>
             </div>
 
-            <div class="mm__lane-track" :style="{ width: `${contentWidth}px` }">
+            <div
+              class="mm__lane-track"
+              :style="{ width: `${contentWidth}px` }"
+              @pointerdown.self="onLaneBackgroundDown"
+            >
               <MixBlockView
                 v-for="block in lane.blocks"
                 :key="block.id"
                 :block="block"
                 :entry="entryFor(block)"
                 :waveform="waveformFor(block)"
+                :speed="speedFor(block)"
                 :pixels-per-second="pps"
                 :height="laneHeight"
                 :selected="store.selected.has(block.id)"
@@ -979,6 +1600,7 @@ const summary = computed(() => {
                 :tool="store.tool"
                 @grab="onGrab($event, block.id)"
                 @automation="onAutomation($event, block.id)"
+                @open-mixer="store.select([block.id]); openBlockMixer()"
               />
             </div>
           </div>
@@ -995,8 +1617,28 @@ const summary = computed(() => {
           </div>
 
           <div
+            v-if="marqueeBox"
+            class="mm__marquee"
+            :style="{
+              left: `${marqueeBox.left}px`,
+              top: `${marqueeBox.top}px`,
+              width: `${marqueeBox.width}px`,
+              height: `${marqueeBox.height}px`,
+            }"
+            aria-hidden="true"
+          />
+
+          <div
+            v-if="snapLine !== null"
+            class="mm__snapline"
+            :class="{ 'is-locked': snapLocked }"
+            :style="{ left: `${HEADER_WIDTH + snapLine * pps}px` }"
+            aria-hidden="true"
+          />
+
+          <div
             class="mm__playhead"
-            :style="{ left: `${HEADER_WIDTH + store.playhead * pps}px` }"
+            :style="{ left: `${HEADER_WIDTH + renderPlayhead * pps}px` }"
             aria-hidden="true"
           />
         </div>
@@ -1005,14 +1647,18 @@ const summary = computed(() => {
       <p v-else class="mm__loading">Loading the arrangement…</p>
 
       <footer class="mm__footer">
-        <span v-if="store.tool === 'blade'">Click a block to split it. Press V for the pointer.</span>
+        <span v-if="store.tool === 'blade'">
+          Click a block to split it. With Snap on the cut lands on the nearest block
+          edge or the playhead; Alt inverts that. Press V for the pointer.
+        </span>
         <span v-else-if="store.tool === 'automation'">
           Click to add a keyframe, drag to move it, drag the midpoint to bend the curve. Double-click
           a point to remove it.
         </span>
         <span v-else>
-          Drag to move, drag an edge to trim, hold Alt to ignore snapping. Cmd/Ctrl+D duplicates.
-          Option+wheel changes track height. Drop MP3, FLAC or WAV to import.
+          Drag to move, drag an edge to trim, drag empty space to select. Alt inverts snapping,
+          arrows nudge, Cmd/Ctrl+D duplicates. Option+wheel changes track height. Drop MP3, FLAC
+          or WAV anywhere to import.
         </span>
       </footer>
     </section>
@@ -1020,6 +1666,29 @@ const summary = computed(() => {
       <AdvancedMixer v-if="blockMixerOpen" class="mm__block-mixer" />
     </Transition>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="colorLane"
+        ref="paletteEl"
+        class="mm__palette"
+        :class="{ 'is-flipped': colorLane.flip }"
+        role="menu"
+        aria-label="Track colours"
+        :style="{ left: `${colorLane.x}px`, top: `${colorLane.y}px` }"
+      >
+        <button
+          v-for="colorHue in COLOR_HUES"
+          :key="colorHue"
+          type="button"
+          class="mm__palette-color"
+          :class="{ 'is-selected': hueFor(colorLane.index) === colorHue }"
+          :style="{ background: `hsl(${colorHue} 60% 62%)` }"
+          :aria-label="`Use hue ${colorHue}`"
+          @click="setLaneColor(colorLane.index, colorHue)"
+        />
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -1036,8 +1705,10 @@ const summary = computed(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Keep interactive chrome clear of macOS's overlay traffic lights. */
-  padding: 44px 22px 22px 78px;
+  /* Even on every side, and as small as it can be: the modal is meant to fill
+     the window. The traffic lights are dealt with in the header, which is the
+     only part of this that has anything to click underneath them. */
+  padding: 20px;
   background: rgba(0, 0, 0, 0.4);
   backdrop-filter: blur(4px);
 }
@@ -1071,7 +1742,9 @@ const summary = computed(() => {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 14px;
+  /* On macOS the window's traffic lights are drawn over this corner, so the
+     title starts after them. `--overlay-controls` is zero everywhere else. */
+  padding: 12px 14px 12px calc(14px + var(--overlay-controls));
   border-bottom: 0.5px solid var(--separator);
 }
 
@@ -1230,10 +1903,17 @@ const summary = computed(() => {
   min-height: 100%;
 }
 
+/*
+ * Stacking inside the grid, low to high: blocks, the playhead, the lane
+ * headers, the ruler, the corner. The headers sit *above* the playhead
+ * deliberately — the playhead is positioned in grid coordinates, so once the
+ * timeline is scrolled right it would otherwise be drawn across the track
+ * names as if it were somewhere it is not.
+ */
 .mm__ruler-row {
   position: sticky;
   top: 0;
-  z-index: 3;
+  z-index: 7;
   display: flex;
   height: 26px;
   background: var(--bg-sunken);
@@ -1243,7 +1923,7 @@ const summary = computed(() => {
 .mm__corner {
   position: sticky;
   left: 0;
-  z-index: 4;
+  z-index: 8;
   flex: none;
   background: var(--bg-sunken);
   border-right: 0.5px solid var(--separator);
@@ -1268,6 +1948,27 @@ const summary = computed(() => {
   pointer-events: none;
 }
 
+.mm__tick--minor {
+  top: auto;
+  bottom: 0;
+  height: 6px;
+  border-left-color: var(--separator-strong);
+  opacity: 0.6;
+}
+
+/* The grab handle a timeline ruler has, so the playhead is something you can
+   see and take hold of rather than a hairline. */
+.mm__playhead-head {
+  position: absolute;
+  bottom: 0;
+  width: 9px;
+  height: 9px;
+  margin-left: -4px;
+  background: var(--accent);
+  clip-path: polygon(0 0, 100% 0, 50% 100%);
+  pointer-events: none;
+}
+
 .mm__lane {
   display: flex;
   border-bottom: 0.5px solid var(--separator);
@@ -1276,7 +1977,7 @@ const summary = computed(() => {
 .mm__lane-head {
   position: sticky;
   left: 0;
-  z-index: 2;
+  z-index: 6;
   flex: none;
   display: flex;
   align-items: center;
@@ -1286,23 +1987,19 @@ const summary = computed(() => {
   border-right: 0.5px solid var(--separator);
 }
 
-.mm__color-wrap {
-  position: relative;
-  flex: none;
-}
-
 .mm__lane-swatch {
+  flex: none;
   display: block;
   width: 7px;
   height: 32px;
   border-radius: 3px;
 }
 
+/* Above the modal's own scrim rather than inside the scrolling grid, which is
+   what stops later lanes painting over it. */
 .mm__palette {
-  position: absolute;
-  z-index: 8;
-  top: calc(100% + 5px);
-  left: 0;
+  position: fixed;
+  z-index: 620;
   display: grid;
   grid-template-columns: repeat(3, 18px);
   gap: 5px;
@@ -1311,6 +2008,11 @@ const summary = computed(() => {
   border-radius: var(--radius-sm);
   background: var(--bg-elevated);
   box-shadow: var(--shadow-popover);
+}
+
+/* Anchored by its bottom edge when there is no room below the swatch. */
+.mm__palette.is-flipped {
+  transform: translateY(-100%);
 }
 
 .mm__palette-color {
@@ -1323,6 +2025,52 @@ const summary = computed(() => {
 .mm__palette-color.is-selected {
   border-color: var(--text);
   box-shadow: 0 0 0 1px var(--bg-elevated), 0 0 0 2px var(--text);
+}
+
+.mm__lane-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mm__lane-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.mm__lane-gain {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mm__lane-db {
+  flex: none;
+  width: 36px;
+  padding: 1px 2px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  outline: none;
+  background: transparent;
+  text-align: right;
+  font: inherit;
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+
+.mm__lane-db:hover {
+  border-color: var(--separator-strong);
+  color: var(--text-secondary);
+}
+
+.mm__lane-db:focus {
+  border-color: var(--accent);
+  background: var(--bg);
+  color: var(--text);
 }
 
 .mm__lane-name {
@@ -1404,7 +2152,7 @@ const summary = computed(() => {
 .mm__add-lane {
   position: sticky;
   left: 0;
-  z-index: 2;
+  z-index: 6;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1431,6 +2179,57 @@ const summary = computed(() => {
   z-index: 5;
   background: var(--accent);
   pointer-events: none;
+}
+
+/* Distinct from the playhead, which is the other vertical line here: the
+   second accent, and dashed while it is only following the cursor. Solid means
+   it has locked on to an edge, the playhead or a ruler mark. */
+.mm__snapline {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  z-index: 5;
+  border-left: 1px dashed var(--accent-secondary);
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.mm__snapline.is-locked {
+  border-left-style: solid;
+  opacity: 1;
+}
+
+.mm__marquee {
+  position: absolute;
+  z-index: 4;
+  border: 1px solid var(--accent);
+  background: var(--accent-tint);
+  pointer-events: none;
+}
+
+.mm__toggle {
+  padding: 3px 9px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.mm__toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.mm__toggle:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mm__toggle.is-on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
 }
 
 .mm__loading {
@@ -1479,8 +2278,7 @@ const summary = computed(() => {
 
 @media (max-width: 760px) {
   .mm-scrim {
-    padding-right: 10px;
-    padding-bottom: 10px;
+    padding: 10px;
   }
 
   .mm__header {
