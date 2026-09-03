@@ -19,6 +19,7 @@ pub struct MixerSettings {
     /// Name of the preset this layer was loaded from, for UI display only.
     pub preset: Option<String>,
     pub pitch: Option<Pitch>,
+    pub panning: Option<Panning>,
     pub eq: Option<Eq>,
     pub reverb: Option<Reverb>,
     pub delay: Option<Delay>,
@@ -44,6 +45,7 @@ impl MixerSettings {
             enabled: over.enabled.or(self.enabled),
             preset: over.preset.clone().or_else(|| self.preset.clone()),
             pitch: over.pitch.clone().or_else(|| self.pitch.clone()),
+            panning: over.panning.clone().or_else(|| self.panning.clone()),
             eq: over.eq.clone().or_else(|| self.eq.clone()),
             reverb: over.reverb.clone().or_else(|| self.reverb.clone()),
             delay: over.delay.clone().or_else(|| self.delay.clone()),
@@ -76,6 +78,7 @@ impl MixerSettings {
         Resolved {
             enabled: on,
             pitch: merged.pitch.unwrap_or_default(),
+            panning: merged.panning.unwrap_or_default(),
             eq: merged.eq.unwrap_or_default(),
             reverb: merged.reverb.unwrap_or_default(),
             delay: merged.delay.unwrap_or_default(),
@@ -111,6 +114,35 @@ impl Pitch {
     pub fn ratio(&self) -> f64 {
         let semis = self.semitones as f64 + self.cents as f64 / 100.0;
         (2.0f64).powf(semis / 12.0).clamp(0.25, 4.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PanningMode {
+    MonoPan,
+    #[default]
+    StereoBalance,
+    TrueStereo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Panning {
+    pub mode: PanningMode,
+    /// Pan or stereo centre, clamped to -1..1 by the DSP.
+    pub position: f32,
+    /// Half-width for true-stereo mode, clamped to 0..1 by the DSP.
+    pub width: f32,
+}
+
+impl Default for Panning {
+    fn default() -> Self {
+        Panning {
+            mode: PanningMode::StereoBalance,
+            position: 0.0,
+            width: 1.0,
+        }
     }
 }
 
@@ -341,6 +373,7 @@ impl Default for Filter {
 pub struct Resolved {
     pub enabled: bool,
     pub pitch: Pitch,
+    pub panning: Panning,
     pub eq: Eq,
     pub reverb: Reverb,
     pub delay: Delay,
@@ -399,6 +432,7 @@ mod tests {
         let r = MixerSettings::resolve(&[&MixerSettings::default()]);
         assert!(r.enabled);
         assert_eq!(r.pitch.ratio(), 1.0);
+        assert_eq!(r.panning, Panning::default());
         assert_eq!(r.eq.bands.len(), 8);
         assert_eq!(r.crossfade, CrossfadeSettings::default());
     }
@@ -419,6 +453,36 @@ mod tests {
         }
         // Every other band is flat, so the default chain is transparent.
         assert!(bands.iter().filter(|b| b.enabled).all(|b| b.gain_db == 0.0));
+    }
+
+    #[test]
+    fn panning_is_backward_compatible_and_cascades_as_a_section() {
+        let legacy: MixerSettings = serde_json::from_str(r#"{"eq":{"enabled":false}}"#).unwrap();
+        assert_eq!(
+            MixerSettings::resolve(&[&legacy]).panning,
+            Panning::default()
+        );
+
+        let global = MixerSettings {
+            panning: Some(Panning {
+                mode: PanningMode::MonoPan,
+                position: -0.5,
+                width: 1.0,
+            }),
+            ..Default::default()
+        };
+        let track = MixerSettings {
+            panning: Some(Panning {
+                mode: PanningMode::TrueStereo,
+                position: 0.25,
+                width: 0.4,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            MixerSettings::resolve(&[&global, &track]).panning,
+            track.panning.unwrap()
+        );
     }
 
     #[test]

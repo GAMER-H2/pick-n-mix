@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
-import QueueList from "../QueueList.vue";
+import QueueList from "../media/QueueList.vue";
 import type { Track } from "@/lib/types";
 
 function track(id: string, title: string): Track {
@@ -45,7 +45,7 @@ function mountList(
 ) {
   return mount(QueueList, {
     props: {
-      items: [track("t1", "One")],
+      items: [{ kind: "track", track: track("t1", "One") }],
       currentIndex: null,
       ...props,
     },
@@ -86,7 +86,7 @@ describe("QueueList", () => {
   });
 
   it("renders removed rows as disabled while still allowing removal", async () => {
-    const wrapper = mountList({ items: [null], removeLabel: "Remove from history" });
+    const wrapper = mountList({ items: [{ kind: "track", track: null }], removeLabel: "Remove from history" });
     const row = wrapper.get(".row");
 
     expect(row.get(".row__title").text()).toBe("Removed track");
@@ -119,5 +119,67 @@ describe("QueueList", () => {
     expect(wrapper.get(".row__subtitle").text()).toBe("0:Artist");
     expect(wrapper.get(".row").text()).toContain("FLAC:0");
     expect(wrapper.find(".row__duration").exists()).toBe(false);
+  });
+});
+
+/**
+ * A mix in the queue is one block. Its songs are listed but are not rows: no
+ * grip, no drop target between them, and clicking one jumps to that point in
+ * the arrangement rather than to an entry of its own.
+ */
+describe("QueueList with a master mix in it", () => {
+  const mix = {
+    playlistId: "pl_1",
+    name: "Evening",
+    artwork: null,
+    artworkIds: [],
+    durationSecs: 600,
+    chapters: [
+      { startSecs: 0, title: "One", artist: "A" },
+      { startSecs: 300, title: "Two", artist: "B" },
+    ],
+  };
+
+  function mountWithMix(currentIndex: number | null, positionSecs = 0) {
+    return mount(QueueList, {
+      props: {
+        items: [
+          { kind: "mix", mix } as const,
+          { kind: "track", track: track("t1", "After") } as const,
+        ],
+        currentIndex,
+        positionSecs,
+      },
+      global: { stubs: { Artwork: true, PlaylistArtwork: true, PnmIcon: true } },
+    });
+  }
+
+  it("draws the mix as one block with its songs inside", () => {
+    const wrapper = mountWithMix(0);
+    expect(wrapper.findAll(".mix-block")).toHaveLength(1);
+    expect(wrapper.findAll(".mix-block__chapter")).toHaveLength(2);
+    // One grip for the whole mix, one for the song queued after it: none on
+    // the chapters, which cannot be reordered.
+    expect(wrapper.findAll(".row__grip")).toHaveLength(2);
+    expect(wrapper.text()).toContain("Master mix · 2 songs");
+  });
+
+  it("marks the song the mix has reached", () => {
+    const wrapper = mountWithMix(0, 320);
+    const chapters = wrapper.findAll(".mix-block__chapter");
+    expect(chapters[0].classes()).not.toContain("is-current");
+    expect(chapters[1].classes()).toContain("is-current");
+  });
+
+  it("marks nothing when the mix is not the entry playing", () => {
+    const wrapper = mountWithMix(1, 320);
+    const marked = wrapper.findAll(".mix-block__chapter.is-current");
+    expect(marked).toHaveLength(0);
+  });
+
+  it("asks to play the mix from a song's own position", async () => {
+    const wrapper = mountWithMix(0);
+    await wrapper.findAll(".mix-block__chapter")[1].trigger("click");
+    expect(wrapper.emitted("play")).toEqual([[0, 300]]);
   });
 });

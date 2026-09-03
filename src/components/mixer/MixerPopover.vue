@@ -6,8 +6,8 @@
  */
 import { computed } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
-import AppSlider from "../AppSlider.vue";
-import AppToggle from "../AppToggle.vue";
+import AppSlider from "../ui/AppSlider.vue";
+import AppToggle from "../ui/AppToggle.vue";
 import EqSliders from "./EqSliders.vue";
 import PresetSelect from "./PresetSelect.vue";
 import FilterGrid from "./FilterGrid.vue";
@@ -69,7 +69,7 @@ function openAdvanced() {
   <div class="popover" role="dialog" aria-label="DJ Mixer">
     <header class="popover__head">
       <div>
-        <div class="popover__title">DJ Mixer</div>
+        <p class="eyebrow">DJ Mixer</p>
         <div class="popover__target truncate">{{ mixer.targetLabel }}</div>
       </div>
       <button class="popover__advanced" @click="openAdvanced">
@@ -137,14 +137,10 @@ function openAdvanced() {
   gap: 10px;
 }
 
-.popover__title {
-  font-size: 15px;
-  font-weight: 600;
-}
-
 .popover__target {
-  font-size: 11px;
-  color: var(--text-tertiary);
+  margin-top: 2px;
+  font-size: 13px;
+  font-weight: 600;
   max-width: 170px;
 }
 

@@ -1,8 +1,8 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as api from "@/lib/api";
-import { DEFAULTS, clone, resolve, type Section } from "@/lib/mixer";
-import type { FilterInfo, MixerSettings, Preset, ResolvedMixer } from "@/lib/types";
+import { DEFAULTS, clone, pitchRatio, resolve, type Section } from "@/lib/mixer";
+import type { Eq, FilterInfo, MixerSettings, Preset, ResolvedMixer } from "@/lib/types";
 
 /**
  * Which layer of the cascade the mixer UI is editing.
@@ -14,7 +14,9 @@ export type Target =
   | { kind: "global" }
   | { kind: "playlist"; id: string; name: string }
   /** One entry of one playlist. `index` addresses it inside the file. */
-  | { kind: "entry"; playlistId: string; index: number; name: string };
+  | { kind: "entry"; playlistId: string; index: number; name: string }
+  /** One audio block on a playlist's master mix timeline. */
+  | { kind: "block"; playlistId: string; blockId: string; name: string };
 
 export const useMixerStore = defineStore("mixer", () => {
   const global = ref<MixerSettings>({});
@@ -42,6 +44,8 @@ export const useMixerStore = defineStore("mixer", () => {
       case "playlist":
         return target.value.name;
       case "entry":
+        return target.value.name;
+      case "block":
         return target.value.name;
     }
   });
@@ -88,11 +92,25 @@ export const useMixerStore = defineStore("mixer", () => {
     underlyingLayers.value = [];
   }
 
-  async function editPlaylist(id: string, name: string, mixer: MixerSettings | null) {
+  /**
+   * Edit a playlist's own layer.
+   *
+   * `ignoresGlobal` is set for a playlist that plays as a master mix: those
+   * ignore the global mixer outright — see `build_plan` in `commands.rs` — so
+   * showing global settings underneath would describe a sound nobody will
+   * hear. The layer is kept in place but empty, so the sections still line up
+   * with what the resolver expects of a cascade.
+   */
+  async function editPlaylist(
+    id: string,
+    name: string,
+    mixer: MixerSettings | null,
+    ignoresGlobal = false,
+  ) {
     await refresh();
     target.value = { kind: "playlist", id, name };
     targetLayer.value = mixer ? clone(mixer) : {};
-    underlyingLayers.value = [global.value];
+    underlyingLayers.value = [ignoresGlobal ? {} : global.value];
   }
 
   /**
@@ -112,6 +130,27 @@ export const useMixerStore = defineStore("mixer", () => {
     // Keep an explicit empty playlist layer so the frontend resolver can
     // consistently exclude the entry layer from crossfade resolution.
     underlyingLayers.value = [global.value, playlistMixer ?? {}];
+  }
+
+  /**
+   * Effects for one block on the master mix, layered over the playlist alone.
+   *
+   * A mix ignores the global mixer entirely, so the empty layer where global
+   * would sit is not an oversight: it keeps the cascade the same shape as
+   * everywhere else while making sure nothing set on the DJ mixer downstairs
+   * shows up in — or is heard through — an arrangement.
+   */
+  async function editMixBlock(
+    playlistId: string,
+    blockId: string,
+    name: string,
+    mixer: MixerSettings | null,
+    playlistMixer: MixerSettings | null = null,
+  ) {
+    await refresh();
+    target.value = { kind: "block", playlistId, blockId, name };
+    targetLayer.value = mixer ? clone(mixer) : {};
+    underlyingLayers.value = [{}, playlistMixer ?? {}];
   }
 
   /** Write a whole section into the layer being edited, then persist. */
@@ -159,6 +198,18 @@ export const useMixerStore = defineStore("mixer", () => {
           Object.keys(layer).length ? layer : null,
         );
         break;
+      case "block": {
+        const { useMasterMixStore } = await import("./masterMix");
+        // The resolved speed goes with the write: the timeline needs it to
+        // resize the region, and only the cascade here knows what the pitch
+        // settled to once the layers underneath are taken into account.
+        useMasterMixStore().setBlockMixer(
+          target.value.blockId,
+          Object.keys(layer).length ? layer : null,
+          effective.value.enabled ? pitchRatio(effective.value.pitch) : 1,
+        );
+        break;
+      }
     }
   }
 
@@ -167,13 +218,17 @@ export const useMixerStore = defineStore("mixer", () => {
     const settings = clone(preset.settings);
     // A crossfade spans playlist entries, so an entry preset may not introduce
     // one even if that preset carries a crossfade setting.
-    if (target.value.kind === "entry") delete settings.crossfade;
+    if (target.value.kind === "entry" || target.value.kind === "block") delete settings.crossfade;
     targetLayer.value = { ...targetLayer.value, ...settings, preset: preset.name };
     await persist();
   }
 
   async function saveAsPreset(name: string) {
-    presets.value = await api.savePreset(name, clone(targetLayer.value));
+    presets.value = await api.savePreset(name, clone(targetLayer.value), "mixer");
+  }
+
+  async function saveEqPreset(name: string, eq: Eq) {
+    presets.value = await api.savePreset(name, { eq: clone(eq) }, "eq");
   }
 
   async function removePreset(id: string) {
@@ -217,12 +272,14 @@ export const useMixerStore = defineStore("mixer", () => {
     editGlobal,
     editPlaylist,
     editPlaylistEntry,
+    editMixBlock,
     setSection,
     clearSection,
     setEnabled,
     resetLayer,
     applyPreset,
     saveAsPreset,
+    saveEqPreset,
     removePreset,
     toggleFilter,
     setFilterVolume,

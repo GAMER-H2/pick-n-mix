@@ -132,8 +132,10 @@ of the processed output.
 
 Drag a node to move it (horizontally for frequency, vertically for gain),
 scroll over it to change Q, and double-click it to flatten it. Bands can be
-added up to twelve, removed, and switched between all five filter types. Like
-every other section, it edits whichever layer the panel is pointed at.
+added up to twelve, removed, and switched between all five filter types. Built-in
+EQ curves can be applied from the graph, and custom curves can be saved there or
+managed under **Settings → Mixer**. Like every other section, the EQ edits
+whichever layer the panel is pointed at.
 
 The two pass filters start disabled: unlike a shelf or a peak, a pass filter
 has no flat setting, so an enabled one would colour every mix by default.

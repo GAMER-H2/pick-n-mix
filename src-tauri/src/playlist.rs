@@ -20,6 +20,7 @@ use serde_json::{Map, Value};
 use crate::audio::params::MixerSettings;
 use crate::library::db::Db;
 use crate::library::model::{normalise, stable_id, Track};
+use crate::master_mix::MasterMix;
 
 /// Marker so a stray `.json` is not mistaken for a playlist.
 pub const FORMAT_TAG: &str = "pick-n-mix.playlist";
@@ -46,6 +47,9 @@ pub struct Playlist {
     pub shuffle_only: bool,
     /// Mixer override applied to everything played from this playlist.
     pub mixer: Option<MixerSettings>,
+    /// The hand-built timeline, once the user has opened the master mixer.
+    /// `None` means this playlist has never had one and plays as a plain list.
+    pub master_mix: Option<MasterMix>,
     pub tracks: Vec<Entry>,
     /// Anything a newer version wrote, preserved verbatim.
     #[serde(flatten)]
@@ -66,6 +70,7 @@ impl Default for Playlist {
             updated_at: now,
             shuffle_only: false,
             mixer: None,
+            master_mix: None,
             tracks: Vec::new(),
             extra: Map::new(),
         }
@@ -115,6 +120,36 @@ impl Entry {
 }
 
 /// A playlist joined against the local library, ready for the UI.
+/// One entry, matched against this library.
+///
+/// The stored path is tried first as a fast path, then musical identity. Kept
+/// out of [`Playlist::resolve`] so that [`Playlist::covers`] can use the same
+/// rules without resolving a whole playlist to answer a question about four
+/// of its songs.
+fn resolve_entry(db: &Db, entry: &Entry) -> Result<Option<Track>> {
+    let by_path = if let Some(path) = entry.local_path.as_deref() {
+        let direct = match db.file_by_location("local", path)? {
+            Some(file) => db.get_track(&file.song_id)?,
+            None => None,
+        };
+        direct
+            .or(db.get_track(&stable_id("t", path))?)
+            .filter(|track| normalise(&track.album) == normalise(&entry.album))
+    } else {
+        None
+    };
+
+    match by_path {
+        Some(track) => Ok(Some(track)),
+        None => db.resolve(
+            entry.musicbrainz_recording_id.as_deref(),
+            &entry.artist,
+            &entry.title,
+            &entry.album,
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Resolved {
@@ -174,39 +209,125 @@ impl Playlist {
         Ok(())
     }
 
+    /// Add a song to the end of the list.
+    ///
+    /// If a master mix already exists, the new song also becomes a lane at the
+    /// end of the timeline — the brief's rule that adding to a mixed playlist
+    /// extends the mix rather than disturbing the arrangement already built.
     pub fn add_track(&mut self, track: &Track) {
+        let index = self.tracks.len();
         self.tracks.push(Entry::from_track(track));
+        if let Some(mix) = self.master_mix.as_mut() {
+            mix.append_entry(index, &track.title, track.duration_secs);
+        }
+    }
+
+    /// Remove an entry, keeping any master mix pointing at the right songs.
+    pub fn remove_entry(&mut self, index: usize) -> bool {
+        if index >= self.tracks.len() {
+            return false;
+        }
+        self.tracks.remove(index);
+        if let Some(mix) = self.master_mix.as_mut() {
+            mix.entry_removed(index);
+        }
+        true
+    }
+
+    /// Reorder, keeping any master mix pointing at the right songs.
+    pub fn move_entry(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.tracks.len() || to >= self.tracks.len() {
+            return false;
+        }
+        let entry = self.tracks.remove(from);
+        self.tracks.insert(to, entry);
+        if let Some(mix) = self.master_mix.as_mut() {
+            mix.entry_moved(from, to);
+        }
+        true
+    }
+
+    /// The mix as it should be played, building the default arrangement the
+    /// first time the master mixer is opened.
+    ///
+    /// Durations come from the local library where a song resolves, and fall
+    /// back to the duration the playlist file recorded, so a shared playlist
+    /// still lays out sensibly before every song has been matched.
+    pub fn master_mix_or_default(&self, db: &Db) -> Result<MasterMix> {
+        if let Some(existing) = self.master_mix.as_ref() {
+            return Ok(existing.clone());
+        }
+        let resolved = self.clone().resolve(db)?;
+        let titles: Vec<String> = resolved
+            .items
+            .iter()
+            .map(|item| {
+                item.track
+                    .as_ref()
+                    .map(|t| t.title.clone())
+                    .unwrap_or_else(|| item.entry.title.clone())
+            })
+            .collect();
+        let durations: Vec<f64> = resolved
+            .items
+            .iter()
+            .map(|item| {
+                item.track
+                    .as_ref()
+                    .map(|t| t.duration_secs)
+                    .filter(|d| *d > 0.0)
+                    .unwrap_or(item.entry.duration_secs)
+            })
+            .collect();
+        Ok(MasterMix::build(&titles, &durations))
+    }
+
+    /// Where this playlist's imported audio lives: a folder beside the file,
+    /// named after it. Kept next to the playlist rather than in a shared cache
+    /// so the pair can be copied or shared together.
+    pub fn assets_dir(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("playlist");
+        path.with_file_name(format!("{stem}.assets"))
     }
 
     /// Join every entry against the library.
+    /// Up to `limit` different covers, taken from the front of the playlist.
+    ///
+    /// What a playlist without a picture of its own is drawn as. Entries are
+    /// resolved one at a time and the walk stops as soon as there are enough,
+    /// so the common case costs four lookups rather than one per song — this
+    /// is called for every playlist in the sidebar's list.
+    ///
+    /// The scan is bounded as well: a long playlist of songs nobody here owns
+    /// must not turn a cheap listing into a full resolve.
+    pub fn covers(&self, db: &Db, limit: usize) -> Vec<String> {
+        const SCAN: usize = 40;
+        let mut out: Vec<String> = Vec::new();
+        for entry in self.tracks.iter().take(SCAN) {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok(Some(track)) = resolve_entry(db, entry) else {
+                continue;
+            };
+            if let Some(id) = track.artwork_id {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    }
+
     pub fn resolve(self, db: &Db) -> Result<Resolved> {
         let mut items = Vec::with_capacity(self.tracks.len());
         let mut missing = 0;
 
         for (index, entry) in self.tracks.iter().enumerate() {
-            // The stored path is tried first as a fast path, then we fall back
-            // to matching on musical identity.
-            let by_path = if let Some(path) = entry.local_path.as_deref() {
-                let direct = match db.file_by_location("local", path)? {
-                    Some(file) => db.get_track(&file.song_id)?,
-                    None => None,
-                };
-                direct
-                    .or(db.get_track(&stable_id("t", path))?)
-                    .filter(|track| normalise(&track.album) == normalise(&entry.album))
-            } else {
-                None
-            };
-
-            let track = match by_path {
-                Some(t) => Some(t),
-                None => db.resolve(
-                    entry.musicbrainz_recording_id.as_deref(),
-                    &entry.artist,
-                    &entry.title,
-                    &entry.album,
-                )?,
-            };
+            let track = resolve_entry(db, entry)?;
 
             if track.is_none() {
                 missing += 1;

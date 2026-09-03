@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import FilterGrid from "../FilterGrid.vue";
-import AppKnob from "@/components/AppKnob.vue";
+import AppKnob from "@/components/ui/AppKnob.vue";
 import { useMixerStore } from "@/stores/mixer";
 
 const activeSettings = [
@@ -29,7 +29,17 @@ describe("FilterGrid", () => {
     expect(wrapper.find("[aria-label='Custom Wind volume']").exists()).toBe(true);
 
     const knobs = wrapper.findAllComponents(AppKnob);
+    expect(knobs[0].get(".knob__label").text()).toBe("Rain");
+    expect(knobs[0].get(".knob__value").text()).toBe("35%");
+    expect(knobs.every((knob) => knob.props("size") === 34)).toBe(true);
     await knobs[0].vm.$emit("update:modelValue", 0.75);
     expect(wrapper.emitted("volume")).toEqual([["rain", 0.75]]);
+  });
+
+  it("hides the volume row when no atmosphere is active", () => {
+    const wrapper = mount(FilterGrid, { props: { settings: [] } });
+
+    expect(wrapper.find("[aria-label='Atmosphere volumes']").exists()).toBe(false);
+    expect(wrapper.findAllComponents(AppKnob)).toHaveLength(0);
   });
 });

@@ -11,10 +11,18 @@ use serde::{Deserialize, Serialize};
 use crate::audio::{
     crossfade::{CrossfadeCurve, CrossfadeSettings},
     params::{
-        default_bands, BandKind, Delay, Eq, EqBand, Lofi, MixerSettings, Normalisation, Pitch,
-        Reverb,
+        default_bands, BandKind, Delay, Eq, EqBand, Lofi, MixerSettings, Normalisation, Panning,
+        Pitch, Reverb,
     },
 };
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PresetKind {
+    #[default]
+    Mixer,
+    Eq,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -23,6 +31,7 @@ pub struct Preset {
     pub name: String,
     /// Built-ins cannot be deleted or overwritten.
     pub built_in: bool,
+    pub kind: PresetKind,
     pub settings: MixerSettings,
 }
 
@@ -32,6 +41,7 @@ impl Default for Preset {
             id: String::new(),
             name: "Untitled".into(),
             built_in: false,
+            kind: PresetKind::default(),
             settings: MixerSettings::default(),
         }
     }
@@ -48,6 +58,7 @@ impl<'de> Deserialize<'de> for Preset {
             id: String,
             name: String,
             built_in: bool,
+            kind: PresetKind,
             settings: MixerSettings,
             // Read the legacy location once, but only write `settings.crossfade`.
             crossfade: Option<CrossfadeSettings>,
@@ -62,6 +73,7 @@ impl<'de> Deserialize<'de> for Preset {
             id: stored.id,
             name: stored.name,
             built_in: stored.built_in,
+            kind: stored.kind,
             settings,
         })
     }
@@ -89,10 +101,12 @@ pub fn built_ins() -> Vec<Preset> {
             id: "flat".into(),
             name: "Flat".into(),
             built_in: true,
+            kind: PresetKind::Mixer,
             settings: MixerSettings {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings::default()),
                 pitch: Some(Pitch::default()),
+                panning: Some(Panning::default()),
                 eq: Some(Eq::default()),
                 reverb: Some(Reverb::default()),
                 delay: Some(Delay::default()),
@@ -106,6 +120,7 @@ pub fn built_ins() -> Vec<Preset> {
             id: "lofi-study".into(),
             name: "Lo-Fi Study".into(),
             built_in: true,
+            kind: PresetKind::Mixer,
             settings: MixerSettings {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings {
@@ -143,6 +158,7 @@ pub fn built_ins() -> Vec<Preset> {
             id: "chopped".into(),
             name: "Chopped & Screwed".into(),
             built_in: true,
+            kind: PresetKind::Mixer,
             settings: MixerSettings {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings::default()),
@@ -166,6 +182,7 @@ pub fn built_ins() -> Vec<Preset> {
             id: "nightcore".into(),
             name: "Nightcore".into(),
             built_in: true,
+            kind: PresetKind::Mixer,
             settings: MixerSettings {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings::default()),
@@ -181,6 +198,7 @@ pub fn built_ins() -> Vec<Preset> {
             id: "club".into(),
             name: "Club".into(),
             built_in: true,
+            kind: PresetKind::Mixer,
             settings: MixerSettings {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings::default()),
@@ -198,6 +216,7 @@ pub fn built_ins() -> Vec<Preset> {
             id: "vocal".into(),
             name: "Vocal Boost".into(),
             built_in: true,
+            kind: PresetKind::Mixer,
             settings: MixerSettings {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings::default()),
@@ -249,6 +268,7 @@ pub fn built_ins() -> Vec<Preset> {
             id: "cathedral".into(),
             name: "Cathedral".into(),
             built_in: true,
+            kind: PresetKind::Mixer,
             settings: MixerSettings {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings::default()),
@@ -268,6 +288,7 @@ pub fn built_ins() -> Vec<Preset> {
             id: "tape-echo".into(),
             name: "Tape Echo".into(),
             built_in: true,
+            kind: PresetKind::Mixer,
             settings: MixerSettings {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings::default()),
@@ -286,6 +307,7 @@ pub fn built_ins() -> Vec<Preset> {
             id: "am-radio".into(),
             name: "AM Radio".into(),
             built_in: true,
+            kind: PresetKind::Mixer,
             settings: MixerSettings {
                 enabled: Some(true),
                 crossfade: Some(CrossfadeSettings::default()),
@@ -364,12 +386,30 @@ pub fn save_user(path: &Path, presets: &[Preset]) -> Result<()> {
     Ok(())
 }
 
-/// Add or replace a user preset by name.
-pub fn upsert(path: &Path, name: &str, mut settings: MixerSettings) -> Result<Vec<Preset>> {
+/// Add or replace a mixer preset by name.
+pub fn upsert(path: &Path, name: &str, settings: MixerSettings) -> Result<Vec<Preset>> {
+    upsert_with_kind(path, name, PresetKind::Mixer, settings)
+}
+
+/// Add or replace a user preset by category and name.
+pub fn upsert_with_kind(
+    path: &Path,
+    name: &str,
+    kind: PresetKind,
+    mut settings: MixerSettings,
+) -> Result<Vec<Preset>> {
     settings.preset = None;
     let mut user = load_user(path);
-    let id = crate::library::model::stable_id("ps", &crate::library::model::normalise(name));
-    match user.iter_mut().find(|p| p.id == id) {
+    let normalised_name = crate::library::model::normalise(name);
+    let id = match kind {
+        // Preserve the historical mixer ID so existing presets update in place.
+        PresetKind::Mixer => crate::library::model::stable_id("ps", &normalised_name),
+        PresetKind::Eq => crate::library::model::stable_id("ps", &format!("eq:{normalised_name}")),
+    };
+    match user
+        .iter_mut()
+        .find(|preset| preset.kind == kind && preset.id == id)
+    {
         Some(existing) => {
             existing.name = name.to_string();
             existing.settings = settings;
@@ -378,6 +418,7 @@ pub fn upsert(path: &Path, name: &str, mut settings: MixerSettings) -> Result<Ve
             id,
             name: name.to_string(),
             built_in: false,
+            kind,
             settings,
         }),
     }
@@ -446,6 +487,7 @@ mod tests {
         let all = built_ins();
         assert!(all.len() >= 8);
         assert!(all.iter().all(|p| p.built_in));
+        assert!(all.iter().all(|p| p.kind == PresetKind::Mixer));
         assert!(all.iter().any(|p| p.name == "Lo-Fi Study"));
     }
 
@@ -508,6 +550,10 @@ mod tests {
                 ..Default::default()
             }),
             crossfade: Some(crossfade.clone()),
+            panning: Some(Panning {
+                position: 0.35,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         upsert(&path, "My Mix", settings).unwrap();
@@ -518,6 +564,25 @@ mod tests {
         assert_eq!(mine.settings.preset, None);
         assert_eq!(mine.settings.reverb.as_ref().unwrap().mix, 0.66);
         assert_eq!(mine.settings.crossfade, Some(crossfade));
+        assert_eq!(mine.settings.panning.as_ref().unwrap().position, 0.35);
+    }
+
+    #[test]
+    fn legacy_preset_without_kind_defaults_to_mixer() {
+        let preset: Preset = serde_json::from_str(
+            r#"{"id":"legacy","name":"Legacy","builtIn":false,"settings":{}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(preset.kind, PresetKind::Mixer);
+        assert_eq!(
+            MixerSettings::resolve(&[&preset.settings]).panning,
+            Panning::default()
+        );
+        assert_eq!(
+            serde_json::to_value(&preset).unwrap()["kind"],
+            serde_json::json!("mixer")
+        );
     }
 
     #[test]
@@ -557,9 +622,37 @@ mod tests {
     }
 
     #[test]
+    fn same_name_mixer_and_eq_presets_coexist() {
+        let path = tempfile();
+        let mixer_id = crate::library::model::stable_id("ps", "shared name");
+
+        upsert(&path, "Shared Name", MixerSettings::default()).unwrap();
+        let all = upsert_with_kind(
+            &path,
+            "Shared Name",
+            PresetKind::Eq,
+            MixerSettings::default(),
+        )
+        .unwrap();
+        let matching: Vec<&Preset> = all
+            .iter()
+            .filter(|preset| preset.name == "Shared Name")
+            .collect();
+
+        assert_eq!(matching.len(), 2);
+        assert!(matching
+            .iter()
+            .any(|preset| { preset.kind == PresetKind::Mixer && preset.id == mixer_id }));
+        assert!(matching
+            .iter()
+            .any(|preset| { preset.kind == PresetKind::Eq && preset.id != mixer_id }));
+    }
+
+    #[test]
     fn updating_a_user_preset_preserves_its_id_and_replaces_its_contents() {
         let path = tempfile();
-        let created = upsert(&path, "Original", MixerSettings::default()).unwrap();
+        let created =
+            upsert_with_kind(&path, "Original", PresetKind::Eq, MixerSettings::default()).unwrap();
         let id = created
             .iter()
             .find(|preset| preset.name == "Original")
@@ -585,6 +678,7 @@ mod tests {
         let renamed = updated.iter().find(|preset| preset.id == id).unwrap();
 
         assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.kind, PresetKind::Eq);
         assert_eq!(renamed.settings.preset, None);
         assert_eq!(renamed.settings.reverb.as_ref().unwrap().mix, 0.42);
         assert!(!updated.iter().any(|preset| preset.name == "Original"));

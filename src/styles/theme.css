@@ -27,6 +27,14 @@
   --shadow-popover: 0 10px 40px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.1);
   --shadow-art: 0 4px 18px rgba(0, 0, 0, 0.16);
 
+  /* Layering scale. Never write a bare z-index; add a token if a new layer
+     is genuinely needed. See docs/ui-design-system.md §2. */
+  --z-panel: 300;
+  --z-modal: 520;
+  --z-modal-top: 530;
+  --z-context: 540;
+  --z-popover: 600;
+
   --sidebar-width: 244px;
   --player-height: 78px;
   --mixer-width: 336px;
@@ -40,12 +48,22 @@
      that use these are inert there. */
   --titlebar-height: 0px;
   --titlebar-controls: 0px;
+  /* The other case: macOS draws its traffic lights *over* the top-left of the
+     window, above the webview and outside its control. Anything the user has
+     to click there needs to start after this. Zero everywhere else. */
+  --overlay-controls: 0px;
 }
 
 /* Set once, in `App.vue`, once the window is confirmed undecorated. */
 html.is-custom-titlebar {
   --titlebar-height: 30px;
   --titlebar-controls: 90px;
+}
+
+/* Also set in `App.vue`, for the macOS overlay title bar. Mutually exclusive
+   with the rule above: a window cannot have both. */
+html.is-mac-overlay {
+  --overlay-controls: 68px;
 }
 
 /* Light */
@@ -192,6 +210,13 @@ textarea {
   transform: scale(0.97);
 }
 
+/* Matching `.icon-button:disabled`: a header button with nothing to act on
+   should look as unavailable as it is. */
+.pill-button:disabled {
+  opacity: 0.32;
+  pointer-events: none;
+}
+
 .pill-button.is-secondary {
   background: var(--accent-tint);
   color: var(--accent);
@@ -233,6 +258,21 @@ textarea {
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--text-tertiary);
+}
+
+/*
+ * The small-caps accent label above a surface's title — the shared pattern for
+ * naming which surface you are looking at (Settings, DJ Mixer, Advanced DJ
+ * Mixer, Equaliser, Master Mixer). The title under it says what the surface is
+ * acting on. See docs/ui-design-system.md §6.
+ */
+.eyebrow {
+  margin: 0;
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .truncate {

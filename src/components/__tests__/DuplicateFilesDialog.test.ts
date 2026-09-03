@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
-import DuplicateFilesDialog from "../DuplicateFilesDialog.vue";
+import DuplicateFilesDialog from "../dialogs/DuplicateFilesDialog.vue";
 import type { Track, TrackFile } from "@/lib/types";
 import { useLibraryStore } from "@/stores/library";
 import { useUiStore } from "@/stores/ui";
@@ -115,7 +115,10 @@ async function settle() {
 
 async function mountDialog(currentSong: Track, files: TrackFile[]): Promise<VueWrapper> {
   listTrackFiles.mockResolvedValueOnce(files);
-  const wrapper = mount(DuplicateFilesDialog);
+  const wrapper = mount(DuplicateFilesDialog, {
+    // BaseModal teleports to <body>; render it inline so queries reach the dialog.
+    global: { stubs: { teleport: true } },
+  });
   useUiStore().duplicateTrack = currentSong;
   await settle();
   return wrapper;

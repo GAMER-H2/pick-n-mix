@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import AppToggle from "../AppToggle.vue";
-import QueueList from "../QueueList.vue";
-import SelectMenu from "../SelectMenu.vue";
+import AppToggle from "../ui/AppToggle.vue";
 import PnmIcon from "../icons/PnmIcon.vue";
+import QueueList from "../media/QueueList.vue";
+import SelectMenu from "../ui/SelectMenu.vue";
 import AdvancedMixer from "../mixer/AdvancedMixer.vue";
+import { EQ_PRESETS } from "@/lib/eqPresets";
 import * as api from "@/lib/api";
-import type { AppPreferences, FadeMode, Preset, ThemePreference } from "@/lib/types";
+import type { AppPreferences, FadeMode, FilterInfo, Preset, ThemePreference } from "@/lib/types";
 import { useHomeStore } from "@/stores/home";
 import { useLibraryStore } from "@/stores/library";
 import { useMixerStore } from "@/stores/mixer";
@@ -49,10 +50,11 @@ const numberFields: {
 ];
 
 const accents = ["#f56300", "#e23d55", "#a855f7", "#3b82f6", "#14a37f", "#d69b16"];
-const dialog = ref<HTMLElement | null>(null);
+
 const activePane = ref<Pane>("theme");
 const clearHistoryArmed = ref(false);
 const presetName = ref("");
+const eqPresetName = ref("");
 const busy = ref<string | null>(null);
 const pendingFilterDelete = ref<string | null>(null);
 const pendingFolderRemove = ref<string | null>(null);
@@ -100,18 +102,33 @@ const fadeModeOptions = [
   { id: "pause", label: "Pausing playback" },
   { id: "both", label: "Starting and pausing" },
 ];
-const visiblePresets = computed(() => mixer.presets.filter((preset) =>
-  !preset.builtIn || !settings.preferences.hiddenBuiltInPresetIds.includes(preset.id),
-));
-const hiddenPresets = computed(() => mixer.presets.filter((preset) =>
-  preset.builtIn && settings.preferences.hiddenBuiltInPresetIds.includes(preset.id),
-));
-const visibleFilters = computed(() => mixer.filters.filter((filter) =>
-  !filter.builtIn || !settings.preferences.hiddenBuiltInFilterIds.includes(filter.id),
-));
-const hiddenFilters = computed(() => mixer.filters.filter((filter) =>
-  filter.builtIn && settings.preferences.hiddenBuiltInFilterIds.includes(filter.id),
-));
+const mixPresets = computed(() =>
+  mixer.presets.filter((preset) => preset.kind === "mixer"),
+);
+const builtInEqPresets: Preset[] = EQ_PRESETS.map((preset) => ({
+  id: preset.id,
+  name: preset.name,
+  builtIn: true,
+  kind: "eq",
+  settings: { eq: preset.eq },
+}));
+const eqPresets = computed(() => [
+  ...builtInEqPresets,
+  ...mixer.presets.filter((preset) => preset.kind === "eq" && !preset.builtIn),
+]);
+
+/**
+ * A hidden built-in stays in its list, greyed out, with its Hide button
+ * turned into Show — hiding it should not also hide the fact that it exists
+ * or the way to get it back.
+ */
+function presetHidden(preset: Preset): boolean {
+  return preset.builtIn && settings.preferences.hiddenBuiltInPresetIds.includes(preset.id);
+}
+
+function filterHidden(filter: FilterInfo): boolean {
+  return filter.builtIn && settings.preferences.hiddenBuiltInFilterIds.includes(filter.id);
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -265,6 +282,18 @@ async function savePreset() {
   }
 }
 
+async function saveEqPreset() {
+  const name = eqPresetName.value.trim();
+  if (!name) return;
+  busy.value = "eq-preset-save";
+  try {
+    await reportFailure("Could not save EQ preset", () => mixer.saveEqPreset(name, mixer.effective.eq));
+    eqPresetName.value = "";
+  } finally {
+    busy.value = null;
+  }
+}
+
 function editPreset(preset: Preset) {
   presetEditor.open(preset);
 }
@@ -382,9 +411,9 @@ function duration(seconds: number): string {
 }
 
 onMounted(async () => {
+  // Escape keeps its own handler rather than BaseModal's: with the preset
+  // editor open it stands down that first instead of closing all of settings.
   window.addEventListener("keydown", onKeydown, true);
-  await nextTick();
-  dialog.value?.focus();
   if (activePane.value === "recommendations") {
     await reportFailure("Could not load listening history", () => settings.loadHistory());
   }
@@ -576,7 +605,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
             <QueueList
               v-else
               class="history-queue"
-              :items="settings.history.map((record) => record.track)"
+              :items="settings.history.map((record) => ({ kind: 'track', track: record.track }) as const)"
               :current-index="null"
               :playing="player.playing"
               :reorderable="false"
@@ -612,7 +641,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
               <button class="primary-button" type="submit" :disabled="!presetName.trim() || busy !== null">Save current</button>
             </form>
             <ul class="item-list preset-list">
-              <li v-for="preset in visiblePresets" :key="preset.id">
+              <li v-for="preset in mixPresets" :key="preset.id" :class="{ 'is-hidden': presetHidden(preset) }">
                 <button class="item-main" type="button" @click="editPreset(preset)">
                   <strong>{{ preset.name }}</strong>
                   <span>{{ preset.builtIn ? "Built in · click to edit a custom copy" : "Custom · click to edit" }}</span>
@@ -621,8 +650,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
                   v-if="preset.builtIn"
                   class="text-button"
                   type="button"
-                  @click.stop="setBuiltInHidden('preset', preset.id, true)"
-                >Hide</button>
+                  @click.stop="setBuiltInHidden('preset', preset.id, !presetHidden(preset))"
+                >{{ presetHidden(preset) ? "Show" : "Hide" }}</button>
                 <button
                   v-else
                   class="text-button danger-text"
@@ -632,13 +661,38 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
                 >Delete</button>
               </li>
             </ul>
-            <details v-if="hiddenPresets.length" class="hidden-builtins">
-              <summary>Hidden built-in presets ({{ hiddenPresets.length }})</summary>
-              <div v-for="preset in hiddenPresets" :key="preset.id">
-                <span>{{ preset.name }}</span>
-                <button class="text-button" @click="setBuiltInHidden('preset', preset.id, false)">Show</button>
+
+            <div class="section-heading filters-heading">
+              <div>
+                <h4>EQ presets</h4>
+                <p>Save and manage curves used by the expanded equaliser.</p>
               </div>
-            </details>
+            </div>
+            <form class="inline-form" @submit.prevent="saveEqPreset">
+              <input v-model="eqPresetName" maxlength="60" placeholder="EQ preset name" aria-label="EQ preset name" />
+              <button class="primary-button" type="submit" :disabled="!eqPresetName.trim() || busy !== null">Save current EQ</button>
+            </form>
+            <ul class="item-list preset-list">
+              <li v-for="preset in eqPresets" :key="preset.id" :class="{ 'is-hidden': presetHidden(preset) }">
+                <button class="item-main" type="button" @click="editPreset(preset)">
+                  <strong>{{ preset.name }}</strong>
+                  <span>{{ preset.builtIn ? "Built in · click to edit a custom copy" : "Custom · click to edit" }}</span>
+                </button>
+                <button
+                  v-if="preset.builtIn"
+                  class="text-button"
+                  type="button"
+                  @click.stop="setBuiltInHidden('preset', preset.id, !presetHidden(preset))"
+                >{{ presetHidden(preset) ? "Show" : "Hide" }}</button>
+                <button
+                  v-else
+                  class="text-button danger-text"
+                  type="button"
+                  :disabled="busy !== null"
+                  @click.stop="removePreset(preset.id)"
+                >Delete</button>
+              </li>
+            </ul>
 
             <div class="section-heading filters-heading">
               <div>
@@ -647,16 +701,16 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
               </div>
               <button class="secondary-button" type="button" :disabled="busy !== null" @click="chooseFilter">Import audio…</button>
             </div>
-            <p v-if="visibleFilters.length === 0" class="empty-state compact">No ambience audio imported.</p>
+            <p v-if="mixer.filters.length === 0" class="empty-state compact">No ambience audio imported.</p>
             <ul v-else class="item-list">
-              <li v-for="filter in visibleFilters" :key="filter.id">
+              <li v-for="filter in mixer.filters" :key="filter.id" :class="{ 'is-hidden': filterHidden(filter) }">
                 <div><strong>{{ filter.name }}</strong><span>{{ filter.available ? "Available" : "File missing" }}</span></div>
                 <button
                   v-if="filter.builtIn"
                   class="text-button"
                   type="button"
-                  @click="setBuiltInHidden('filter', filter.id, true)"
-                >Hide</button>
+                  @click="setBuiltInHidden('filter', filter.id, !filterHidden(filter))"
+                >{{ filterHidden(filter) ? "Show" : "Hide" }}</button>
                 <button
                   v-else
                   class="text-button danger-text"
@@ -666,13 +720,6 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
                 >{{ pendingFilterDelete === filter.id ? "Confirm delete" : "Delete" }}</button>
               </li>
             </ul>
-            <details v-if="hiddenFilters.length" class="hidden-builtins">
-              <summary>Hidden built-in filters ({{ hiddenFilters.length }})</summary>
-              <div v-for="filter in hiddenFilters" :key="filter.id">
-                <span>{{ filter.name }}</span>
-                <button class="text-button" @click="setBuiltInHidden('filter', filter.id, false)">Show</button>
-              </div>
-            </details>
             <p v-if="mixer.filtersDir" class="path-note" :title="mixer.filtersDir">Stored in {{ mixer.filtersDir }}</p>
           </section>
 
@@ -727,7 +774,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 .settings-scrim {
   position: fixed;
   inset: 0;
-  z-index: 520;
+  z-index: var(--z-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -774,13 +821,19 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 
 .settings-header > div { flex: 1; }
 .settings-header h2, .pane-heading h3 { margin: 1px 0 0; font-size: 19px; font-weight: 650; }
-.eyebrow { margin: 0; color: var(--accent); font-size: 10.5px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; }
 .saving { color: var(--text-tertiary); font-size: 11.5px; }
 
 .settings-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 190px minmax(0, 1fr); }
 /* Matches the app's own sidebar rather than inventing a second one: same
    surface, same radius, same accent-tinted active row. */
-.settings-nav { padding: 14px 10px; border-right: 1px solid var(--separator); background: var(--bg-sidebar); }
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 14px 10px;
+  border-right: 1px solid var(--separator);
+  background: var(--bg-sidebar);
+}
 .settings-nav button { width: 100%; display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: var(--radius-sm); text-align: left; color: var(--text); }
 .settings-nav button:hover { background: var(--bg-hover); }
 .settings-nav button.active { color: var(--accent); background: var(--accent-tint); }
@@ -856,12 +909,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 .danger-button:hover:not(:disabled) { background: rgba(215,55,63,.2); }
 .primary-button:disabled, .secondary-button:disabled, .danger-button:disabled, .remote-card button:disabled { opacity: .45; pointer-events: none; }
 .item-list li { min-height: 45px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 11px; border-bottom: 1px solid var(--separator); }
+/* A hidden built-in stays listed, greyed, with its action turned into Show. */
+.item-list li.is-hidden { opacity: 0.45; }
 .item-list li > div { display: flex; flex-direction: column; gap: 2px; }
 .item-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; text-align: left; }
 .hidden-builtins { margin-top: 9px; color: var(--text-secondary); font-size: 11px; }
-.hidden-builtins summary { cursor: pointer; }
-.hidden-builtins > div { display: flex; justify-content: space-between; padding: 7px 4px; border-bottom: 1px solid var(--separator); }
-.item-list strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
 .item-list span { color: var(--text-tertiary); font-size: 10px; }
 .text-button { color: var(--accent); font-size: 10.5px; white-space: nowrap; }
 .danger-text { color: #d7373f; }
@@ -879,8 +931,10 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 
 .history-queue { margin-top: 12px; }
 .history-queue :deep(.row) { padding-left: 6px; }
-.history-queue :deep(.row__text) { max-width: 190px; }
-.history-queue .history-meta { max-width: 170px; color: var(--text-tertiary); font-size: 10px; }
+/* No width caps: the track text flexes to fill the row, which both shows more
+   of the title/artist and carries the meta and remove button to the right
+   edge instead of stranding them mid-row. */
+.history-queue .history-meta { color: var(--text-tertiary); font-size: 10px; text-align: right; }
 .preset-editor { height: 100%; border: 0.5px solid var(--separator); border-radius: 0 var(--radius-lg) var(--radius-lg) 0; box-shadow: var(--shadow-popover); overflow: hidden; }
 .settings-workspace.is-editing .settings-modal { border-radius: var(--radius-lg) 0 0 var(--radius-lg); }
 

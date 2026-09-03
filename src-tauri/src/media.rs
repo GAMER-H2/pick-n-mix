@@ -88,6 +88,14 @@ fn handle_event(app: &AppHandle, event: MediaControlEvent) {
         return;
     };
 
+    // The Master Mixer takes the engine over while its editor is open, and
+    // these events reach the engine without passing through the frontend at
+    // all. Play and Seek would move the audition; Next would load a queue
+    // track over the timeline. None of them mean anything in that state.
+    if crate::commands::master_mix_owns_playback(&state) {
+        return;
+    }
+
     // Deliberately the same functions the UI buttons call.
     let result = match event {
         MediaControlEvent::Play => {

@@ -11,7 +11,10 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
-import AppSlider from "../AppSlider.vue";
+import AppSlider from "../ui/AppSlider.vue";
+import BaseModal from "../ui/BaseModal.vue";
+import IconButton from "../ui/IconButton.vue";
+import EqPresetSelect from "./EqPresetSelect.vue";
 import { bandResponse, logFrequencies, summedResponse } from "@/lib/eqCurve";
 import { defaultBands, hasGain } from "@/lib/mixer";
 import * as api from "@/lib/api";
@@ -51,7 +54,6 @@ const BAND_KINDS: { value: BandKind; label: string; short: string }[] = [
 const GRID_HZ = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000];
 const GRID_DB = [-12, -6, 0, 6, 12];
 
-const dialog = ref<HTMLElement | null>(null);
 const plot = ref<HTMLElement | null>(null);
 const selected = ref(0);
 const dragging = ref<number | null>(null);
@@ -164,8 +166,6 @@ async function poll() {
 }
 
 onMounted(async () => {
-  dialog.value?.focus();
-  window.addEventListener("keydown", onKeydown, true);
   try {
     await api.setAnalyserEnabled(true);
   } catch {
@@ -177,16 +177,8 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   stopped = true;
   if (frame !== null) cancelAnimationFrame(frame);
-  window.removeEventListener("keydown", onKeydown, true);
   void api.setAnalyserEnabled(false).catch(() => {});
 });
-
-function onKeydown(event: KeyboardEvent) {
-  if (event.key !== "Escape") return;
-  event.preventDefault();
-  event.stopPropagation();
-  emit("close");
-}
 
 // -- editing -----------------------------------------------------------------
 
@@ -302,20 +294,15 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
 </script>
 
 <template>
-  <div class="eq-scrim" @click.self="emit('close')">
-    <section
-      ref="dialog"
-      class="eq-modal"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="eq-modal-title"
-      tabindex="-1"
-    >
+  <BaseModal :open="true" labelledby="eq-modal-title" :width="1040" flush @close="emit('close')">
+    <div class="eq-modal">
       <header class="eq-modal__head">
         <div class="eq-modal__heading">
-          <p class="eq-modal__eyebrow">Equaliser</p>
+          <p class="eyebrow">Equaliser</p>
           <h2 id="eq-modal-title">{{ targetLabel }}</h2>
         </div>
+
+        <EqPresetSelect :eq="eq" @change="emit('change', $event)" />
 
         <label class="eq-modal__power">
           <input
@@ -327,9 +314,7 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
         </label>
 
         <button class="eq-modal__link" @click="reset">Reset</button>
-        <button class="icon-button" aria-label="Close" title="Close" @click="emit('close')">
-          <PnmIcon name="close" :size="18" />
-        </button>
+        <IconButton icon="close" label="Close" :size="18" @click="emit('close')" />
       </header>
 
       <!-- Graph -------------------------------------------------------------->
@@ -518,55 +503,35 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
           <span class="eq-modal__value">{{ gainLabel(eq.preampDb) }} dB</span>
         </div>
       </footer>
-    </section>
-  </div>
+    </div>
+  </BaseModal>
 </template>
 
 <style scoped>
-.eq-scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 520;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 22px;
-  background: rgba(0, 0, 0, 0.34);
-  backdrop-filter: blur(4px);
-}
-
 .eq-modal {
-  width: min(1040px, 100%);
-  max-height: min(88vh, 780px);
+  /* Fills the shell's body exactly: the scrim and shell already frame the
+     modal, so the workspace does not inset itself a second time — matching
+     how the settings and master mixer workspaces sit in their shells. */
+  width: 100%;
+  height: 100%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border: 0.5px solid var(--separator);
-  border-radius: var(--radius-lg);
-  outline: none;
-  background: var(--bg-elevated);
-  box-shadow: var(--shadow-popover);
 }
 
 .eq-modal__head {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 15px 16px 13px 18px;
+  /* Same inset as the master mixer's header, so the workspace modals read
+     as one family. */
+  padding: 12px 14px;
   border-bottom: 1px solid var(--separator);
 }
 
 .eq-modal__heading {
   flex: 1;
   min-width: 0;
-}
-
-.eq-modal__eyebrow {
-  margin: 0;
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-tertiary);
 }
 
 .eq-modal__heading h2 {
@@ -826,7 +791,7 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
 /* -- footer ---------------------------------------------------------------- */
 
 .eq-modal__foot {
-  padding: 8px 18px 16px 34px;
+  padding: 8px 14px 12px;
 }
 
 .eq-modal__hint {

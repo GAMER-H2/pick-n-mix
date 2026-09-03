@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mount, type VueWrapper } from "@vue/test-utils";
+import { createPinia, setActivePinia } from "pinia";
 import EqModal from "../mixer/EqModal.vue";
 import { defaultBands } from "@/lib/mixer";
 import type { Eq } from "@/lib/types";
@@ -40,6 +41,8 @@ function mountModal(value: Eq = eq()) {
   return mount(EqModal, {
     props: { eq: value, targetLabel: "All Playback", sampleRate: 48000 },
     attachTo: document.body,
+    // BaseModal teleports to <body>; render it inline so queries reach the dialog.
+    global: { stubs: { teleport: true } },
   });
 }
 
@@ -52,6 +55,7 @@ function lastChange(wrapper: VueWrapper): Eq {
 
 describe("EqModal", () => {
   beforeEach(() => {
+    setActivePinia(createPinia());
     setAnalyserEnabled.mockReset().mockResolvedValue(undefined);
     analyserFrame.mockReset().mockResolvedValue({
       bins: new Array(96).fill(-90),
@@ -193,6 +197,21 @@ describe("EqModal", () => {
     const next = lastChange(wrapper);
     expect(next.enabled).toBe(false);
     expect(next.bands).toHaveLength(8);
+    wrapper.unmount();
+  });
+
+  it("applies an EQ-only preset", async () => {
+    const wrapper = mountModal();
+    await wrapper.get("[aria-haspopup='menu']").trigger("click");
+    expect(wrapper.find("[role='menu']").exists()).toBe(true);
+    const bassBoost = wrapper.findAll("[role='menuitem']").find((option) => option.text().includes("Bass Boost"));
+    expect(bassBoost).toBeTruthy();
+    await bassBoost!.trigger("click");
+
+    const next = lastChange(wrapper);
+    expect(next.bands[1].gainDb).toBe(5);
+    expect(next.preampDb).toBe(-3);
+    expect(next.enabled).toBe(true);
     wrapper.unmount();
   });
 

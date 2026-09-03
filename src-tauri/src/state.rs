@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -28,6 +29,9 @@ pub struct Paths {
     /// Packaged ambience files, if they are available in this runtime.
     pub bundled_ambience: Option<PathBuf>,
     pub presets: PathBuf,
+    /// Cached waveform peaks, keyed by file identity. Safe to delete: the
+    /// next request recomputes whatever is missing.
+    pub waveforms: PathBuf,
 }
 
 impl Paths {
@@ -40,6 +44,7 @@ impl Paths {
             filters: data_dir.join("filters"),
             bundled_ambience,
             presets: crate::presets::presets_path(data_dir),
+            waveforms: crate::audio::peaks::cache_dir(data_dir),
         }
     }
 
@@ -49,6 +54,7 @@ impl Paths {
             &self.artwork,
             &self.playlists,
             &self.filters,
+            &self.waveforms,
         ] {
             std::fs::create_dir_all(dir)?;
         }
@@ -69,6 +75,36 @@ pub(crate) struct PreviewOriginal {
     pub playing: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum MasterMixOriginal {
+    Empty,
+    Queue {
+        track_id: String,
+        order_index: usize,
+        path: PathBuf,
+        gain_db: f32,
+        position_secs: f64,
+        playing: bool,
+    },
+    EnabledMix {
+        playlist_id: String,
+        position_secs: f64,
+        playing: bool,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct MasterMixSession {
+    pub token: String,
+    pub original: MasterMixOriginal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MasterMixPlayback {
+    Enabled { playlist_id: String },
+    Audition { token: String, playlist_id: String },
+}
+
 pub struct AppState {
     pub db: Db,
     pub engine: AudioEngine,
@@ -76,6 +112,14 @@ pub struct AppState {
     pub paths: Paths,
     /// The first preview captures normal playback here; later previews retain it.
     pub(crate) preview: Mutex<Option<PreviewSession>>,
+    /// Identifies the master-mix timeline currently loaded in the engine.
+    /// Enabled playlist playback and a modal audition are deliberately distinct.
+    pub(crate) master_mix_playback: Mutex<Option<MasterMixPlayback>>,
+    /// Captures normal playback for the lifetime of an open Master Mixer modal.
+    /// Commands hold this lock through engine changes, making session end a
+    /// barrier after which requests carrying the old token cannot affect audio.
+    pub(crate) master_mix_session: Mutex<Option<MasterMixSession>>,
+    master_mix_session_counter: AtomicU64,
     /// Handed to the background pump in `lib.rs`.
     pub engine_events: Mutex<Option<Receiver<EngineEvent>>>,
     /// Guards MusicBrainz lookups so only one runs at a time.
@@ -270,6 +314,9 @@ impl AppState {
             player: Mutex::new(player),
             paths,
             preview: Mutex::new(None),
+            master_mix_playback: Mutex::new(None),
+            master_mix_session: Mutex::new(None),
+            master_mix_session_counter: AtomicU64::new(0),
             engine_events: Mutex::new(Some(rx)),
             metadata: Mutex::new(None),
             media: crate::media::MediaBridge::new(),
@@ -405,7 +452,20 @@ impl AppState {
     }
 
     pub(crate) fn is_previewing(&self) -> bool {
-        self.preview.lock().is_some()
+        self.preview.lock().is_some() || self.master_mix_playback.lock().is_some()
+    }
+
+    /// Whether the engine currently owns any master-mix timeline rather than a
+    /// queue decoder. This includes ordinary playback of an enabled saved mix.
+    pub(crate) fn master_mix_playing(&self) -> bool {
+        self.master_mix_playback.lock().is_some()
+    }
+
+    pub(crate) fn next_master_mix_session_token(&self) -> String {
+        self.master_mix_session_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+            .to_string()
     }
 
     /// Load one exact physical version while preserving the first normal
@@ -479,8 +539,13 @@ impl AppState {
     /// End preview without restoring it. Normal transport commands call this
     /// before loading or manipulating their intended logical queue item.
     pub(crate) fn cancel_preview(&self) -> Option<PreviewSession> {
+        // A master mix session ends the moment anything else asks to play,
+        // which is every caller of this function. Taking the session also
+        // invalidates every in-flight modal request carrying its old token.
+        let session = self.master_mix_session.lock().take();
+        let mix = self.master_mix_playback.lock().take();
         let preview = self.preview.lock().take();
-        if preview.is_some() {
+        if preview.is_some() || mix.is_some() || session.is_some() {
             self.engine.cancel_next();
             self.engine.clear();
         }

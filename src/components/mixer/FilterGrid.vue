@@ -6,7 +6,7 @@
  */
 import { computed } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
-import AppKnob from "../AppKnob.vue";
+import AppKnob from "../ui/AppKnob.vue";
 import { useMixerStore } from "@/stores/mixer";
 import { useSettingsStore } from "@/stores/settings";
 import type { FilterSetting } from "@/lib/types";
@@ -23,6 +23,7 @@ const mixer = useMixerStore();
 const appSettings = useSettingsStore();
 
 const activeSettings = computed(() => props.settings ?? mixer.effective.filters);
+const enabledSettings = computed(() => activeSettings.value.filter((filter) => filter.enabled));
 const settingsFor = computed(() => new Map(activeSettings.value.map((f) => [f.id, f])));
 const catalogue = computed(() => mixer.filters.filter((filter) =>
   !filter.builtIn ||
@@ -36,6 +37,10 @@ function isOn(id: string) {
 
 function volumeOf(id: string) {
   return settingsFor.value.get(id)?.volume ?? 0.4;
+}
+
+function nameOf(id: string) {
+  return mixer.filters.find((filter) => filter.id === id)?.name ?? id;
 }
 
 function toggle(id: string) {
@@ -75,21 +80,28 @@ function setVolume(id: string, volume: number) {
       </button>
     </div>
 
-    <div v-if="props.showVolumes && activeSettings.some((f) => f.enabled)" class="levels">
+    <Transition name="levels">
       <div
-        v-for="filter in activeSettings.filter((f) => f.enabled)"
-        :key="filter.id"
-        class="levels__control"
+        v-if="props.showVolumes && enabledSettings.length > 0"
+        class="levels"
+        aria-label="Atmosphere volumes"
       >
-        <AppKnob
-          :model-value="volumeOf(filter.id)"
-          :label="`${mixer.filters.find((item) => item.id === filter.id)?.name ?? filter.id} volume`"
-          :display="`${Math.round(volumeOf(filter.id) * 100)}%`"
-          :size="42"
-          @update:model-value="setVolume(filter.id, $event)"
-        />
+        <div
+          v-for="filter in enabledSettings"
+          :key="filter.id"
+          class="levels__control"
+        >
+          <AppKnob
+            :model-value="volumeOf(filter.id)"
+            :label="nameOf(filter.id)"
+            :aria-label="`${nameOf(filter.id)} volume`"
+            :display="`${Math.round(volumeOf(filter.id) * 100)}%`"
+            :size="34"
+            @update:model-value="setVolume(filter.id, $event)"
+          />
+        </div>
       </div>
-    </div>
+    </Transition>
 
     <p v-if="!catalogue.some((f) => f.available)" class="hint">
       <PnmIcon name="folder" :size="13" />
@@ -339,16 +351,50 @@ function setVolume(id: string, volume: number) {
 
 .levels {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 10px 14px;
+  justify-content: flex-start;
+  gap: 10px;
+  height: 84px;
   margin-top: 11px;
-  padding-top: 10px;
+  padding: 9px 2px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
   border-top: 1px solid var(--separator);
+  scrollbar-width: thin;
 }
 
 .levels__control {
-  min-width: 58px;
+  flex: 0 0 64px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.levels__control :deep(.knob__label),
+.levels__control :deep(.knob__value) {
+  width: 100%;
+  overflow: hidden;
+  line-height: 12px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.levels-enter-active,
+.levels-leave-active {
+  transition:
+    height 0.45s var(--ease),
+    margin-top 0.45s var(--ease),
+    padding-top 0.45s var(--ease),
+    opacity 0.32s var(--ease),
+    transform 0.45s var(--ease);
+}
+
+.levels-enter-from,
+.levels-leave-to {
+  height: 0;
+  margin-top: 0;
+  padding-top: 0;
+  opacity: 0;
+  transform: translateY(-8px);
 }
 
 /* Motion off, but the colours stay: a still fire is still recognisably fire,
@@ -357,6 +403,11 @@ function setVolume(id: string, volume: number) {
   .chip.is-built-in.is-on[data-atmosphere]::before,
   .chip.is-built-in.is-on[data-atmosphere]::after {
     animation: none;
+  }
+
+  .levels-enter-active,
+  .levels-leave-active {
+    transition: none;
   }
 }
 

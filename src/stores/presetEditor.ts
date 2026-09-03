@@ -3,12 +3,13 @@ import { defineStore } from "pinia";
 import * as api from "@/lib/api";
 import { clone, resolve, type Section } from "@/lib/mixer";
 import { useMixerStore } from "@/stores/mixer";
-import type { MixerSettings, Preset } from "@/lib/types";
+import type { MixerSettings, Preset, PresetKind } from "@/lib/types";
 
 interface PresetSession {
   sourceId: string;
   sourceName: string;
   sourceBuiltIn: boolean;
+  sourceKind: PresetKind;
   name: string;
   original: MixerSettings;
   draft: MixerSettings;
@@ -38,6 +39,7 @@ export const usePresetEditorStore = defineStore("presetEditor", () => {
       sourceId: preset.id,
       sourceName: preset.builtIn ? `${preset.name} Custom` : preset.name,
       sourceBuiltIn: preset.builtIn,
+      sourceKind: preset.kind,
       name: preset.builtIn ? `${preset.name} Custom` : preset.name,
       original: clone(settings),
       draft: clone(settings),
@@ -94,16 +96,19 @@ export const usePresetEditorStore = defineStore("presetEditor", () => {
     saving.value = true;
     try {
       const presets = current.sourceBuiltIn
-        ? await api.savePreset(name, settings)
+        ? await api.savePreset(name, settings, current.sourceKind)
         : await api.updatePreset(current.sourceId, name, settings);
       const mixer = useMixerStore();
       mixer.presets = presets;
-      const saved = presets.find((preset) => !preset.builtIn && preset.name === name);
+      const saved = presets.find((preset) =>
+        !preset.builtIn && preset.kind === current.sourceKind && preset.name === name,
+      );
       if (!saved) throw new Error("The saved preset was not returned by the backend");
       session.value = {
         sourceId: saved.id,
         sourceName: saved.name,
         sourceBuiltIn: false,
+        sourceKind: saved.kind,
         name: saved.name,
         original: clone(settings),
         draft: clone(settings),

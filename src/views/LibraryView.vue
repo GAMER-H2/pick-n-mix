@@ -7,14 +7,21 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
-import Artwork from "@/components/Artwork.vue";
-import TrackRow from "@/components/TrackRow.vue";
-import SelectMenu from "@/components/SelectMenu.vue";
+import Artwork from "@/components/media/Artwork.vue";
+import TrackList, { type TrackListItem } from "@/components/collections/TrackList.vue";
+import EmptyState from "@/components/ui/EmptyState.vue";
+import IconButton from "@/components/ui/IconButton.vue";
+import MediaCard from "@/components/ui/MediaCard.vue";
+import SearchField from "@/components/ui/SearchField.vue";
+import SelectMenu from "@/components/ui/SelectMenu.vue";
+import Tabs from "@/components/ui/Tabs.vue";
 import { formatTotal } from "@/lib/format";
 import { resolveSort, sortItems, type SortDirection, type SortOption } from "@/lib/sort";
 import { useLibraryStore } from "@/stores/library";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";
+import { useMenu } from "@/composables/useMenu";
+import { useCollectionPlayback } from "@/composables/useCollectionPlayback";
 import type { Album, Artist, Track } from "@/lib/types";
 
 const library = useLibraryStore();
@@ -22,9 +29,15 @@ const player = usePlayerStore();
 const ui = useUiStore();
 const router = useRouter();
 const route = useRoute();
+const { openMenu } = useMenu();
 
 const TABS = ["songs", "albums", "artists"] as const;
 type Tab = (typeof TABS)[number];
+
+const TAB_OPTIONS: ReadonlyArray<{ id: string; label: string }> = TABS.map((tab) => ({
+  id: tab,
+  label: tab[0].toUpperCase() + tab.slice(1),
+}));
 
 /**
  * The selected tab lives in the URL rather than in local state, so that
@@ -36,11 +49,12 @@ const tab = computed<Tab>(() => {
   return TABS.includes(requested as Tab) ? (requested as Tab) : "songs";
 });
 
-function selectTab(next: Tab) {
+function selectTab(next: string) {
+  const nextTab = TABS.find((option) => option === next);
+  if (!nextTab || nextTab === tab.value) return;
   // Guard against pushing a duplicate entry, which would make Back appear to
   // do nothing the first time it is pressed.
-  if (next === tab.value) return;
-  router.push({ name: "library", query: { ...route.query, tab: next } });
+  router.push({ name: "library", query: { ...route.query, tab: nextTab } });
 }
 /**
  * The search text also lives in the URL, for the same reason the tab does:
@@ -73,12 +87,14 @@ watch(
 onBeforeUnmount(() => window.clearTimeout(queryTimer));
 
 const normalizedQuery = computed(() => query.value.trim().toLocaleLowerCase());
-const matches = (...fields: Array<string | number | null | undefined>) => {
-  const q = normalizedQuery.value;
-  return !q || fields.some((field) => String(field ?? "").toLocaleLowerCase().includes(q));
-};
+const matches = computed(
+  () =>
+    (...fields: Array<string | number | null | undefined>) =>
+      !normalizedQuery.value ||
+      fields.some((field) => String(field ?? "").toLocaleLowerCase().includes(normalizedQuery.value)),
+);
 
-// -- sorting ----------------------------------------------------------------
+// -- sorting -----------------------------------------------------------------
 
 const SONG_SORTS: ReadonlyArray<SortOption<Track>> = [
   { id: "title", label: "Title", value: (t) => t.title },
@@ -132,7 +148,7 @@ function applySort(id: string, direction: SortDirection) {
 const filteredTracks = computed<Track[]>(() =>
   sortItems(
     library.tracks.filter((track) =>
-      matches(track.title, track.artist, track.album, track.albumArtist, track.genre, track.year),
+      matches.value(track.title, track.artist, track.album, track.albumArtist, track.genre, track.year),
     ),
     resolveSort(SONG_SORTS, sortId.value),
     sortDirection.value,
@@ -140,17 +156,21 @@ const filteredTracks = computed<Track[]>(() =>
 );
 const filteredAlbums = computed<Album[]>(() =>
   sortItems(
-    library.albums.filter((album) => matches(album.name, album.artist, album.year)),
+    library.albums.filter((album) => matches.value(album.name, album.artist, album.year)),
     resolveSort(ALBUM_SORTS, sortId.value),
     sortDirection.value,
   ),
 );
 const filteredArtists = computed<Artist[]>(() =>
   sortItems(
-    library.artists.filter((artist) => matches(artist.name)),
+    library.artists.filter((artist) => matches.value(artist.name)),
     resolveSort(ARTIST_SORTS, sortId.value),
     sortDirection.value,
   ),
+);
+
+const trackItems = computed<TrackListItem[]>(() =>
+  filteredTracks.value.map((track) => ({ track })),
 );
 
 const searchPlaceholder = computed(() => `Search ${tab.value}`);
@@ -171,23 +191,19 @@ async function chooseFolder() {
   }
 }
 
+const { playFromList } = useCollectionPlayback();
+
 /**
  * Clicking the row that is already playing toggles it, rather than restarting
  * it from the beginning. Anything else starts the list from that song.
  */
-async function playFrom(index: number) {
-  const track = filteredTracks.value[index];
-  if (track && player.track?.id === track.id) {
-    await player.toggle();
-    return;
-  }
-  await player.playTracks(filteredTracks.value, index, {
+function playFrom(index: number) {
+  return playFromList(filteredTracks.value, index, {
     kind: "library",
     id: "library",
     name: "Library",
   });
 }
-
 
 onMounted(() => {
   if (library.tracks.length === 0) library.refresh();
@@ -197,19 +213,18 @@ onMounted(() => {
 <template>
   <div class="library">
     <!-- Empty state: get music in -->
-    <div v-if="library.isEmpty && library.folders.length === 0" class="empty">
-      <PnmIcon name="folder" :size="44" class="empty__icon" />
-      <h1>Add your music</h1>
-      <p>
-        Choose a folder and Pick n Mix will index everything in it, reading titles, artwork and
-        ReplayGain straight from your files. Nothing is sent anywhere.
-      </p>
+    <EmptyState
+      v-if="library.isEmpty && library.folders.length === 0"
+      icon="folder"
+      title="Add your music"
+      message="Choose a folder and Pick n Mix will index everything in it, reading titles, artwork and ReplayGain straight from your files. Nothing is sent anywhere."
+    >
       <button class="pill-button" @click="chooseFolder">
         <PnmIcon name="plus" :size="14" />
         <span>Choose Folder</span>
       </button>
-      <p class="empty__later">Streaming from Navidrome or Jellyfin is planned.</p>
-    </div>
+      <p class="library__later">Streaming from Navidrome or Jellyfin is planned.</p>
+    </EmptyState>
 
     <template v-else>
       <header class="library__head">
@@ -222,30 +237,20 @@ onMounted(() => {
         </div>
 
         <div class="library__tools">
-          <div class="library__search">
-            <PnmIcon name="search" :size="15" />
-            <input
-              v-model="query"
-              class="library__input"
-              :placeholder="searchPlaceholder"
-              :aria-label="searchPlaceholder"
-              type="search"
-            />
-          </div>
+          <SearchField v-model="query" :placeholder="searchPlaceholder" />
           <SelectMenu
             :model-value="sortId"
             :options="sortOptions"
             label="Sort"
             @update:model-value="applySort($event, sortDirection)"
           />
-          <button
-            class="icon-button library__direction"
-            :title="sortDirection === 'asc' ? 'Sorted ascending' : 'Sorted descending'"
-            :aria-label="sortDirection === 'asc' ? 'Sorted ascending' : 'Sorted descending'"
+          <IconButton
+            class="library__direction"
+            :icon="sortDirection === 'asc' ? 'chevronUp' : 'chevronDown'"
+            :label="sortDirection === 'asc' ? 'Sorted ascending' : 'Sorted descending'"
+            :size="15"
             @click="applySort(sortId, sortDirection === 'asc' ? 'desc' : 'asc')"
-          >
-            <PnmIcon :name="sortDirection === 'asc' ? 'chevronUp' : 'chevronDown'" :size="15" />
-          </button>
+          />
           <button
             class="pill-button is-plain"
             :disabled="library.scanning"
@@ -254,75 +259,60 @@ onMounted(() => {
           >
             {{ library.scanning ? "Scanning…" : "Rescan" }}
           </button>
-          <button class="icon-button" title="Add folder" @click="chooseFolder">
-            <PnmIcon name="plus" :size="17" />
-          </button>
+          <IconButton icon="plus" label="Add folder" :size="17" @click="chooseFolder" />
         </div>
       </header>
 
-      <nav class="tabs">
-        <button
-          v-for="option in TABS"
-          :key="option"
-          class="tabs__tab"
-          :class="{ 'is-active': tab === option }"
-          @click="selectTab(option)"
-        >
-          {{ option[0].toUpperCase() + option.slice(1) }}
-        </button>
-      </nav>
+      <Tabs :tabs="TAB_OPTIONS" :model-value="tab" @update:model-value="selectTab" />
 
       <!-- Songs -->
-      <div v-if="tab === 'songs'" class="list">
-        <TrackRow
-          v-for="(track, index) in filteredTracks"
-          :key="track.id"
-          :track="track"
-          show-artwork
-          :current="player.track?.id === track.id"
-          :playing="player.playing"
-          @play="playFrom(index)"
-          @menu="ui.openContextMenu({ x: $event.clientX, y: $event.clientY, tracks: [track] })"
-        />
-        <p v-if="filteredTracks.length === 0" class="list__empty">
-          No songs match "{{ query }}".
-        </p>
-      </div>
+      <TrackList
+        v-if="tab === 'songs'"
+        :items="trackItems"
+        :current-id="player.track?.id ?? null"
+        :playing="player.playing"
+        show-artwork
+        :empty-message="`No songs match “${query}”.`"
+        @play="playFrom"
+        @menu="(event, index) => { const track = filteredTracks[index]; if (track) openMenu(event, { tracks: [track] }); }"
+      />
 
       <!-- Albums -->
       <div v-else-if="tab === 'albums'" class="grid">
-        <button
+        <MediaCard
           v-for="album in filteredAlbums"
           :key="album.id"
-          class="card"
-          @click="router.push({ name: 'album', params: { id: album.id } })"
+          :title="album.name"
+          :subtitle="album.artist"
+          @open="router.push({ name: 'album', params: { id: album.id } })"
         >
           <Artwork :artwork-id="album.artworkId" :size="152" :radius="7" shadow />
-          <div class="card__title truncate">{{ album.name }}</div>
-          <div class="card__subtitle truncate">{{ album.artist }}</div>
-        </button>
-        <p v-if="filteredAlbums.length === 0" class="grid__empty">
-          No albums match "{{ query }}".
-        </p>
+        </MediaCard>
+        <EmptyState
+          v-if="filteredAlbums.length === 0"
+          compact
+          class="library__grid-empty"
+          :message="`No albums match “${query}”.`"
+        />
       </div>
 
       <!-- Artists -->
       <div v-else class="grid grid--artists">
-        <button
+        <MediaCard
           v-for="artist in filteredArtists"
           :key="artist.id"
-          class="card"
-          @click="router.push({ name: 'artist', params: { id: artist.id } })"
+          :title="artist.name"
+          :subtitle="`${artist.albumCount} ${artist.albumCount === 1 ? 'album' : 'albums'}`"
+          @open="router.push({ name: 'artist', params: { id: artist.id } })"
         >
           <Artwork :artwork-id="artist.artworkId" :size="132" :radius="66" shadow />
-          <div class="card__title truncate">{{ artist.name }}</div>
-          <div class="card__subtitle truncate">
-            {{ artist.albumCount }} {{ artist.albumCount === 1 ? "album" : "albums" }}
-          </div>
-        </button>
-        <p v-if="filteredArtists.length === 0" class="grid__empty">
-          No artists match "{{ query }}".
-        </p>
+        </MediaCard>
+        <EmptyState
+          v-if="filteredArtists.length === 0"
+          compact
+          class="library__grid-empty"
+          :message="`No artists match “${query}”.`"
+        />
       </div>
     </template>
   </div>
@@ -333,38 +323,9 @@ onMounted(() => {
   padding: 6px 26px 40px;
 }
 
-.empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  min-height: 70vh;
-  text-align: center;
-  color: var(--text-secondary);
-}
-
-.empty__icon {
-  color: var(--text-tertiary);
-}
-
-.empty h1 {
-  margin: 4px 0 0;
-  font-size: 22px;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.empty p {
-  margin: 0;
-  max-width: 420px;
-  font-size: 13px;
-  line-height: 1.55;
-}
-
-.empty__later {
-  margin-top: 6px !important;
-  font-size: 11.5px !important;
+.library__later {
+  margin-top: 6px;
+  font-size: 11.5px;
   color: var(--text-tertiary);
 }
 
@@ -395,68 +356,6 @@ onMounted(() => {
   gap: 8px;
 }
 
-.library__search {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  height: 30px;
-  padding: 0 10px;
-  border-radius: 999px;
-  background: var(--bg-sunken);
-  color: var(--text-tertiary);
-}
-
-.library__direction {
-  width: 28px;
-  height: 28px;
-}
-
-.library__input {
-  width: 160px;
-  border: 0;
-  background: none;
-  outline: none;
-  font-size: 12.5px;
-  user-select: text;
-}
-
-.tabs {
-  display: flex;
-  gap: 4px;
-  margin-bottom: 10px;
-  border-bottom: 1px solid var(--separator);
-}
-
-.tabs__tab {
-  position: relative;
-  padding: 8px 12px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-secondary);
-}
-
-.tabs__tab.is-active {
-  color: var(--text);
-}
-
-.tabs__tab.is-active::after {
-  content: "";
-  position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: -1px;
-  height: 2px;
-  border-radius: 2px;
-  background: var(--accent);
-}
-
-.list__empty {
-  padding: 40px 0;
-  text-align: center;
-  font-size: 13px;
-  color: var(--text-tertiary);
-}
-
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(152px, 1fr));
@@ -468,48 +367,8 @@ onMounted(() => {
   grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
 }
 
-.card {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  text-align: left;
-  min-width: 0;
-  content-visibility: auto;
-  contain-intrinsic-block-size: auto 196px;
-}
-
-.grid--artists .card {
-  contain-intrinsic-block-size: auto 178px;
-}
-
-.grid__empty {
+.library__grid-empty {
   grid-column: 1 / -1;
-  padding: 40px 0;
   margin: 0;
-  text-align: center;
-  font-size: 13px;
-  color: var(--text-tertiary);
-}
-
-.card :deep(.artwork) {
-  width: 100% !important;
-  height: auto !important;
-  aspect-ratio: 1;
-  margin-bottom: 8px;
-  transition: transform 0.18s var(--ease);
-}
-
-.card:hover :deep(.artwork) {
-  transform: translateY(-2px);
-}
-
-.card__title {
-  font-size: 12.5px;
-  font-weight: 500;
-}
-
-.card__subtitle {
-  font-size: 11.5px;
-  color: var(--text-secondary);
 }
 </style>

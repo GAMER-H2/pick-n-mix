@@ -8,9 +8,9 @@
  */
 import { computed, ref } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
-import AppSlider from "../AppSlider.vue";
-import AppKnob from "../AppKnob.vue";
-import AppToggle from "../AppToggle.vue";
+import AppSlider from "../ui/AppSlider.vue";
+import AppKnob from "../ui/AppKnob.vue";
+import AppToggle from "../ui/AppToggle.vue";
 import EqSliders from "./EqSliders.vue";
 import EqModal from "./EqModal.vue";
 import PresetSelect from "./PresetSelect.vue";
@@ -26,7 +26,7 @@ import { usePlayerStore } from "@/stores/player";
 import { usePresetEditorStore } from "@/stores/presetEditor";
 import { useUiStore } from "@/stores/ui";
 import type { Section } from "@/lib/mixer";
-import type { CrossfadeCurve, Eq, MixerSettings } from "@/lib/types";
+import type { CrossfadeCurve, Eq, MixerSettings, PanningMode } from "@/lib/types";
 
 const props = withDefaults(defineProps<{ mode?: "live" | "preset" }>(), { mode: "live" });
 const mixer = useMixerStore();
@@ -35,6 +35,7 @@ const presetEditor = usePresetEditorStore();
 const ui = useUiStore();
 
 const isPreset = computed(() => props.mode === "preset");
+const isEqPreset = computed(() => isPreset.value && presetEditor.session?.sourceKind === "eq");
 const eqExpanded = ref(false);
 const fx = computed(() => isPreset.value ? presetEditor.effective : mixer.effective);
 const targetLabel = computed(() => isPreset.value
@@ -42,10 +43,13 @@ const targetLabel = computed(() => isPreset.value
   : mixer.targetLabel,
 );
 const canOverride = computed(() => isPreset.value || mixer.target.kind !== "global");
+const isBlockTarget = computed(() => !isPreset.value && mixer.target.kind === "block");
 // Crossfades apply between playlist entries, not to an individual entry's
 // mixer override. Keep the global and playlist controls available, but do not
 // offer a misleading per-song crossfade editor.
-const canEditCrossfade = computed(() => isPreset.value || mixer.target.kind !== "entry");
+const canEditCrossfade = computed(
+  () => isPreset.value || (mixer.target.kind !== "entry" && mixer.target.kind !== "block"),
+);
 
 const MAX_CROSSFADE_SECS = 12;
 const crossfadeSettings = computed(() => fx.value.crossfade);
@@ -105,6 +109,31 @@ const cents = computed({
   set: (cents: number) => setSection("pitch", { ...fx.value.pitch, cents }),
 });
 
+// -- panning -----------------------------------------------------------------
+function setPanning(patch: Partial<typeof fx.value.panning>) {
+  setSection("panning", { ...fx.value.panning, ...patch });
+}
+
+function onPanningMode(event: Event) {
+  setPanning({ mode: (event.target as HTMLSelectElement).value as PanningMode });
+}
+
+const panningLabel = computed(() => {
+  switch (fx.value.panning.mode) {
+    case "monoPan":
+      return "Pan";
+    case "stereoBalance":
+      return "Balance";
+    case "trueStereo":
+      return "Centre";
+  }
+});
+
+function panningPositionDisplay(position: number): string {
+  if (Math.abs(position) < 0.005) return "C";
+  return `${position < 0 ? "L" : "R"} ${Math.round(Math.abs(position) * 100)}`;
+}
+
 // -- reverb ------------------------------------------------------------------
 function setReverb(patch: Partial<typeof fx.value.reverb>) {
   setSection("reverb", { ...fx.value.reverb, ...patch });
@@ -141,8 +170,8 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   <aside class="panel" role="complementary" aria-label="DJ Advanced Mixer">
     <header class="panel__head">
       <div class="panel__heading">
-        <h2>DJ Advanced Mixer</h2>
-        <p class="panel__target truncate">
+        <p class="eyebrow">{{ isEqPreset ? "EQ Preset Editor" : "Advanced DJ Mixer" }}</p>
+        <h2 class="panel__title truncate">
           <PnmIcon
             :name="
               isPreset || mixer.target.kind === 'global'
@@ -154,7 +183,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
             :size="12"
           />
           <span>{{ targetLabel }}</span>
-        </p>
+        </h2>
       </div>
       <button class="icon-button" aria-label="Close mixer" @click="closePanel">
         <PnmIcon name="close" :size="18" />
@@ -162,7 +191,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
     </header>
 
     <div class="panel__body scroll-area">
-      <div class="panel__bypass">
+      <div v-if="!isEqPreset" class="panel__bypass">
         <span>Effects</span>
         <AppToggle
           :model-value="fx.enabled"
@@ -188,7 +217,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </div>
 
       <p v-if="isPreset" class="panel__scope">
-        This is an isolated preset draft. Playback does not change while you edit it.
+        This is an isolated {{ isEqPreset ? "EQ " : "" }}preset draft. Playback does not change while you edit it.
       </p>
       <p v-else-if="canOverride" class="panel__scope">
         Changes here apply only to <strong>{{ targetLabel }}</strong
@@ -200,7 +229,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         <SectionHeader
           title="EQ"
           :overridden="overridden('eq')"
-          :can-override="canOverride"
+          :can-override="canOverride && !isEqPreset"
           @clear="clearSection('eq')"
         >
           <div class="panel__spacer" />
@@ -217,6 +246,8 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
 
         <EqSliders :eq="fx.eq" @change="onEq" />
       </section>
+
+      <template v-if="!isEqPreset">
 
       <!-- Pitch ------------------------------------------------------------->
       <section class="panel__section">
@@ -239,6 +270,10 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         <p class="panel__hint">
           Varispeed: pitch and tempo move together, so this also changes speed by
           {{ tempoPercent(fx.pitch) > 0 ? "+" : "" }}{{ tempoPercent(fx.pitch).toFixed(1) }}%.
+          <template v-if="isBlockTarget">
+            The region on the timeline resizes to match, so it keeps covering the
+            same part of the song.
+          </template>
         </p>
       </section>
 
@@ -437,6 +472,47 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         </p>
       </section>
 
+      <!-- Panning ----------------------------------------------------------->
+      <section class="panel__section" data-testid="panning-section">
+        <SectionHeader
+          title="Panning"
+          :overridden="overridden('panning')"
+          :can-override="canOverride"
+          @clear="clearSection('panning')"
+        />
+        <label class="panning-mode">
+          <span>Mode</span>
+          <select
+            class="text-field"
+            aria-label="Panning mode"
+            :value="fx.panning.mode"
+            @change="onPanningMode"
+          >
+            <option value="monoPan">Mono Pan</option>
+            <option value="stereoBalance">Stereo Balance</option>
+            <option value="trueStereo">True Stereo</option>
+          </select>
+        </label>
+        <div class="knobs knobs--panning">
+          <AppKnob
+            :model-value="fx.panning.position"
+            :min="-1"
+            :max="1"
+            :detents="[0]"
+            :label="panningLabel"
+            :display="panningPositionDisplay(fx.panning.position)"
+            @update:model-value="setPanning({ position: $event })"
+          />
+          <AppKnob
+            v-if="fx.panning.mode === 'trueStereo'"
+            :model-value="fx.panning.width"
+            label="Width"
+            :display="`${Math.round(fx.panning.width * 100)}%`"
+            @update:model-value="setPanning({ width: $event })"
+          />
+        </div>
+      </section>
+
       <!-- Crossfade ----------------------------------------------------------->
       <section v-if="canEditCrossfade" class="panel__section">
         <SectionHeader
@@ -491,6 +567,10 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           @toggle="presetEditor.toggleFilter"
           @volume="presetEditor.setFilterVolume"
         />
+        <p v-if="isBlockTarget" class="panel__hint">
+          A bed here plays for as long as this region does and fades with it,
+          rather than running under the whole mix.
+        </p>
       </section>
 
       <!-- Sample rate ------------------------------------------------------->
@@ -550,6 +630,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           {{ formatHz(deviceRate) }}.
         </p>
       </section>
+      </template>
     </div>
 
     <!-- Edits whichever layer this panel is pointed at, like every other
@@ -585,7 +666,10 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
 }
 
 .panel__heading h2 {
-  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 2px 0 0;
   font-size: 15px;
   font-weight: 600;
 }
@@ -709,6 +793,21 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   flex-wrap: wrap;
   gap: 12px 6px;
   justify-content: space-between;
+}
+
+.panning-mode {
+  display: grid;
+  grid-template-columns: 68px 1fr;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.knobs--panning {
+  justify-content: flex-start;
+  gap: 24px;
 }
 
 .meter {

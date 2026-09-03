@@ -10,16 +10,23 @@
 import { computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
-import Artwork from "@/components/Artwork.vue";
-import MixCard from "@/components/home/MixCard.vue";
+import Artwork from "@/components/media/Artwork.vue";
+import PlaylistArtwork from "@/components/media/PlaylistArtwork.vue";
+import MixCard from "@/components/media/MixCard.vue";
+import EmptyState from "@/components/ui/EmptyState.vue";
+import MediaCard from "@/components/ui/MediaCard.vue";
 import * as api from "@/lib/api";
 import { useHomeStore } from "@/stores/home";
 import { usePlayerStore } from "@/stores/player";
-import type { HomePick, MixSummary } from "@/lib/types";
+import { useUiStore } from "@/stores/ui";
+import { useMenu } from "@/composables/useMenu";
+import type { HomePick, MixSummary, PlaylistSummary, Track } from "@/lib/types";
 
 const router = useRouter();
 const home = useHomeStore();
 const player = usePlayerStore();
+const ui = useUiStore();
+const { openMenu } = useMenu();
 
 onMounted(() => home.refresh());
 
@@ -53,19 +60,55 @@ function openPick(pick: HomePick) {
   void playPick(pick);
 }
 
+function showMenu(event: MouseEvent, tracks: Track[]) {
+  if (tracks.length === 0) {
+    ui.notify("No available songs in this item", "error");
+    return;
+  }
+  openMenu(event, { tracks });
+}
+
+async function openPickMenu(pick: HomePick, event: MouseEvent) {
+  try {
+    const resolved = await Promise.all(pick.trackIds.map((id) => api.getTrack(id)));
+    showMenu(event, resolved.filter((track): track is Track => track !== null));
+  } catch (error) {
+    ui.notify(`Could not open that menu: ${error}`, "error");
+  }
+}
+
+async function openMixMenu(mix: MixSummary, event: MouseEvent) {
+  try {
+    showMenu(event, await api.mixTracks(mix.kind));
+  } catch (error) {
+    ui.notify(`Could not open that menu: ${error}`, "error");
+  }
+}
+
+async function openPlaylistMenu(playlist: PlaylistSummary, event: MouseEvent) {
+  try {
+    const resolved = await api.getPlaylist(playlist.id);
+    const tracks = resolved?.items
+      .map((item) => item.track)
+      .filter((track): track is Track => track !== null) ?? [];
+    showMenu(event, tracks);
+  } catch (error) {
+    ui.notify(`Could not open that menu: ${error}`, "error");
+  }
+}
+
 </script>
 
 <template>
   <div class="home">
-    <div v-if="isBare && !home.loading" class="home__bare">
-      <PnmIcon name="home" :size="44" class="home__bare-icon" />
-      <h1>Nothing to go on yet</h1>
-      <p>
-        Mixes and recommendations are built from what you actually listen to, so this page
-        fills in as you play things.
-      </p>
-      <RouterLink to="/library" class="pill-button">Open Library</RouterLink>
-    </div>
+    <EmptyState
+      v-if="isBare && !home.loading"
+      icon="home"
+      title="Nothing to go on yet"
+      message="Mixes and recommendations are built from what you actually listen to, so this page fills in as you play things."
+    >
+      <RouterLink to="/library" class="pill-button home__bare-link">Open Library</RouterLink>
+    </EmptyState>
 
     <template v-else>
       <!-- Mixes ------------------------------------------------------------>
@@ -78,6 +121,7 @@ function openPick(pick: HomePick) {
           @open="openMix(mix)"
           @play="playMix(mix)"
           @pin="home.setPinned(mix.kind, !mix.pinned)"
+          @menu="openMixMenu(mix, $event)"
         />
       </section>
 
@@ -97,6 +141,7 @@ function openPick(pick: HomePick) {
             class="pick"
             :title="pick.reason"
             @click="openPick(pick)"
+            @contextmenu.prevent="openPickMenu(pick, $event)"
           >
             <div class="pick__art">
               <Artwork :artwork-id="pick.artworkId" :size="44" :radius="5" />
@@ -119,18 +164,22 @@ function openPick(pick: HomePick) {
         </header>
 
         <div class="playlists">
-          <button
+          <MediaCard
             v-for="playlist in home.recentPlaylists"
             :key="playlist.id"
-            class="card"
-            @click="router.push({ name: 'playlist', params: { id: playlist.id } })"
+            :title="playlist.name"
+            :subtitle="`${playlist.trackCount} ${playlist.trackCount === 1 ? 'song' : 'songs'}`"
+            @open="router.push({ name: 'playlist', params: { id: playlist.id } })"
+            @menu="openPlaylistMenu(playlist, $event)"
           >
-            <Artwork :artwork-id="playlist.artwork" :size="140" :radius="7" shadow />
-            <div class="card__title truncate">{{ playlist.name }}</div>
-            <div class="card__subtitle truncate">
-              {{ playlist.trackCount }} {{ playlist.trackCount === 1 ? "song" : "songs" }}
-            </div>
-          </button>
+            <PlaylistArtwork
+              :artwork="playlist.artwork"
+              :artwork-ids="playlist.artworkIds"
+              :size="140"
+              :radius="7"
+              shadow
+            />
+          </MediaCard>
         </div>
       </section>
     </template>
@@ -142,37 +191,7 @@ function openPick(pick: HomePick) {
   padding: 6px 26px 40px;
 }
 
-.home__bare {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  height: 100%;
-  min-height: 60vh;
-  text-align: center;
-  color: var(--text-secondary);
-}
-
-.home__bare-icon {
-  color: var(--text-tertiary);
-}
-
-.home__bare h1 {
-  margin: 4px 0 0;
-  font-size: 22px;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.home__bare p {
-  margin: 0;
-  max-width: 400px;
-  font-size: 13px;
-  line-height: 1.55;
-}
-
-.home__bare .pill-button {
+.home__bare-link {
   margin-top: 8px;
   text-decoration: none;
 }
@@ -282,35 +301,5 @@ function openPick(pick: HomePick) {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 20px 18px;
-}
-
-.card {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  text-align: left;
-  min-width: 0;
-}
-
-.card :deep(.artwork) {
-  width: 100% !important;
-  height: auto !important;
-  aspect-ratio: 1;
-  margin-bottom: 8px;
-  transition: transform 0.18s var(--ease);
-}
-
-.card:hover :deep(.artwork) {
-  transform: translateY(-2px);
-}
-
-.card__title {
-  font-size: 12.5px;
-  font-weight: 500;
-}
-
-.card__subtitle {
-  font-size: 11.5px;
-  color: var(--text-secondary);
 }
 </style>

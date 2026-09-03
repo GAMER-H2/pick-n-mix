@@ -267,6 +267,50 @@ const DEFS = {
     ],
   },
   filter: { mode: "stroke", d: ["M3.8 6.2h16.4", "M6.6 12h10.8", "M9.6 17.8h4.8"] },
+
+  // -- master mixer -------------------------------------------------------
+  /** Stacked lanes with a region on each: the playlist's timeline. */
+  timeline: {
+    mode: "stroke",
+    d: [
+      "M3.4 5.4h9.2v4H3.4z",
+      "M8.4 14.6h12.2v4H8.4z",
+      "M3.4 14.6h2",
+      "M17.6 5.4h3",
+    ],
+  },
+  /** The selection tool: a plain arrow, as in the drawing. */
+  pointer: { mode: "stroke", d: ["M6.4 3.6 18.6 12.9l-5.3.8 2.9 5.6-2.4 1.2-2.9-5.6-3.5 3.8z"] },
+  /** The blade: scissors, which is what splitting a region reads as. */
+  blade: {
+    mode: "stroke",
+    d: ["M7.4 7.4 18.6 18.6", "M16.6 7.4 9.6 14.4"],
+    circles: [
+      { cx: 6.2, cy: 17.4, r: 2.6 },
+      { cx: 17.8, cy: 17.4, r: 2.6 },
+    ],
+  },
+  /** Bounce the mix to a file. */
+  bounce: {
+    mode: "stroke",
+    d: [
+      "M12 3.6v10.4",
+      "M8.2 10.4 12 14.2l3.8-3.8",
+      "M5.2 17.4h13.6",
+    ],
+  },
+  /** Volume automation: a breakpoint envelope over a region. */
+  automation: {
+    mode: "stroke",
+    d: ["M3.4 17.6 8.6 9.4l5.4 5 6.6-8"],
+    circles: [
+      { cx: 8.6, cy: 9.4, r: 1.7 },
+      { cx: 14, cy: 14.4, r: 1.7 },
+    ],
+  },
+  stop: { mode: "fill", d: ["M6.2 6.9a.7.7 0 0 1 .7-.7h10.2a.7.7 0 0 1 .7.7v10.2a.7.7 0 0 1-.7.7H6.9a.7.7 0 0 1-.7-.7z"] },
+  undo: { mode: "stroke", d: ["M4.6 9.6h9.8a5.2 5.2 0 0 1 0 10.4H8.2", "M8.4 5.4 4.2 9.6l4.2 4.2"] },
+  redo: { mode: "stroke", d: ["M19.4 9.6H9.6a5.2 5.2 0 0 0 0 10.4h6.2", "M15.6 5.4l4.2 4.2-4.2 4.2"] },
 } as const;
 
 export type IconName = keyof typeof DEFS;

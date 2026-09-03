@@ -13,6 +13,16 @@ export interface PlaylistMenuOptions {
   id: string;
   shuffleOnly: boolean;
   hasArtwork: boolean;
+  /**
+   * Whether this playlist plays as a master mix.
+   *
+   * When it does, queueing it queues the arrangement as one block rather than
+   * its songs one by one — an arrangement cannot be spread across a queue —
+   * so the menu's queue actions are the playlist's own.
+   */
+  masterMixEnabled: boolean;
+  onPlayNext: () => Promise<void>;
+  onAddToQueue: () => Promise<void>;
   onToggleShuffleOnly: () => Promise<void>;
   onChooseArtwork: () => Promise<void>;
   onClearArtwork: () => Promise<void>;
@@ -34,6 +44,15 @@ export interface ContextMenuState {
 export const useUiStore = defineStore("ui", () => {
   const contextMenu = ref<ContextMenuState | null>(null);
   const infoTrack = ref<Track | null>(null);
+  /**
+   * Whether the information bubble is showing the mix that is playing.
+   *
+   * A flag rather than a copy of the mix: what it describes is live — the
+   * arrangement, the stream the engine built from it, and where the output is
+   * going — so the popover reads all three from the player and closes itself
+   * if the mix stops.
+   */
+  const infoMixOpen = ref(false);
   const duplicateTrack = ref<Track | null>(null);
   const settingsOpen = ref(false);
   const queueOpen = ref(false);
@@ -58,6 +77,7 @@ export const useUiStore = defineStore("ui", () => {
   return {
     contextMenu,
     infoTrack,
+    infoMixOpen,
     duplicateTrack,
     settingsOpen,
     queueOpen,

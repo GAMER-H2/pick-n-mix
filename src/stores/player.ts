@@ -1,7 +1,14 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as api from "@/lib/api";
-import type { PlaybackSnapshot, PlayContext, QueueView, Repeat, Track } from "@/lib/types";
+import type {
+  MasterMixNowPlaying,
+  PlaybackSnapshot,
+  PlayContext,
+  QueueView,
+  Repeat,
+  Track,
+} from "@/lib/types";
 
 export const usePlayerStore = defineStore("player", () => {
   const snapshot = ref<PlaybackSnapshot>({
@@ -25,6 +32,14 @@ export const usePlayerStore = defineStore("player", () => {
     context: null,
   });
 
+  /**
+   * The playlist being played as a mix, when one is.
+   *
+   * A mix has no current track — the engine holds one long timeline and the
+   * queue is empty — so this is what the player bar shows in a track's place.
+   */
+  const masterMix = ref<MasterMixNowPlaying | null>(null);
+
   /** Set while the user drags the scrubber, so ticks do not fight the drag. */
   const scrubbing = ref(false);
   const scrubPosition = ref(0);
@@ -37,25 +52,39 @@ export const usePlayerStore = defineStore("player", () => {
     scrubbing.value ? scrubPosition.value : snapshot.value.positionSecs,
   );
   const duration = computed(
-    () => snapshot.value.durationSecs || track.value?.durationSecs || 0,
+    () =>
+      snapshot.value.durationSecs ||
+      track.value?.durationSecs ||
+      masterMix.value?.durationSecs ||
+      0,
   );
+
   const progress = computed(() =>
     duration.value > 0 ? Math.min(1, position.value / duration.value) : 0,
   );
+  /** Something is loaded, so the transport means something. */
+  const hasPlayback = computed(() => track.value !== null || masterMix.value !== null);
 
   function applySnapshot(next: PlaybackSnapshot) {
     snapshot.value = next;
   }
 
   async function refresh() {
-    const [snap, current, q] = await Promise.all([
+    const [snap, current, q, mix] = await Promise.all([
       api.playbackState(),
       api.currentTrack(),
       api.queueState(),
+      api.masterMixNowPlaying(),
     ]);
     snapshot.value = snap;
     track.value = current;
     queue.value = q;
+    masterMix.value = mix;
+  }
+
+  /** Ask again which mix, if any, is playing — cheaper than a full refresh. */
+  async function refreshMasterMix() {
+    masterMix.value = await api.masterMixNowPlaying();
   }
 
   async function refreshQueue() {
@@ -64,7 +93,9 @@ export const usePlayerStore = defineStore("player", () => {
 
   async function toggle() {
     // Optimistic, so the button responds on the same frame it is pressed.
-    if (track.value) snapshot.value = { ...snapshot.value, playing: !snapshot.value.playing };
+    if (hasPlayback.value) {
+      snapshot.value = { ...snapshot.value, playing: !snapshot.value.playing };
+    }
     await api.togglePlay();
   }
 
@@ -131,6 +162,7 @@ export const usePlayerStore = defineStore("player", () => {
   return {
     snapshot,
     track,
+    masterMix,
     queue,
     scrubbing,
     scrubPosition,
@@ -140,9 +172,11 @@ export const usePlayerStore = defineStore("player", () => {
     position,
     duration,
     progress,
+    hasPlayback,
     applySnapshot,
     refresh,
     refreshQueue,
+    refreshMasterMix,
     toggle,
     playTracks,
     next,

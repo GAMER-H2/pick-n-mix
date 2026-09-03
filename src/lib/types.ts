@@ -114,10 +114,38 @@ export interface PlayContext {
   name: string;
 }
 
+/** Where one song begins inside a mix. */
+export interface MixChapter {
+  startSecs: number;
+  title: string;
+  artist: string;
+}
+
+/**
+ * A playlist that plays as a master mix, sitting in the queue as one block.
+ *
+ * Indivisible on purpose: its songs overlap inside an arrangement, so there is
+ * nothing finer than the whole mix to reorder or insert next to. The chapters
+ * are positions inside it, not entries of their own.
+ */
+export interface QueueMix {
+  playlistId: string;
+  name: string;
+  artwork: string | null;
+  artworkIds: string[];
+  durationSecs: number;
+  chapters: MixChapter[];
+}
+
+/** One row of the queue: a song, or a whole mix. */
+export type QueueEntry =
+  | { kind: "track"; track: Track }
+  | { kind: "mix"; mix: QueueMix };
+
 export interface QueueView {
-  items: Track[];
+  items: QueueEntry[];
   currentIndex: number | null;
-  upcoming: Track[];
+  upcoming: QueueEntry[];
   shuffle: boolean;
   repeat: Repeat;
   context: PlayContext | null;
@@ -158,6 +186,16 @@ export interface AnalyserFrame {
 export interface Pitch {
   semitones: number;
   cents: number;
+}
+
+export type PanningMode = "monoPan" | "stereoBalance" | "trueStereo";
+
+export interface Panning {
+  mode: PanningMode;
+  /** Pan or stereo centre, from full left (-1) to full right (1). */
+  position: number;
+  /** Half-width used by true-stereo panning, from mono (0) to full width (1). */
+  width: number;
 }
 
 export interface Reverb {
@@ -206,6 +244,7 @@ export interface MixerSettings {
   enabled?: boolean | null;
   preset?: string | null;
   pitch?: Pitch | null;
+  panning?: Panning | null;
   eq?: Eq | null;
   reverb?: Reverb | null;
   delay?: Delay | null;
@@ -221,6 +260,7 @@ export interface MixerSettings {
 export interface ResolvedMixer {
   enabled: boolean;
   pitch: Pitch;
+  panning: Panning;
   eq: Eq;
   reverb: Reverb;
   delay: Delay;
@@ -230,10 +270,13 @@ export interface ResolvedMixer {
   filters: FilterSetting[];
 }
 
+export type PresetKind = "mixer" | "eq";
+
 export interface Preset {
   id: string;
   name: string;
   builtIn: boolean;
+  kind: PresetKind;
   settings: MixerSettings;
 }
 
@@ -295,10 +338,146 @@ export interface PlaylistSummary {
   description: string;
   trackCount: number;
   artwork: string | null;
+  /** Covers of the first few different songs, quilted when there is no artwork. */
+  artworkIds: string[];
   hasMixer: boolean;
+  /** Whether a timeline has ever been built for this playlist. */
+  hasMasterMix: boolean;
+  /** Whether that timeline is what plays. */
+  masterMixEnabled: boolean;
   /** Ignore the stored order and reshuffle on every play. */
   shuffleOnly: boolean;
   path: string;
+}
+
+// -- master mix ---------------------------------------------------------------
+//
+// The Logic-style timeline behind a playlist. Mirrors `src-tauri/src/master_mix.rs`;
+// see that file for what each field means and what keeps it in range.
+
+/** Where a block's audio comes from: a playlist entry, or an imported file. */
+export type BlockSource =
+  | { kind: "entry"; index: number }
+  | { kind: "asset"; file: string };
+
+export interface AutomationPoint {
+  /** Seconds from the start of the block, so a point survives a drag. */
+  atSecs: number;
+  gainDb: number;
+  /** Shape of the segment leaving this point; 1 is linear. */
+  curve: number;
+}
+
+export interface MixBlock {
+  id: string;
+  source: BlockSource;
+  /** Absolute position on the timeline. */
+  startSecs: number;
+  /** How far into the source this block begins. */
+  offsetSecs: number;
+  durationSecs: number;
+  gainDb: number;
+  fadeInSecs: number;
+  fadeOutSecs: number;
+  mixer: MixerSettings | null;
+  automation: AutomationPoint[];
+  [extra: string]: unknown;
+}
+
+export interface MixLane {
+  id: string;
+  name: string;
+  muted: boolean;
+  soloed: boolean;
+  gainDb: number;
+  /** Stable optional lane colour; absent/null lets the timeline choose one. */
+  colorHue?: number | null;
+  blocks: MixBlock[];
+  [extra: string]: unknown;
+}
+
+export interface MasterMix {
+  enabled: boolean;
+  /** Bumped on every saved edit, so caches can tell they are stale. */
+  revision: number;
+  lanes: MixLane[];
+  [extra: string]: unknown;
+}
+
+/** One playlist entry as the timeline needs it. */
+export interface MixEntry {
+  index: number;
+  title: string;
+  artist: string;
+  artworkId: string | null;
+  /** The song's full length: the longest a block of it can be. */
+  durationSecs: number;
+  /** False when nothing in this library matched; its blocks are silent. */
+  available: boolean;
+}
+
+export interface MasterMixView {
+  playlistId: string;
+  playlistName: string;
+  mix: MasterMix;
+  entries: MixEntry[];
+  durationSecs: number;
+  /** False for the default arrangement of a playlist never mixed before. */
+  saved: boolean;
+}
+
+/**
+ * The playlist the engine is playing as a mix, for the player bar.
+ *
+ * While a mix plays there is no current track — the queue is empty and the
+ * engine holds one long timeline — so the bar shows the playlist itself and
+ * marks the songs along the scrubber.
+ */
+export interface MasterMixNowPlaying {
+  playlistId: string;
+  name: string;
+  description: string;
+  artwork: string | null;
+  artworkIds: string[];
+  trackCount: number;
+  durationSecs: number;
+  /** What the engine is summing: this many regions across this many tracks. */
+  laneCount: number;
+  blockCount: number;
+  chapters: MixChapter[];
+}
+
+/** Peak magnitudes for drawing one song's waveform. */
+export interface Waveform {
+  /** 0-255, one per 1/peaksPerSec of audio. */
+  peaks: number[];
+  peaksPerSec: number;
+  durationSecs: number;
+}
+
+/** A file copied into a playlist's assets folder, ready to become a block. */
+export interface MixAsset {
+  file: string;
+  durationSecs: number;
+}
+
+export type BounceFormat = "wav" | "flac" | "mp3";
+
+/** What this machine's ffmpeg, if any, can do. MP3 depends on it. */
+export interface FfmpegStatus {
+  path: string;
+  available: boolean;
+  /** True only when that ffmpeg was built with libmp3lame. */
+  mp3: boolean;
+  version: string;
+}
+
+export interface BounceOptions {
+  format: BounceFormat;
+  sampleRate: 44100 | 48000 | 96000;
+  wavBitDepth: 16 | 24 | 32;
+  flacCompression: number;
+  mp3Bitrate: 128 | 192 | 256 | 320;
 }
 
 // -- home ---------------------------------------------------------------------
@@ -385,6 +564,8 @@ export interface ResolvedPlaylist {
   updatedAt: number;
   shuffleOnly: boolean;
   mixer: MixerSettings | null;
+  /** Null until the master mixer has been opened for this playlist. */
+  masterMix: MasterMix | null;
   items: ResolvedEntry[];
   missingCount: number;
 }

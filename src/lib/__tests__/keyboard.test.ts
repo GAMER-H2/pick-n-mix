@@ -159,3 +159,29 @@ describe("escape closes overlays", () => {
     off();
   });
 })
+
+/**
+ * The Master Mixer runs its own transport against the same engine. With both
+ * handlers live, one space bar reached the engine twice — and depending on
+ * which landed second, a pause turned into a resume or a stop.
+ */
+describe("standing aside for another transport", () => {
+  it("ignores every key while playback is owned elsewhere", () => {
+    const player = makePlayer();
+    let suspended = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const off = installShortcuts(player as any, undefined, undefined, () => suspended);
+
+    press(" ");
+    press("l");
+    press("ArrowRight");
+    expect(player.toggle).not.toHaveBeenCalled();
+    expect(player.next).not.toHaveBeenCalled();
+    expect(player.seek).not.toHaveBeenCalled();
+
+    suspended = false;
+    press(" ");
+    expect(player.toggle).toHaveBeenCalledTimes(1);
+    off();
+  });
+});
