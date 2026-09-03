@@ -8,8 +8,8 @@
  */
 import { computed, onMounted, ref } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
-import PnmIcon from "../icons/PnmIcon.vue";
-import SelectMenu from "../SelectMenu.vue";
+import BaseModal from "../ui/BaseModal.vue";
+import SelectMenu from "../ui/SelectMenu.vue";
 import * as api from "@/lib/api";
 import { useBounceStore } from "@/stores/bounce";
 import type { BounceFormat, BounceOptions, FfmpegStatus } from "@/lib/types";
@@ -64,6 +64,16 @@ const mp3Note = computed(() => {
   return status.available
     ? "MP3 needs ffmpeg built with libmp3lame; this system's was not."
     : "MP3 needs ffmpeg, which was not found. WAV and FLAC need nothing installed.";
+});
+
+const subtitle = computed(() => {
+  const artwork = props.hasArtwork
+    ? " The playlist's image goes in as the file's cover art."
+    : "";
+  return (
+    `Render ${props.playlistName} to a single file, with mixer settings, fades and ` +
+    `keyframes baked in.${artwork}`
+  );
 });
 
 // MP3 is left out rather than shown greyed: an option that cannot be chosen
@@ -139,105 +149,57 @@ async function startBounce() {
 </script>
 
 <template>
-  <div class="scrim" @click.self="emit('close')">
-    <div class="dialog" role="dialog" aria-label="Bounce mix">
-      <header class="dialog__head">
-        <h2>Bounce mix</h2>
-        <button class="icon-button" type="button" aria-label="Close" @click="emit('close')">
-          <PnmIcon name="close" :size="17" />
-        </button>
-      </header>
-      <p class="dialog__subtitle">
-        Render {{ playlistName }} to a single file, with mixer settings, fades and
-        keyframes baked in.<template v-if="props.hasArtwork">
-          The playlist's image goes in as the file's cover art.</template>
-      </p>
-
-      <div class="dialog__fields">
-        <SelectMenu v-model="format" label="Format" :options="formatOptions" />
-        <SelectMenu v-model="sampleRate" label="Sample rate" :options="rateOptions" />
-        <SelectMenu
-          v-if="format === 'wav'"
-          v-model="wavBitDepth"
-          label="Bit depth"
-          :options="depthOptions"
-        />
-        <SelectMenu
-          v-if="format === 'flac'"
-          v-model="flacCompression"
-          label="Compression"
-          :options="flacOptions"
-        />
-        <SelectMenu
-          v-if="format === 'mp3'"
-          v-model="mp3Bitrate"
-          label="Bitrate"
-          :options="mp3Options"
-        />
-      </div>
-
-      <p v-if="mp3Note" class="dialog__note">
-        {{ mp3Note }}
-        <button class="dialog__recheck" type="button" :disabled="checking" @click="checkFfmpeg(true)">
-          {{ checking ? "Checking…" : "Check again" }}
-        </button>
-      </p>
-
-      <p v-if="error" class="dialog__error" role="alert">{{ error }}</p>
-
-      <footer class="dialog__foot">
-        <button class="pill-button is-secondary" type="button" :disabled="busy" @click="emit('close')">
-          Cancel
-        </button>
-        <button class="pill-button" type="button" :disabled="busy" @click="startBounce">
-          {{ busy ? "Starting…" : "Choose location…" }}
-        </button>
-      </footer>
+  <BaseModal
+    :open="true"
+    title="Bounce mix"
+    :subtitle="subtitle"
+    :width="380"
+    @close="emit('close')"
+  >
+    <div class="dialog__fields">
+      <SelectMenu v-model="format" label="Format" :options="formatOptions" />
+      <SelectMenu v-model="sampleRate" label="Sample rate" :options="rateOptions" />
+      <SelectMenu
+        v-if="format === 'wav'"
+        v-model="wavBitDepth"
+        label="Bit depth"
+        :options="depthOptions"
+      />
+      <SelectMenu
+        v-if="format === 'flac'"
+        v-model="flacCompression"
+        label="Compression"
+        :options="flacOptions"
+      />
+      <SelectMenu
+        v-if="format === 'mp3'"
+        v-model="mp3Bitrate"
+        label="Bitrate"
+        :options="mp3Options"
+      />
     </div>
-  </div>
+
+    <p v-if="mp3Note" class="dialog__note">
+      {{ mp3Note }}
+      <button class="dialog__recheck" type="button" :disabled="checking" @click="checkFfmpeg(true)">
+        {{ checking ? "Checking…" : "Check again" }}
+      </button>
+    </p>
+
+    <p v-if="error" class="dialog__error" role="alert">{{ error }}</p>
+
+    <template #footer>
+      <button class="pill-button is-secondary" type="button" :disabled="busy" @click="emit('close')">
+        Cancel
+      </button>
+      <button class="pill-button" type="button" :disabled="busy" @click="startBounce">
+        {{ busy ? "Starting…" : "Choose location…" }}
+      </button>
+    </template>
+  </BaseModal>
 </template>
 
 <style scoped>
-.scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 520;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.28);
-  backdrop-filter: blur(3px);
-}
-
-.dialog {
-  width: 380px;
-  display: flex;
-  flex-direction: column;
-  padding: 16px;
-  border-radius: var(--radius-lg);
-  background: var(--bg-elevated);
-  box-shadow: var(--shadow-popover);
-}
-
-.dialog__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.dialog__head h2 {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.dialog__subtitle {
-  margin: 4px 0 14px;
-  font-size: 12px;
-  color: var(--text-tertiary);
-  line-height: 1.45;
-}
-
 .dialog__fields {
   display: flex;
   flex-direction: column;
@@ -265,12 +227,5 @@ async function startBounce() {
   margin: 10px 0 0;
   font-size: 12px;
   color: var(--danger, #c44);
-}
-
-.dialog__foot {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 16px;
 }
 </style>

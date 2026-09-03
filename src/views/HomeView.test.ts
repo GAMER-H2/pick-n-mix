@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import HomeView from "./HomeView.vue";
-import MixCard from "@/components/home/MixCard.vue";
+import MixCard from "@/components/media/MixCard.vue";
 import { useUiStore } from "@/stores/ui";
 import type { HomeShelves, ResolvedPlaylist, Track } from "@/lib/types";
 

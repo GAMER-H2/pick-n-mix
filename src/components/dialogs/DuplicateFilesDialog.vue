@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import Artwork from "./Artwork.vue";
-import PnmIcon from "./icons/PnmIcon.vue";
+import Artwork from "../media/Artwork.vue";
+import BaseModal from "../ui/BaseModal.vue";
+import IconButton from "../ui/IconButton.vue";
 import * as api from "@/lib/api";
 import { formatBytes, formatDuration, formatHz, subtitleFor } from "@/lib/format";
 import type { Track, TrackFile } from "@/lib/types";
@@ -14,7 +15,6 @@ const ui = useUiStore();
 const library = useLibraryStore();
 const player = usePlayerStore();
 
-const dialog = ref<HTMLElement | null>(null);
 const versions = ref<TrackFile[]>([]);
 const loading = ref(false);
 const loadError = ref<string | null>(null);
@@ -250,13 +250,6 @@ async function chooseDestination(folder: string) {
   await relink(pending.fileId, pending.path, folder);
 }
 
-function onKeydown(event: KeyboardEvent) {
-  if (event.key !== "Escape" || !song.value) return;
-  event.preventDefault();
-  event.stopPropagation();
-  void closeDialog();
-}
-
 watch(
   () => song.value?.id ?? null,
   async (songId) => {
@@ -268,44 +261,38 @@ watch(
       loadRequest += 1;
       return;
     }
-    await nextTick();
-    dialog.value?.focus();
     await loadVersions(songId);
   },
   { immediate: true },
 );
 
-onMounted(() => window.addEventListener("keydown", onKeydown, true));
 onBeforeUnmount(() => {
-  window.removeEventListener("keydown", onKeydown, true);
   if (song.value) void api.stopTrackFilePreview();
 });
 </script>
 
 <template>
-  <Transition name="fade">
-    <div v-if="song" class="duplicate-scrim" @click.self="closeDialog">
-      <section
-        ref="dialog"
-        class="duplicate-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="duplicate-dialog-title"
-        tabindex="-1"
-      >
-        <header class="duplicate-dialog__header">
-          <Artwork :artwork-id="song.artworkId" :size="58" :radius="7" shadow />
-          <div class="duplicate-dialog__heading">
-            <p class="duplicate-dialog__eyebrow">Duplicate files</p>
-            <h2 id="duplicate-dialog-title" class="truncate">{{ song.title }}</h2>
-            <p class="truncate" :title="songSubtitle">{{ songSubtitle }}</p>
-          </div>
-          <button class="icon-button" aria-label="Close duplicate files" @click="closeDialog">
-            <PnmIcon name="close" :size="17" />
-          </button>
-        </header>
+  <BaseModal
+    :open="song !== null"
+    labelledby="duplicate-dialog-title"
+    :width="920"
+    @close="closeDialog"
+  >
+    <template #header>
+      <header class="duplicate-dialog__header">
+        <Artwork v-if="song" :artwork-id="song.artworkId" :size="58" :radius="7" shadow />
+        <div class="duplicate-dialog__heading">
+          <p class="duplicate-dialog__eyebrow">Duplicate files</p>
+          <h2 id="duplicate-dialog-title" class="truncate">{{ song?.title }}</h2>
+          <p class="truncate" :title="songSubtitle">{{ songSubtitle }}</p>
+        </div>
+        <IconButton icon="close" label="Close duplicate files" @click="closeDialog" />
+      </header>
+    </template>
+    <template #close><span /></template>
 
-        <div class="duplicate-dialog__selection">
+    <template v-if="song">
+    <div class="duplicate-dialog__selection">
           <div>
             <strong>Version in use</strong>
             <p>{{ effectiveReason }}</p>
@@ -330,13 +317,12 @@ onBeforeUnmount(() => {
               <h3 id="restore-destination-title">Choose a library folder</h3>
               <p>The restored file will be copied into Pick n Mix Restored.</p>
             </div>
-            <button
-              class="icon-button"
-              aria-label="Cancel destination selection"
+            <IconButton
+              icon="close"
+              label="Cancel destination selection"
+              :size="15"
               @click="pendingRelink = null"
-            >
-              <PnmIcon name="close" :size="15" />
-            </button>
+            />
           </div>
           <div class="destination__folders">
             <button
@@ -474,35 +460,14 @@ onBeforeUnmount(() => {
             </footer>
           </article>
         </div>
-      </section>
-    </div>
-  </Transition>
+    </template>
+  </BaseModal>
 </template>
 
 <style scoped>
-.duplicate-scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 520;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 22px;
-  background: rgba(0, 0, 0, 0.34);
-  backdrop-filter: blur(4px);
-}
-
 .duplicate-dialog {
-  width: min(920px, 100%);
-  max-height: min(86vh, 820px);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
-  border: 0.5px solid var(--separator);
-  border-radius: var(--radius-lg);
-  outline: none;
-  background: var(--bg-elevated);
-  box-shadow: var(--shadow-popover);
 }
 
 .duplicate-dialog__header {
@@ -789,10 +754,6 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 720px) {
-  .duplicate-scrim {
-    padding: 10px;
-  }
-
   .technical {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

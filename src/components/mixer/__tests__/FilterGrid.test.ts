@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import FilterGrid from "../FilterGrid.vue";
-import AppKnob from "@/components/AppKnob.vue";
+import AppKnob from "@/components/ui/AppKnob.vue";
 import { useMixerStore } from "@/stores/mixer";
 
 const activeSettings = [

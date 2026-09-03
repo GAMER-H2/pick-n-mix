@@ -3,8 +3,8 @@
  * The header shared by playlist, album and artist pages: artwork, title,
  * subtitle, and the play / shuffle / mixer row from the drawings.
  */
-import PnmIcon from "./icons/PnmIcon.vue";
-import PlaylistArtwork from "./PlaylistArtwork.vue";
+import PnmIcon from "../icons/PnmIcon.vue";
+import PlaylistArtwork from "../media/PlaylistArtwork.vue";
 
 withDefaults(
   defineProps<{

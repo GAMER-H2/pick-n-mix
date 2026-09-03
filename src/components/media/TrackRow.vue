@@ -5,8 +5,8 @@
  * on the right.
  */
 import { computed } from "vue";
-import PnmIcon from "./icons/PnmIcon.vue";
-import Artwork from "./Artwork.vue";
+import PnmIcon from "../icons/PnmIcon.vue";
+import Artwork from "../media/Artwork.vue";
 import { formatDuration, subtitleFor } from "@/lib/format";
 import type { Track } from "@/lib/types";
 

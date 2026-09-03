@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /** Cover art with a graceful fallback when a track has none. */
 import { computed, ref, watch } from "vue";
-import PnmIcon from "./icons/PnmIcon.vue";
+import PnmIcon from "../icons/PnmIcon.vue";
 import { artUrl } from "@/lib/format";
 
 const props = withDefaults(

@@ -6,9 +6,9 @@
  * drag can never be mistaken for a click on the song.
  */
 import { nextTick, onMounted, ref } from "vue";
-import PnmIcon from "./icons/PnmIcon.vue";
-import Artwork from "./Artwork.vue";
-import PlaylistArtwork from "./PlaylistArtwork.vue";
+import PnmIcon from "../icons/PnmIcon.vue";
+import Artwork from "../media/Artwork.vue";
+import PlaylistArtwork from "../media/PlaylistArtwork.vue";
 import { formatDuration, subtitleFor } from "@/lib/format";
 import { useDragReorder } from "@/lib/dragReorder";
 import type { QueueMix, Track } from "@/lib/types";

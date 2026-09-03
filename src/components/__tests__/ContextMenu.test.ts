@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
-import ContextMenu from "../ContextMenu.vue";
+import ContextMenu from "../overlays/ContextMenu.vue";
 import { useUiStore } from "@/stores/ui";
 import type { Track } from "@/lib/types";
 

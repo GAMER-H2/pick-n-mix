@@ -8,9 +8,9 @@
  */
 import { computed, ref } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
-import AppSlider from "../AppSlider.vue";
-import AppKnob from "../AppKnob.vue";
-import AppToggle from "../AppToggle.vue";
+import AppSlider from "../ui/AppSlider.vue";
+import AppKnob from "../ui/AppKnob.vue";
+import AppToggle from "../ui/AppToggle.vue";
 import EqSliders from "./EqSliders.vue";
 import EqModal from "./EqModal.vue";
 import PresetSelect from "./PresetSelect.vue";
@@ -170,8 +170,8 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   <aside class="panel" role="complementary" aria-label="DJ Advanced Mixer">
     <header class="panel__head">
       <div class="panel__heading">
-        <h2>{{ isEqPreset ? "EQ Preset Editor" : "DJ Advanced Mixer" }}</h2>
-        <p class="panel__target truncate">
+        <p class="eyebrow">{{ isEqPreset ? "EQ Preset Editor" : "Advanced DJ Mixer" }}</p>
+        <h2 class="panel__title truncate">
           <PnmIcon
             :name="
               isPreset || mixer.target.kind === 'global'
@@ -183,7 +183,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
             :size="12"
           />
           <span>{{ targetLabel }}</span>
-        </p>
+        </h2>
       </div>
       <button class="icon-button" aria-label="Close mixer" @click="closePanel">
         <PnmIcon name="close" :size="18" />
@@ -666,7 +666,10 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
 }
 
 .panel__heading h2 {
-  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 2px 0 0;
   font-size: 15px;
   font-weight: 600;
 }

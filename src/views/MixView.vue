@@ -7,17 +7,21 @@
  * every time it is opened. Saving takes a copy into a real playlist, which is
  * the only way to keep a mix past the next regeneration.
  */
-import { computed, ref, watch } from "vue";
+import { computed, ref } from "vue";
 import { useRoute } from "vue-router";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
-import CollectionHeader from "@/components/CollectionHeader.vue";
-import TrackRow from "@/components/TrackRow.vue";
-import { formatTotal } from "@/lib/format";
+import CollectionHeader from "@/components/collections/CollectionHeader.vue";
+import TrackList from "@/components/collections/TrackList.vue";
+import EmptyState from "@/components/ui/EmptyState.vue";
 import * as api from "@/lib/api";
 import { useHomeStore } from "@/stores/home";
 import { usePlayerStore } from "@/stores/player";
 import { usePlaylistStore } from "@/stores/playlists";
 import { useUiStore } from "@/stores/ui";
+import { useCollectionMeta } from "@/composables/useCollectionMeta";
+import { useCollectionPlayback } from "@/composables/useCollectionPlayback";
+import { useMenu } from "@/composables/useMenu";
+import { useRouteParamLoader } from "@/composables/useRouteParamLoader";
 import type { MixKind, Track } from "@/lib/types";
 
 const route = useRoute();
@@ -25,59 +29,48 @@ const home = useHomeStore();
 const player = usePlayerStore();
 const playlists = usePlaylistStore();
 const ui = useUiStore();
+const { openMenu } = useMenu();
 
 const tracks = ref<Track[]>([]);
-const loading = ref(false);
 const saving = ref(false);
 const savePickerOpen = ref(false);
 
 const kind = computed(() => String(route.params.kind) as MixKind);
 const summary = computed(() => home.mix(kind.value));
 const artworkId = computed(() => tracks.value.find((t) => t.artworkId)?.artworkId ?? null);
-const total = computed(() => tracks.value.reduce((sum, t) => sum + t.durationSecs, 0));
-const meta = computed(
-  () => `${tracks.value.length} songs · ${formatTotal(total.value)}`,
-);
+const items = computed(() => tracks.value.map((track) => ({ track })));
+const { meta } = useCollectionMeta(tracks);
+
+const { loading } = useRouteParamLoader("kind", async (next) => {
+  if (!home.shelves) await home.refresh();
+  // The route only ever carries one of the three known mix kinds.
+  tracks.value = await api.mixTracks(next as MixKind);
+});
 
 /** A mix is only "playing" when the queue is actually running this mix. */
 const playingThisMix = computed(() => player.queue.context?.id === kind.value);
-
-watch(
-  () => route.params.kind,
-  async (next) => {
-    if (typeof next !== "string") return;
-    loading.value = true;
-    try {
-      if (!home.shelves) await home.refresh();
-      tracks.value = await api.mixTracks(next as MixKind);
-    } finally {
-      loading.value = false;
-    }
-  },
-  { immediate: true },
+const currentId = computed(() =>
+  playingThisMix.value ? (player.track?.id ?? null) : null,
 );
 
 function isCurrent(track: Track) {
   return playingThisMix.value && player.track?.id === track.id;
 }
 
+const { playOrToggle, shuffleAndPlay } = useCollectionPlayback();
+
 async function play(startIndex = 0) {
   await api.playMix(kind.value, startIndex);
 }
 
 /** Clicking the row already playing toggles it rather than restarting it. */
-async function playTrack(index: number) {
+function playTrack(index: number) {
   const track = tracks.value[index];
-  if (track && isCurrent(track)) {
-    await player.toggle();
-    return;
-  }
-  await play(index);
+  return playOrToggle(isCurrent(track), () => play(index));
 }
 
-async function shuffle() {
-  await player.setShuffle(true);
-  await play(0);
+function shuffle() {
+  return shuffleAndPlay(() => play(0));
 }
 
 async function save(playlistId?: string) {
@@ -117,9 +110,7 @@ async function regenerate() {
       :disabled="tracks.length === 0"
       @play="play(0)"
       @shuffle="shuffle"
-      @menu="
-        ui.openContextMenu({ x: $event.clientX, y: $event.clientY, tracks })
-      "
+      @menu="openMenu($event, { tracks })"
     />
 
     <div class="mix__actions">
@@ -162,23 +153,21 @@ async function regenerate() {
       </p>
     </div>
 
-    <p v-if="!loading && tracks.length === 0" class="mix__empty">
-      There is not enough listening history to build this mix yet. Play a few things and
-      come back.
-    </p>
+    <EmptyState
+      v-if="!loading && tracks.length === 0"
+      compact
+      message="There is not enough listening history to build this mix yet. Play a few things and come back."
+    />
 
-    <div v-else class="mix__list">
-      <TrackRow
-        v-for="(track, index) in tracks"
-        :key="track.id"
-        :track="track"
-        show-artwork
-        :current="isCurrent(track)"
-        :playing="player.playing"
-        @play="playTrack(index)"
-        @menu="ui.openContextMenu({ x: $event.clientX, y: $event.clientY, tracks: [track] })"
-      />
-    </div>
+    <TrackList
+      v-else
+      :items="items"
+      :current-id="currentId"
+      :playing="player.playing"
+      show-artwork
+      @play="playTrack"
+      @menu="(event, index) => { const track = tracks[index]; if (track) openMenu(event, { tracks: [track] }); }"
+    />
   </div>
 </template>
 
@@ -246,13 +235,6 @@ async function regenerate() {
 .save__empty {
   margin: 2px 4px;
   font-size: 11.5px;
-  color: var(--text-tertiary);
-}
-
-.mix__empty {
-  padding: 50px 0;
-  text-align: center;
-  font-size: 13px;
   color: var(--text-tertiary);
 }
 </style>

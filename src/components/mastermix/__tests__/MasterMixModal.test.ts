@@ -592,7 +592,7 @@ describe("MasterMixModal", () => {
     await flushPromises();
 
     expect(wrapper.find(".mm__block-mixer").exists()).toBe(true);
-    expect(wrapper.text()).toContain("DJ Advanced Mixer");
+    expect(wrapper.text()).toContain("Advanced DJ Mixer");
     // Both are per-voice on the timeline, so a block gets them like anything
     // else does.
     expect(wrapper.text()).toContain("Atmospheres");

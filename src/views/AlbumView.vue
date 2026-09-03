@@ -3,71 +3,46 @@
  * An album, laid out like the second drawing: large artwork on the left with
  * the track list beside it.
  */
-import { computed, ref, watch } from "vue";
-import CollectionHeader from "@/components/CollectionHeader.vue";
-import TrackRow from "@/components/TrackRow.vue";
+import { computed, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { formatTotal, subtitleFor } from "@/lib/format";
+import CollectionHeader from "@/components/collections/CollectionHeader.vue";
+import TrackList from "@/components/collections/TrackList.vue";
+import { subtitleFor } from "@/lib/format";
 import * as api from "@/lib/api";
-import { usePlayerStore } from "@/stores/player";
-import { useUiStore } from "@/stores/ui";
 import { stableArtistId } from "@/lib/ids";
-import type { Track } from "@/lib/types";
+import { useCollectionMeta } from "@/composables/useCollectionMeta";
+import { useCollectionPlayback } from "@/composables/useCollectionPlayback";
+import { useMenu } from "@/composables/useMenu";
+import { useRouteParamLoader } from "@/composables/useRouteParamLoader";
+import type { PlayContext, Track } from "@/lib/types";
 
 const route = useRoute();
 const router = useRouter();
-const player = usePlayerStore();
-const ui = useUiStore();
+const { openMenu } = useMenu();
 
 const tracks = ref<Track[]>([]);
-const loading = ref(false);
+useRouteParamLoader("id", async (id) => {
+  tracks.value = await api.albumTracks(id);
+});
 
+const { meta } = useCollectionMeta(tracks);
 const first = computed(() => tracks.value[0] ?? null);
-const total = computed(() => tracks.value.reduce((sum, t) => sum + t.durationSecs, 0));
-const meta = computed(() =>
-  subtitleFor([
-    `${tracks.value.length} ${tracks.value.length === 1 ? "song" : "songs"}`,
-    formatTotal(total.value),
-  ]),
-);
+const items = computed(() => tracks.value.map((track) => ({ track })));
+const context = computed<PlayContext>(() => ({
+  kind: "album",
+  id: String(route.params.id),
+  name: first.value?.album ?? "",
+}));
 
-watch(
-  () => route.params.id,
-  async (id) => {
-    if (typeof id !== "string") return;
-    loading.value = true;
-    try {
-      tracks.value = await api.albumTracks(id);
-    } finally {
-      loading.value = false;
-    }
-  },
-  { immediate: true },
-);
+const { player, playFromList, shuffleAndPlay } = useCollectionPlayback();
 
-/**
- * Clicking the row that is already playing toggles it, rather than restarting
- * it from the beginning. Anything else starts the list from that song.
- */
-async function play(index = 0) {
-  if (!first.value) return;
-  const track = tracks.value[index];
-  if (track && player.track?.id === track.id) {
-    await player.toggle();
-    return;
-  }
-  await player.playTracks(tracks.value, index, {
-    kind: "album",
-    id: String(route.params.id),
-    name: first.value.album,
-  });
+function play(index: number) {
+  return playFromList(tracks.value, index, context.value);
 }
 
-async function shuffle() {
-  await player.setShuffle(true);
-  await play(0);
+function shuffle() {
+  return shuffleAndPlay(() => play(0));
 }
-
 </script>
 
 <template>
@@ -81,7 +56,7 @@ async function shuffle() {
       :show-mixer="false"
       @play="play(0)"
       @shuffle="shuffle"
-      @menu="ui.openContextMenu({ x: $event.clientX, y: $event.clientY, tracks })"
+      @menu="openMenu($event, { tracks })"
     />
 
     <button
@@ -92,22 +67,15 @@ async function shuffle() {
       Go to {{ first.albumArtist || first.artist }}
     </button>
 
-    <div class="album__list">
-      <TrackRow
-        v-for="(track, index) in tracks"
-        :key="track.id"
-        :track="track"
-        :index="track.trackNumber ?? index + 1"
-        :current="player.track?.id === track.id"
-        :playing="player.playing"
-        @play="play(index)"
-        @menu="ui.openContextMenu({ x: $event.clientX, y: $event.clientY, tracks: [track] })"
-      />
-    </div>
-
-    <p v-if="!loading && tracks.length === 0" class="album__empty">
-      This album is no longer in your library.
-    </p>
+    <TrackList
+      :items="items"
+      :current-id="player.track?.id ?? null"
+      :playing="player.playing"
+      numbered
+      empty-message="This album is no longer in your library."
+      @play="play"
+      @menu="(event, index) => { const track = tracks[index]; if (track) openMenu(event, { tracks: [track] }); }"
+    />
   </div>
 </template>
 
@@ -121,12 +89,5 @@ async function shuffle() {
   font-size: 12.5px;
   font-weight: 500;
   color: var(--accent);
-}
-
-.album__empty {
-  padding: 60px 0;
-  text-align: center;
-  font-size: 13px;
-  color: var(--text-tertiary);
 }
 </style>

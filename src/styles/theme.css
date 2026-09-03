@@ -27,6 +27,14 @@
   --shadow-popover: 0 10px 40px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.1);
   --shadow-art: 0 4px 18px rgba(0, 0, 0, 0.16);
 
+  /* Layering scale. Never write a bare z-index; add a token if a new layer
+     is genuinely needed. See docs/ui-design-system.md §2. */
+  --z-panel: 300;
+  --z-modal: 520;
+  --z-modal-top: 530;
+  --z-context: 540;
+  --z-popover: 600;
+
   --sidebar-width: 244px;
   --player-height: 78px;
   --mixer-width: 336px;
@@ -250,6 +258,21 @@ textarea {
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--text-tertiary);
+}
+
+/*
+ * The small-caps accent label above a surface's title — the shared pattern for
+ * naming which surface you are looking at (Settings, DJ Mixer, Advanced DJ
+ * Mixer, Equaliser, Master Mixer). The title under it says what the surface is
+ * acting on. See docs/ui-design-system.md §6.
+ */
+.eyebrow {
+  margin: 0;
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .truncate {

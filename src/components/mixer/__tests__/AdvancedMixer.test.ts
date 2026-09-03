@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import AdvancedMixer from "../AdvancedMixer.vue";
-import AppKnob from "@/components/AppKnob.vue";
+import AppKnob from "@/components/ui/AppKnob.vue";
 import { useMixerStore } from "@/stores/mixer";
 
 const setGlobalMixer = vi.fn();

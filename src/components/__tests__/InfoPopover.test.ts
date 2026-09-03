@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
-import InfoPopover from "../InfoPopover.vue";
+import InfoPopover from "../overlays/InfoPopover.vue";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";
 import type { MasterMixNowPlaying } from "@/lib/types";

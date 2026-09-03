@@ -5,164 +5,59 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import Sidebar from "./components/Sidebar.vue";
-import PnmIcon from "./components/icons/PnmIcon.vue";
-import NowPlayingBar from "./components/NowPlayingBar.vue";
-import QueuePanel from "./components/QueuePanel.vue";
+import Sidebar from "./components/layout/Sidebar.vue";
+import NowPlayingBar from "./components/layout/NowPlayingBar.vue";
+import QueuePanel from "./components/layout/QueuePanel.vue";
 import AdvancedMixer from "./components/mixer/AdvancedMixer.vue";
-import ContextMenu from "./components/ContextMenu.vue";
-import AddToPlaylistDialog from "./components/AddToPlaylistDialog.vue";
-import DuplicateFilesDialog from "./components/DuplicateFilesDialog.vue";
+import ContextMenu from "./components/overlays/ContextMenu.vue";
+import AddToPlaylistDialog from "./components/dialogs/AddToPlaylistDialog.vue";
+import DuplicateFilesDialog from "./components/dialogs/DuplicateFilesDialog.vue";
 import SettingsModal from "./components/settings/SettingsModal.vue";
 import MasterMixModal from "./components/mastermix/MasterMixModal.vue";
-import BounceProgress from "./components/BounceProgress.vue";
+import BounceProgress from "./components/layout/BounceProgress.vue";
+import PnmIcon from "./components/icons/PnmIcon.vue";
 import { usePlayerStore } from "./stores/player";
 import { useLibraryStore } from "./stores/library";
-import { usePlaylistStore } from "./stores/playlists";
 import { useMixerStore } from "./stores/mixer";
-import { useCrossfadeStore } from "./stores/crossfade";
-import { useHomeStore } from "./stores/home";
 import { useUiStore } from "./stores/ui";
 import { useMasterMixStore } from "./stores/masterMix";
-import { useBounceStore } from "./stores/bounce";
 import { useSettingsStore } from "./stores/settings";
 import { installShortcuts } from "./lib/keyboard";
 import { registerScroller } from "./lib/viewState";
-import type { PlaybackSnapshot, QueueView, ResolvedMixer, Track } from "./lib/types";
+import { useWindowChrome } from "./composables/useWindowChrome";
+import { useBackendEvents } from "./composables/useBackendEvents";
 
 const player = usePlayerStore();
 const library = useLibraryStore();
-const playlists = usePlaylistStore();
 const mixer = useMixerStore();
-const crossfade = useCrossfadeStore();
-const home = useHomeStore();
 const ui = useUiStore();
 const masterMix = useMasterMixStore();
-const bounce = useBounceStore();
 const settings = useSettingsStore();
 const route = useRoute();
 const router = useRouter();
 
 const isNowPlaying = computed(() => route.name === "nowPlaying");
-const usesCustomTitlebar = ref(false);
-const isMaximized = ref(false);
-const isFocused = ref(true);
 /** The scrolling element, handed to the back/forward scroll restore. */
 const mainEl = ref<HTMLElement | null>(null);
 
-type ResizeDirection =
-  | "East"
-  | "North"
-  | "NorthEast"
-  | "NorthWest"
-  | "South"
-  | "SouthEast"
-  | "SouthWest"
-  | "West";
+const {
+  usesCustomTitlebar,
+  isMaximized,
+  isFocused,
+  resizeRegions,
+  minimizeWindow,
+  toggleMaximizeWindow,
+  closeWindow,
+  startResizeWindow,
+  reportWindowControlError,
+} = useWindowChrome();
 
-const resizeRegions: ReadonlyArray<{ direction: ResizeDirection; className: string }> = [
-  { direction: "North", className: "app__resize-region--north" },
-  { direction: "NorthEast", className: "app__resize-region--north-east" },
-  { direction: "East", className: "app__resize-region--east" },
-  { direction: "SouthEast", className: "app__resize-region--south-east" },
-  { direction: "South", className: "app__resize-region--south" },
-  { direction: "SouthWest", className: "app__resize-region--south-west" },
-  { direction: "West", className: "app__resize-region--west" },
-  { direction: "NorthWest", className: "app__resize-region--north-west" },
-];
+const { init: initBackendEvents } = useBackendEvents();
 
-/**
- * Whether this window has to draw its own frame.
- *
- * Asked of the window rather than inferred from the user agent, so it stays
- * true to whatever `decorations` the platform config actually applied instead
- * of being a second, silently divergent source of truth.
- */
-async function usesClientSideDecorations() {
-  if (!("__TAURI_INTERNALS__" in window)) return false;
-  try {
-    return !(await getCurrentWindow().isDecorated());
-  } catch (error) {
-    reportWindowControlError(error);
-    return false;
-  }
-}
-
-/**
- * Whether the system's window buttons are floating over our own content.
- *
- * The user agent rather than a plugin: this only decides how much padding to
- * leave, so being wrong costs a little space and nothing else, and the app
- * already avoids adding a dependency for a single boolean.
- */
-function isMacOverlay(): boolean {
-  return /Mac(intosh| OS X)/.test(navigator.userAgent);
-}
-
-/** Kept in step so the frame and its shadow drop away when maximised. */
-async function syncMaximized() {
-  try {
-    isMaximized.value = await getCurrentWindow().isMaximized();
-  } catch (error) {
-    reportWindowControlError(error);
-  }
-}
-
-async function minimizeWindow() {
-  await getCurrentWindow().minimize();
-}
-
-async function toggleMaximizeWindow() {
-  await getCurrentWindow().toggleMaximize();
-  await syncMaximized();
-}
-
-async function closeWindow() {
-  await getCurrentWindow().close();
-}
-
-async function startResizeWindow(direction: ResizeDirection) {
-  await getCurrentWindow().startResizeDragging(direction);
-}
-
-function reportWindowControlError(error: unknown) {
-  console.error("Unable to change the window state:", error);
-}
-
-const unlisteners = ref<UnlistenFn[]>([]);
 let removeShortcuts: (() => void) | null = null;
-let unlistenResize: UnlistenFn | null = null;
-let unlistenFocus: UnlistenFn | null = null;
 
 onMounted(async () => {
   await settings.initialise();
-
-  // macOS keeps its own decorations but floats the traffic lights over the
-  // webview's top-left corner, so anything drawn there has to leave room. The
-  // two cases are exclusive: a window either draws its own controls or has
-  // the system's laid over it.
-  if (isMacOverlay()) document.documentElement.classList.add("is-mac-overlay");
-
-  if (await usesClientSideDecorations()) {
-    usesCustomTitlebar.value = true;
-    document.documentElement.classList.add("is-custom-titlebar");
-    await syncMaximized();
-    // Maximising, tiling and snapping all arrive as a resize.
-    unlistenResize = await getCurrentWindow().onResized(() => {
-      void syncMaximized();
-    });
-
-    try {
-      isFocused.value = await getCurrentWindow().isFocused();
-    } catch (error) {
-      reportWindowControlError(error);
-    }
-    unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload }) => {
-      isFocused.value = payload;
-    });
-  }
 
   registerScroller(mainEl.value);
 
@@ -170,62 +65,12 @@ onMounted(async () => {
   // global keys stand down for as long as it is open.
   removeShortcuts = installShortcuts(player, ui, router, () => masterMix.open);
 
-  unlisteners.value = await Promise.all([
-    listen<PlaybackSnapshot>("playback", (e) => player.applySnapshot(e.payload)),
-    listen<Track | null>("track-changed", (e) => {
-      player.track = e.payload;
-      // The track layer of the cascade changed with it, but the preset list
-      // and filter catalogue did not, so avoid the disk-reading variant.
-      mixer.refreshLayers();
-      // Starting a track is also how a mixed playlist stops being what plays,
-      // so the bar has to be told to stop showing one.
-      void player.refreshMasterMix();
-    }),
-    listen<QueueView>("queue-changed", (e) => (player.queue = e.payload)),
-    listen<boolean>("playing-changed", () => player.refresh()),
-    listen("queue-ended", () => player.refresh()),
-    listen("master-mix-ended", () => masterMix.previewEnded()),
-    listen("library-changed", () => library.refresh()),
-    listen("playlists-changed", () => playlists.refresh()),
-    // Only the sidebar's pinned list: rebuilding the whole home page here
-    // would fight with whatever the listener is looking at.
-    listen("home-changed", () => home.refreshPinned()),
-    listen<ResolvedMixer>("mixer-changed", () => mixer.refresh()),
-    listen<{ count: number; path: string }>(
-      "scan-progress",
-      (e) => (library.scanProgress = e.payload),
-    ),
-    listen<string>("engine-error", (e) => ui.notify(e.payload, "error")),
-    listen<{ id: string; fraction: number }>("bounce-progress", (e) =>
-      bounce.onProgress(e.payload.id, e.payload.fraction),
-    ),
-    listen<{ id: string; path: string; error: string | null }>("bounce-finished", (e) => {
-      bounce.onFinished(e.payload.id, e.payload.path, e.payload.error);
-      if (e.payload.error) ui.notify(e.payload.error, "error");
-    }),
-  ]);
-
-  // Listeners first, then the initial fetch: an event emitted between the two
-  // would otherwise be missed, leaving the UI showing nothing while the engine
-  // is already playing.
-  await Promise.all([
-    library.refresh(),
-    playlists.refresh(),
-    home.refreshPinned(),
-    player.refresh(),
-    mixer.refresh(),
-    crossfade.refresh(),
-  ]);
+  await initBackendEvents();
 });
 
 onBeforeUnmount(() => {
-  unlisteners.value.forEach((un) => un());
   removeShortcuts?.();
-  unlistenResize?.();
-  unlistenFocus?.();
   registerScroller(null);
-  document.documentElement.classList.remove("is-custom-titlebar");
-  document.documentElement.classList.remove("is-mac-overlay");
 });
 </script>
 
@@ -332,7 +177,6 @@ onBeforeUnmount(() => {
     </template>
   </div>
 </template>
-
 <style scoped>
 :global(html.is-custom-titlebar),
 :global(html.is-custom-titlebar body),

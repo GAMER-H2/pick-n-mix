@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
-import NowPlayingBar from "../NowPlayingBar.vue";
+import NowPlayingBar from "../layout/NowPlayingBar.vue";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
 import type { MasterMixNowPlaying } from "@/lib/types";

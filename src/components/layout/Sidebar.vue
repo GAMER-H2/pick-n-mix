@@ -2,7 +2,7 @@
 /** Navigation and playlists, matching the drawings' left column. */
 import { ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import PnmIcon from "./icons/PnmIcon.vue";
+import PnmIcon from "../icons/PnmIcon.vue";
 import { usePlaylistStore } from "@/stores/playlists";
 import { useHomeStore } from "@/stores/home";
 import { useMixerStore } from "@/stores/mixer";

@@ -3,11 +3,12 @@
  * A small dropdown in the app's own styling.
  *
  * A native `<select>` renders with the platform widget, which sits badly
- * against the rest of the interface, so this borrows the context menu's look:
- * same surface, radius, shadow and tick.
+ * against the rest of the interface, so this opens a `MenuSurface` — the one
+ * menu look — under a pill-shaped trigger.
  */
 import { computed, nextTick, ref } from "vue";
-import PnmIcon from "./icons/PnmIcon.vue";
+import PnmIcon from "../icons/PnmIcon.vue";
+import MenuSurface, { type MenuItem } from "./MenuSurface.vue";
 import { useDismiss } from "@/lib/dismiss";
 
 export interface SelectOption {
@@ -32,6 +33,14 @@ const selected = computed(
   () => props.options.find((option) => option.id === props.modelValue) ?? props.options[0],
 );
 
+const menuItems = computed<MenuItem[]>(() =>
+  props.options.map((option) => ({
+    id: option.id,
+    label: option.label,
+    checked: option.id === props.modelValue,
+  })),
+);
+
 useDismiss(
   () => open.value,
   () => (open.value = false),
@@ -44,7 +53,7 @@ async function toggle() {
   if (!open.value) return;
   // Focus the current option so the arrow keys have somewhere to start.
   await nextTick();
-  listEl.value?.querySelector<HTMLElement>("[data-selected]")?.focus();
+  listEl.value?.querySelector<HTMLElement>("[aria-checked='true']")?.focus();
 }
 
 function choose(id: string) {
@@ -54,7 +63,7 @@ function choose(id: string) {
 
 /** Roving focus, so the list behaves like a menu rather than a set of buttons. */
 function onListKeydown(event: KeyboardEvent) {
-  const items = Array.from(listEl.value?.querySelectorAll<HTMLElement>("[data-option]") ?? []);
+  const items = Array.from(listEl.value?.querySelectorAll<HTMLElement>(".menu__item") ?? []);
   if (items.length === 0) return;
   const index = items.indexOf(document.activeElement as HTMLElement);
 
@@ -74,7 +83,7 @@ function onListKeydown(event: KeyboardEvent) {
       type="button"
       :aria-label="label"
       :aria-expanded="open"
-      aria-haspopup="listbox"
+      aria-haspopup="menu"
       @click="toggle"
     >
       <span class="select__label">{{ label }}</span>
@@ -83,33 +92,8 @@ function onListKeydown(event: KeyboardEvent) {
     </button>
 
     <Transition name="pop">
-      <div
-        v-if="open"
-        ref="listEl"
-        class="select__menu"
-        role="listbox"
-        :aria-label="label"
-        @keydown="onListKeydown"
-      >
-        <button
-          v-for="option in options"
-          :key="option.id"
-          data-option
-          :data-selected="option.id === modelValue ? '' : undefined"
-          class="select__option"
-          type="button"
-          role="option"
-          :aria-selected="option.id === modelValue"
-          @click="choose(option.id)"
-        >
-          <span>{{ option.label }}</span>
-          <PnmIcon
-            v-if="option.id === modelValue"
-            name="check"
-            :size="14"
-            class="select__tick"
-          />
-        </button>
+      <div v-if="open" ref="listEl" class="select__menu" @keydown="onListKeydown">
+        <MenuSurface :items="menuItems" @select="choose" />
       </div>
     </Transition>
   </div>
@@ -159,38 +143,10 @@ function onListKeydown(event: KeyboardEvent) {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  z-index: 300;
+  z-index: var(--z-popover);
   /* Never narrower than the trigger, so the two line up on both edges rather
      than only on the right. */
   min-width: max(168px, 100%);
-  padding: 5px;
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
-  box-shadow: var(--shadow-popover);
-  border: 0.5px solid var(--separator);
   transform-origin: top right;
-}
-
-.select__option {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 7px 9px;
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  color: var(--text);
-  text-align: left;
-}
-
-.select__option:hover,
-.select__option:focus-visible {
-  background: var(--accent);
-  color: var(--accent-contrast);
-}
-
-.select__tick {
-  margin-left: auto;
-  flex: none;
 }
 </style>

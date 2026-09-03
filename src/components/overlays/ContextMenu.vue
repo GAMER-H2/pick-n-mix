@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /** The right-click menu from the drawings. */
-import { computed, onMounted, onBeforeUnmount, ref } from "vue";
+import { computed, ref } from "vue";
 import { useRouter } from "vue-router";
-import PnmIcon from "./icons/PnmIcon.vue";
-import type { IconName } from "./icons/paths";
+import MenuSurface from "../ui/MenuSurface.vue";
+import type { IconName } from "../icons/paths";
+import { useDismiss } from "@/lib/dismiss";
 import { useUiStore } from "@/stores/ui";
 import { usePlaylistStore } from "@/stores/playlists";
 import { usePlayerStore } from "@/stores/player";
@@ -236,6 +237,32 @@ const items = computed<Item[]>(() => {
   return list;
 });
 
+/** The flat item list split into groups at each `separated` row. */
+const groups = computed(() => {
+  const out: {
+    items: {
+      id: string;
+      label: string;
+      icon: IconName;
+      danger?: boolean;
+      warning?: boolean;
+      checked?: boolean;
+    }[];
+  }[] = [];
+  for (const item of items.value) {
+    if (item.separated || out.length === 0) out.push({ items: [] });
+    out[out.length - 1].items.push({
+      id: item.label,
+      label: item.label,
+      icon: item.icon,
+      danger: item.danger,
+      warning: item.warning,
+      checked: item.checked,
+    });
+  }
+  return out;
+});
+
 async function run(item: Item) {
   const onSelect = menu.value?.onSelect;
   ui.closeContextMenu();
@@ -247,47 +274,22 @@ async function run(item: Item) {
   }
 }
 
-function onPointerDown(event: PointerEvent) {
-  if (el.value && !el.value.contains(event.target as Node)) ui.closeContextMenu();
+function onSelect(id: string) {
+  const item = items.value.find((candidate) => candidate.label === id);
+  if (item) void run(item);
 }
 
-function onKeydown(event: KeyboardEvent) {
-  if (event.key === "Escape") ui.closeContextMenu();
-}
-
-onMounted(() => {
-  window.addEventListener("pointerdown", onPointerDown, true);
-  window.addEventListener("keydown", onKeydown);
-});
-
-onBeforeUnmount(() => {
-  window.removeEventListener("pointerdown", onPointerDown, true);
-  window.removeEventListener("keydown", onKeydown);
-});
+useDismiss(
+  () => ui.contextMenu !== null,
+  () => ui.closeContextMenu(),
+  el,
+);
 </script>
 
 <template>
   <Transition name="pop">
-    <div v-if="menu && items.length" ref="el" class="menu" :style="position" role="menu">
-      <template v-for="item in items" :key="item.label">
-        <div v-if="item.separated" class="menu__separator" />
-        <button
-          class="menu__item"
-          :class="{ 'is-danger': item.danger }"
-          role="menuitem"
-          :aria-checked="item.checked === undefined ? undefined : item.checked"
-          @click="run(item)"
-        >
-          <PnmIcon
-            class="menu__icon"
-            :class="{ 'is-warning': item.warning }"
-            :name="item.icon"
-            :size="17"
-          />
-          <span>{{ item.label }}</span>
-          <PnmIcon v-if="item.checked" class="menu__tick" name="check" :size="15" />
-        </button>
-      </template>
+    <div v-if="menu && items.length" ref="el" class="menu" :style="position">
+      <MenuSurface :groups="groups" @select="onSelect" />
     </div>
   </Transition>
 </template>
@@ -295,56 +297,10 @@ onBeforeUnmount(() => {
 <style scoped>
 .menu {
   position: fixed;
-  z-index: 540;
+  z-index: var(--z-context);
   min-width: 214px;
-  padding: 5px;
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
-  box-shadow: var(--shadow-popover);
-  border: 0.5px solid var(--separator);
   transform-origin: top left;
   max-height: calc(100vh - 16px);
   overflow-y: auto;
-}
-
-.menu__item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 7px 9px;
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  color: var(--text);
-  text-align: left;
-}
-
-.menu__item:hover {
-  background: var(--accent);
-  color: var(--accent-contrast);
-}
-
-.menu__tick {
-  margin-left: auto;
-  flex: none;
-}
-
-.menu__icon.is-warning {
-  color: #d7373f;
-}
-
-.menu__item.is-danger {
-  color: #d7373f;
-}
-
-.menu__item.is-danger:hover {
-  background: #d7373f;
-  color: #fff;
-}
-
-.menu__separator {
-  height: 1px;
-  margin: 5px 8px;
-  background: var(--separator);
 }
 </style>

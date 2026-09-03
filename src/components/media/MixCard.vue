@@ -8,18 +8,18 @@
  */
 import { computed } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
-import Artwork from "../Artwork.vue";
+import PlaylistArtwork from "./PlaylistArtwork.vue";
+import Artwork from "./Artwork.vue";
 import type { MixSummary } from "@/lib/types";
 
 const props = defineProps<{ mix: MixSummary; ready: boolean }>();
 defineEmits<{ open: []; play: []; pin: []; menu: [event: MouseEvent] }>();
 
 /**
- * Up to four covers, as a quilt. Fewer than four is drawn as a single cover
- * rather than an unbalanced grid.
+ * The mix's picture. The quilt-or-single rule lives in `PlaylistArtwork`, so
+ * a mix and a playlist with the same covers always look the same.
  */
-const covers = computed(() => props.mix.artworkIds.slice(0, 4));
-const isQuilt = computed(() => covers.value.length >= 4);
+const hasCovers = computed(() => props.mix.artworkIds.length > 0);
 </script>
 
 <template>
@@ -34,10 +34,13 @@ const isQuilt = computed(() => covers.value.length >= 4);
       :title="ready ? `Open ${mix.name}` : 'Not enough listening yet'"
       @click="$emit('open')"
     >
-      <div v-if="isQuilt" class="mix__quilt">
-        <Artwork v-for="id in covers" :key="id" :artwork-id="id" :size="80" :radius="0" />
-      </div>
-      <Artwork v-else :artwork-id="covers[0] ?? null" :size="160" :radius="0" />
+      <PlaylistArtwork
+        v-if="hasCovers"
+        :artwork-ids="mix.artworkIds"
+        :size="160"
+        :radius="0"
+      />
+      <Artwork v-else :artwork-id="null" :size="160" :radius="0" />
 
       <span v-if="ready" class="mix__play" @click.stop="$emit('play')">
         <PnmIcon name="play" :size="18" />
@@ -99,17 +102,11 @@ const isQuilt = computed(() => covers.value.length >= 4);
   box-shadow: none;
 }
 
-.mix__quilt {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  width: 100%;
-  height: 100%;
-}
-
-.mix__quilt :deep(.artwork) {
+/* The quilt fills the card exactly, whatever nominal size was asked for. */
+.mix__art :deep(.quilt) {
   width: 100% !important;
   height: 100% !important;
-  aspect-ratio: 1;
+  border-radius: 0 !important;
 }
 
 .mix__play {

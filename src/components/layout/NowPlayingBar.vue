@@ -7,18 +7,20 @@
 import { computed, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useDismiss } from "@/lib/dismiss";
-import PnmIcon from "./icons/PnmIcon.vue";
-import Artwork from "./Artwork.vue";
-import PlaylistArtwork from "./PlaylistArtwork.vue";
-import AppSlider from "./AppSlider.vue";
-import MixerPopover from "./mixer/MixerPopover.vue";
-import InfoPopover from "./InfoPopover.vue";
+import PnmIcon from "../icons/PnmIcon.vue";
+import IconButton from "../ui/IconButton.vue";
+import Artwork from "../media/Artwork.vue";
+import PlaylistArtwork from "../media/PlaylistArtwork.vue";
+import AppSlider from "../ui/AppSlider.vue";
+import MixerPopover from "../mixer/MixerPopover.vue";
+import InfoPopover from "../overlays/InfoPopover.vue";
 import { formatDuration } from "@/lib/format";
 import { stableAlbumId, stableArtistId } from "@/lib/ids";
 import { usePlayerStore } from "@/stores/player";
 import { useMixerStore } from "@/stores/mixer";
 import { useUiStore } from "@/stores/ui";
 import { useMasterMixStore } from "@/stores/masterMix";
+import { useNowPlayingMeta } from "@/composables/useNowPlayingMeta";
 
 const player = usePlayerStore();
 const mixer = useMixerStore();
@@ -31,15 +33,7 @@ const SKIP_SECONDS = 10;
 /** Quarters, so the level can be set exactly without fighting the pointer. */
 const VOLUME_DETENTS = [0, 0.25, 0.5, 0.75, 1];
 
-const track = computed(() => player.track);
-
-/**
- * The playlist being played as a mix, if that is what is playing.
- *
- * A mix has no current track: the engine holds one long timeline, so the bar
- * shows the playlist in a song's place and marks the songs along the scrubber.
- */
-const mix = computed(() => player.masterMix);
+const { mix, track } = useNowPlayingMeta();
 
 /**
  * Where each song starts, as dots on the scrubber — but only the ones far
@@ -378,15 +372,13 @@ async function openMixer(event: MouseEvent) {
         </Teleport>
       </div>
 
-      <button
-        class="icon-button"
-        :class="{ 'is-active': player.queue.shuffle }"
-        title="Shuffle"
-        aria-label="Shuffle"
+      <IconButton
+        icon="shuffle"
+        label="Shuffle"
+        :size="19"
+        :active="player.queue.shuffle"
         @click="player.setShuffle(!player.queue.shuffle)"
-      >
-        <PnmIcon name="shuffle" :size="19" />
-      </button>
+      />
 
       <button
         class="icon-button"

@@ -6,7 +6,7 @@
  */
 import { computed } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
-import AppKnob from "../AppKnob.vue";
+import AppKnob from "../ui/AppKnob.vue";
 import { useMixerStore } from "@/stores/mixer";
 import { useSettingsStore } from "@/stores/settings";
 import type { FilterSetting } from "@/lib/types";

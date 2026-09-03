@@ -41,6 +41,8 @@ function mountModal(value: Eq = eq()) {
   return mount(EqModal, {
     props: { eq: value, targetLabel: "All Playback", sampleRate: 48000 },
     attachTo: document.body,
+    // BaseModal teleports to <body>; render it inline so queries reach the dialog.
+    global: { stubs: { teleport: true } },
   });
 }
 

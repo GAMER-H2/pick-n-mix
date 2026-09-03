@@ -1,49 +1,20 @@
 <script setup lang="ts">
 /** Up-next list, opened from the queue button in the player bar. */
-import { computed } from "vue";
-import PnmIcon from "./icons/PnmIcon.vue";
-import QueueList from "./QueueList.vue";
+import IconButton from "../ui/IconButton.vue";
+import QueueList from "../media/QueueList.vue";
 import * as api from "@/lib/api";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";
+import { useQueueActions } from "@/composables/useQueueActions";
 
 const player = usePlayerStore();
 const ui = useUiStore();
 
-const current = computed(() => player.queue.currentIndex);
-const items = computed(() => player.queue.items);
-
-/** Clicking the row that is already playing toggles it instead of restarting. */
-async function jump(index: number, positionSecs?: number) {
-  // A chapter inside the playing mix is a place to go, not a play/pause.
-  if (positionSecs === undefined && index === current.value && player.playing) {
-    await player.toggle();
-    return;
-  }
-  await api.playQueueIndex(index, positionSecs);
-}
-
-async function remove(index: number) {
-  await api.removeFromQueue(index);
-  await player.refreshQueue();
-}
+const { current, items, jump, remove, move, openMenu } = useQueueActions();
 
 async function clear() {
   await api.clearQueue();
   await player.refreshQueue();
-}
-
-async function move(from: number, to: number) {
-  await api.moveInQueue(from, to);
-  await player.refreshQueue();
-}
-
-function openMenu(index: number, event: MouseEvent) {
-  // A mix has no track menu: nothing in it can be reordered or sent elsewhere
-  // on its own.
-  const row = items.value[index];
-  if (row?.kind !== "track") return;
-  ui.openContextMenu({ x: event.clientX, y: event.clientY, tracks: [row.track] });
 }
 </script>
 
@@ -58,9 +29,7 @@ function openMenu(index: number, event: MouseEvent) {
       </div>
       <div class="queue__actions">
         <button v-if="items.length" class="queue__clear" @click="clear">Clear</button>
-        <button class="icon-button" aria-label="Close queue" @click="ui.queueOpen = false">
-          <PnmIcon name="close" :size="18" />
-        </button>
+        <IconButton icon="close" label="Close queue" :size="18" @click="ui.queueOpen = false" />
       </div>
     </header>
 

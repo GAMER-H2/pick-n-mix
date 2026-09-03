@@ -8,40 +8,26 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { onBeforeRouteLeave, useRouter } from "vue-router";
-import PnmIcon from "./icons/PnmIcon.vue";
-import Artwork from "./Artwork.vue";
-import PlaylistArtwork from "./PlaylistArtwork.vue";
-import QueueList from "./QueueList.vue";
-import { artUrl, formatDuration, subtitleFor } from "@/lib/format";
-import * as api from "@/lib/api";
+import PnmIcon from "../icons/PnmIcon.vue";
+import Artwork from "../media/Artwork.vue";
+import PlaylistArtwork from "../media/PlaylistArtwork.vue";
+import QueueList from "../media/QueueList.vue";
+import { artUrl, formatDuration } from "@/lib/format";
 import { usePlayerStore } from "@/stores/player";
-import { useUiStore } from "@/stores/ui";
+import { useNowPlayingMeta } from "@/composables/useNowPlayingMeta";
+import { useQueueActions } from "@/composables/useQueueActions";
 
 const player = usePlayerStore();
-const ui = useUiStore();
 const router = useRouter();
 
-const track = computed(() => player.track);
-/**
- * The playlist, when a mix is what is playing.
- *
- * A mix has no current track, so the screen shows what it is actually playing:
- * the playlist, its picture, and how far through the arrangement it is.
- */
-const mix = computed(() => player.masterMix);
+const { mix, track, title, subtitle } = useNowPlayingMeta();
+const { current, items, jump, remove, move, openMenu } = useQueueActions();
+
 // Blown up 1.6x and blurred 64px, so detail beyond this is invisible; no
 // reason to decode the original multi-megapixel picture for it.
 const backdrop = computed(() =>
   artUrl(mix.value ? (mix.value.artwork ?? mix.value.artworkIds[0] ?? null) : track.value?.artworkId, 640),
 );
-const subtitle = computed(() =>
-  mix.value
-    ? `Master mix · ${mix.value.trackCount} ${mix.value.trackCount === 1 ? "song" : "songs"}`
-    : subtitleFor([track.value?.artist, track.value?.album]),
-);
-const title = computed(() => mix.value?.name ?? track.value?.title ?? "Nothing Playing");
-const items = computed(() => player.queue.items);
-const current = computed(() => player.queue.currentIndex);
 const queueReady = ref(false);
 const curtainVisible = ref(true);
 let queueTimer: number | null = null;
@@ -82,33 +68,6 @@ onBeforeUnmount(() => {
   if (queueTimer !== null) window.clearTimeout(queueTimer);
   if (curtainFrame !== null) window.cancelAnimationFrame(curtainFrame);
 });
-
-/** Clicking the row that is already playing toggles it instead of restarting. */
-async function jump(index: number, positionSecs?: number) {
-  // A chapter inside the playing mix is a place to go, not a play/pause.
-  if (positionSecs === undefined && index === current.value && player.playing) {
-    await player.toggle();
-    return;
-  }
-  await api.playQueueIndex(index, positionSecs);
-}
-
-async function remove(index: number) {
-  await api.removeFromQueue(index);
-  await player.refreshQueue();
-}
-
-async function move(from: number, to: number) {
-  await api.moveInQueue(from, to);
-  await player.refreshQueue();
-}
-
-function openMenu(index: number, event: MouseEvent) {
-  // A mix is one block: there is no per-song menu inside it.
-  const row = items.value[index];
-  if (row?.kind !== "track") return;
-  ui.openContextMenu({ x: event.clientX, y: event.clientY, tracks: [row.track] });
-}
 </script>
 
 <template>
@@ -293,14 +252,19 @@ function openMenu(index: number, event: MouseEvent) {
 .screen__body {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(320px, 1fr) minmax(340px, 460px);
-  gap: 40px;
-  padding: 8px 40px 40px;
+  min-width: 0;
+  display: flex;
   align-items: center;
+  justify-content: center;
+  gap: 36px;
+  padding: 8px 40px 40px;
 }
 
 .screen__art {
+  /* Flexes and shrinks with the space actually available — which shrinks when
+     the sidebar's advanced mixer or queue panel opens — instead of holding a
+     fixed minimum and overflowing. `min-width: 0` is what allows the shrink. */
+  flex: 1 1 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -308,18 +272,22 @@ function openMenu(index: number, event: MouseEvent) {
   min-width: 0;
 }
 
-.screen__art :deep(.artwork) {
+.screen__art :deep(.artwork),
+.screen__art :deep(.quilt) {
   /*
-   * `cqw`, not `vw`: the art sits beside a fixed-ish queue column, so what
-   * matters is the width `.app__main` actually has to give — which shrinks
-   * when the sidebar's advanced mixer or queue panel opens — not the raw
-   * window width. `vw` never saw that shrink, so the art stayed oversized and
-   * ran into the queue column. `.app__main` is the query container; see
-   * `App.vue`. The upper limit keeps the cover visually balanced with the
-   * queue on ultrawide displays.
+   * A percentage of the art column, not `vw`/`cqw`: the column is a flex
+   * item that shrinks with `.app__main` — when the window narrows or a side
+   * panel opens — so the cover shrinks with it in every webview, including
+   * ones without container-query support. The `62vh` cap keeps the cover
+   * visually balanced with the queue on short windows; the upper clamp is
+   * unnecessary now that the column itself bounds the size. The quilt is
+   * overridden alongside the single cover: `PlaylistArtwork` sizes the quilt
+   * inline in px, which would otherwise stay fixed while everything around
+   * it shrank.
    */
-  width: clamp(220px, min(46cqw, 62vh), 720px) !important;
-  height: clamp(220px, min(46cqw, 62vh), 720px) !important;
+  width: min(100%, 62vh) !important;
+  height: auto !important;
+  aspect-ratio: 1 !important;
 }
 
 .screen__meta {
@@ -353,6 +321,11 @@ function openMenu(index: number, event: MouseEvent) {
   flex-direction: column;
   min-height: 0;
   max-height: 100%;
+  /* Shrinks with the row rather than holding a fixed minimum: at narrow
+     widths the art gives up space first, then this card, and only below the
+     breakpoint below does the layout stack. */
+  flex: 0 1 440px;
+  min-width: 0;
   padding: 14px;
   border-radius: var(--radius-lg);
   /* A flat translucent card rather than its own `backdrop-filter`: it already
@@ -383,32 +356,72 @@ function openMenu(index: number, event: MouseEvent) {
 }
 
 /*
- * A `@container` query against `.app__main` (declared in `App.vue`), not a
- * `@media` query against the window: it reacts to the space this view
- * actually has, which shrinks when a side panel (the advanced mixer, the
- * compact queue) opens, not just when the window itself is resized.
+ * Stacks the layout when the main view itself is narrow — including when the
+ * advanced mixer or queue panel eats into it from the sidebar, which a
+ * window-width `@media` query cannot see. The art moves above the queue
+ * widget, exactly as in the single-column layout below.
  *
- * The threshold is not a rounded guess — it is the two-column grid's own
- * breaking point, worked backwards from the layout above: 320px + 340px for
- * the column minimums, 40px for the gap between them, 80px for this
- * container's own left+right padding. Below that, `minmax()` cannot shrink
- * the columns any further, so the grid overflows rather than fitting — which
- * is exactly the crowding this query exists to pre-empt. Anything short of
- * that true minimum (736px, an earlier approximation from the window-based
- * breakpoint this replaced, was 44px short of it) leaves a dead zone where
- * the old two-column layout is still forced on a container too narrow for it.
+ * The shrink behaviour above is plain flexbox and works everywhere; this
+ * query only decides *when to stack*. Where container queries are
+ * unsupported the `@media` fallback beneath still catches narrow windows.
  */
 @container app-main (max-width: 780px) {
   .screen__body {
-    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
     gap: 20px;
     padding: 8px 24px 20px;
+    overflow-y: auto;
   }
 
-  .screen__art :deep(.artwork) {
+  .screen__art {
+    flex: none;
+    width: 100%;
+  }
+
+  .screen__art :deep(.artwork),
+  .screen__art :deep(.quilt) {
     /* The single-column layout still leaves meaningful room for the queue. */
-    width: clamp(220px, min(54cqw, 50vh), 420px) !important;
-    height: clamp(220px, min(54cqw, 50vh), 420px) !important;
+    width: min(100%, 38vh) !important;
+  }
+
+  .screen__queue {
+    flex: none;
+    width: 100%;
+    max-height: none;
+  }
+}
+
+/*
+ * Window fallback for webviews without container-query support: same stacked
+ * layout, keyed on the window instead of `.app__main`. Where container
+ * queries work, both queries agree at their boundaries and nothing changes.
+ */
+@media (max-width: 720px) {
+  .screen__body {
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 20px;
+    padding: 8px 24px 20px;
+    overflow-y: auto;
+  }
+
+  .screen__art {
+    flex: none;
+    width: 100%;
+  }
+
+  .screen__art :deep(.artwork),
+  .screen__art :deep(.quilt) {
+    width: min(100%, 38vh) !important;
+  }
+
+  .screen__queue {
+    flex: none;
+    width: 100%;
+    max-height: none;
   }
 }
 </style>

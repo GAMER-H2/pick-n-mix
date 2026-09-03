@@ -8,7 +8,7 @@
  * which is enough to know something is still going on.
  */
 import { computed } from "vue";
-import PnmIcon from "./icons/PnmIcon.vue";
+import PnmIcon from "../icons/PnmIcon.vue";
 import { useBounceStore } from "@/stores/bounce";
 
 const bounce = useBounceStore();

@@ -8,7 +8,7 @@
  * on its own — which is what a playlist of one album should look like anyway.
  */
 import { computed } from "vue";
-import Artwork from "./Artwork.vue";
+import Artwork from "../media/Artwork.vue";
 
 const props = withDefaults(
   defineProps<{

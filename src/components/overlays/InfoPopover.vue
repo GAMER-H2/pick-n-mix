@@ -4,9 +4,9 @@
  * engine is actually doing with it right now.
  */
 import { computed } from "vue";
-import PnmIcon from "./icons/PnmIcon.vue";
-import Artwork from "./Artwork.vue";
-import PlaylistArtwork from "./PlaylistArtwork.vue";
+import PnmIcon from "../icons/PnmIcon.vue";
+import Artwork from "../media/Artwork.vue";
+import PlaylistArtwork from "../media/PlaylistArtwork.vue";
 import { formatBytes, formatDuration, formatHz } from "@/lib/format";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";

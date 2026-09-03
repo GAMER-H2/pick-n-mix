@@ -18,7 +18,7 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
-import AppSlider from "../AppSlider.vue";
+import AppSlider from "../ui/AppSlider.vue";
 import AdvancedMixer from "../mixer/AdvancedMixer.vue";
 import MixBlockView from "./MixBlockView.vue";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -701,9 +701,21 @@ const scrubbing = ref(false);
  * are invented.
  */
 const renderPlayhead = ref(0);
+/**
+ * The scroller's current horizontal offset, kept in a ref so the playhead and
+ * snapline can clip themselves against the track-information column: the
+ * sticky lane heads hide the line over their own rows, but the add-lane area
+ * is transparent and the lane borders are hairlines, so without a clip the
+ * line still shows through both once it has scrolled under the header zone.
+ */
+const scrollLeft = ref(0);
 let anchorSecs = 0;
 let anchorAt = 0;
 let frame = 0;
+
+function onBodyScroll(event: Event) {
+  scrollLeft.value = (event.target as HTMLElement).scrollLeft;
+}
 
 function anchorPlayhead() {
   anchorSecs = store.playhead;
@@ -739,6 +751,17 @@ function keepPlayheadVisible() {
   const from = element.scrollLeft;
   if (x >= from && x <= from + visible - 24) return;
   element.scrollLeft = Math.max(0, x - visible * 0.25);
+}
+
+/**
+ * Clip for a vertical line at `secs * pps`: empty while the line is over the
+ * visible timeline, an inset that removes it once any part of it has entered
+ * the track-information column — which begins `scrollLeft` pixels into the
+ * grid's own coordinates, exactly where the sticky headers start.
+ */
+function headClip(secs: number): string | undefined {
+  const hiddenPx = scrollLeft.value - secs * pps.value;
+  return hiddenPx > 0 ? `inset(0 0 0 ${hiddenPx}px)` : undefined;
 }
 
 function onRulerDown(event: PointerEvent) {
@@ -1270,8 +1293,9 @@ const summary = computed(() => {
     >
       <header class="mm__header">
         <div class="mm__title">
-          <h2>Playlist Master Mixer</h2>
-          <p>{{ store.playlistName }} · {{ summary }}</p>
+          <p class="eyebrow">Master Mixer</p>
+          <h2>{{ store.playlistName }}</h2>
+          <p class="mm__summary">{{ summary }}</p>
         </div>
 
         <div class="mm__tools" role="group" aria-label="Tools">
@@ -1438,6 +1462,7 @@ const summary = computed(() => {
         class="mm__body"
         :class="{ 'is-blade': store.tool === 'blade' }"
         @wheel="onWheel"
+        @scroll.passive="onBodyScroll"
         @pointermove="onBladeHover"
         @pointerleave="snapLine = null"
         @pointerdown.self="store.select([])"
@@ -1632,15 +1657,15 @@ const summary = computed(() => {
             v-if="snapLine !== null"
             class="mm__snapline"
             :class="{ 'is-locked': snapLocked }"
-            :style="{ left: `${HEADER_WIDTH + snapLine * pps}px` }"
+            :style="{ left: `${HEADER_WIDTH + snapLine * pps}px`, clipPath: headClip(snapLine) }"
             aria-hidden="true"
           />
 
           <div
             class="mm__playhead"
-            :style="{ left: `${HEADER_WIDTH + renderPlayhead * pps}px` }"
+            :style="{ left: `${HEADER_WIDTH + renderPlayhead * pps}px`, clipPath: headClip(renderPlayhead) }"
             aria-hidden="true"
-          />
+ />
         </div>
       </div>
 
@@ -1701,14 +1726,15 @@ const summary = computed(() => {
 .mm-scrim {
   position: fixed;
   inset: 0;
-  z-index: 530;
+  z-index: var(--z-modal-top);
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Even on every side, and as small as it can be: the modal is meant to fill
-     the window. The traffic lights are dealt with in the header, which is the
-     only part of this that has anything to click underneath them. */
-  padding: 20px;
+  /* Even on every side, and as small as it can be while keeping the modal
+     clearly a modal: a little over 2% of a typical window is given back on
+     each edge. The traffic lights are not dodged in the header — see the
+     comment there. */
+  padding: 32px;
   background: rgba(0, 0, 0, 0.4);
   backdrop-filter: blur(4px);
 }
@@ -1742,9 +1768,11 @@ const summary = computed(() => {
   display: flex;
   align-items: center;
   gap: 12px;
-  /* On macOS the window's traffic lights are drawn over this corner, so the
-     title starts after them. `--overlay-controls` is zero everywhere else. */
-  padding: 12px 14px 12px calc(14px + var(--overlay-controls));
+  /* No reservation is made for the macOS traffic lights: the modal now sits
+     inside a generous scrim, so the lights land on the dimmed backdrop rather
+     than on this header, and the title starts at the same inset as every
+     other surface. */
+  padding: 12px 14px;
   border-bottom: 0.5px solid var(--separator);
 }
 
@@ -1759,7 +1787,7 @@ const summary = computed(() => {
   font-weight: 650;
 }
 
-.mm__title p {
+.mm__title .mm__summary {
   margin: 2px 0 0;
   font-size: 11.5px;
   color: var(--text-secondary);
@@ -1964,6 +1992,10 @@ const summary = computed(() => {
   width: 9px;
   height: 9px;
   margin-left: -4px;
+  /* Above the ruler's sticky corner (8), inside this row's own stacking
+     context: wherever the playhead is — even scrolled under the track-name
+     column — the arrow stays visible so it can still be located. */
+  z-index: 9;
   background: var(--accent);
   clip-path: polygon(0 0, 100% 0, 50% 100%);
   pointer-events: none;
@@ -1999,7 +2031,7 @@ const summary = computed(() => {
    what stops later lanes painting over it. */
 .mm__palette {
   position: fixed;
-  z-index: 620;
+  z-index: var(--z-popover);
   display: grid;
   grid-template-columns: repeat(3, 18px);
   gap: 5px;
@@ -2176,11 +2208,19 @@ const summary = computed(() => {
   top: 0;
   bottom: 0;
   width: 1px;
+  /* Under the sticky lane heads (6) and the ruler row (7); the scroll clip
+     (see `headClip`) removes it entirely once it enters the header zone,
+     including through the transparent add-lane area and the lane hairlines.
+     The ruler keeps a playhead arrow (see `.mm__playhead-head`) so a hidden
+     playhead can still be located. */
   z-index: 5;
   background: var(--accent);
   pointer-events: none;
 }
 
+/*
+/*
+ * Stacking inside the grid, low to high: blocks, the playhead, the lane
 /* Distinct from the playhead, which is the other vertical line here: the
    second accent, and dashed while it is only following the cursor. Solid means
    it has locked on to an edge, the playhead or a ruler mark. */

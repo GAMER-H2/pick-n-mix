@@ -11,9 +11,9 @@ import { computed, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
-import CollectionHeader from "@/components/CollectionHeader.vue";
-import TrackRow from "@/components/TrackRow.vue";
-import BounceDialog from "@/components/mastermix/BounceDialog.vue";
+import CollectionHeader from "@/components/collections/CollectionHeader.vue";
+import TrackList, { type TrackListItem } from "@/components/collections/TrackList.vue";
+import BounceDialog from "@/components/dialogs/BounceDialog.vue";
 import { formatTotal } from "@/lib/format";
 import * as api from "@/lib/api";
 import { usePlaylistStore } from "@/stores/playlists";
@@ -21,7 +21,8 @@ import { usePlayerStore } from "@/stores/player";
 import { useMixerStore } from "@/stores/mixer";
 import { useMasterMixStore } from "@/stores/masterMix";
 import { useUiStore } from "@/stores/ui";
-import { useDragReorder } from "@/lib/dragReorder";
+import { useCollectionPlayback } from "@/composables/useCollectionPlayback";
+import { useMenu } from "@/composables/useMenu";
 import type { ResolvedEntry } from "@/lib/types";
 
 const route = useRoute();
@@ -30,6 +31,8 @@ const player = usePlayerStore();
 const mixer = useMixerStore();
 const masterMix = useMasterMixStore();
 const ui = useUiStore();
+const { openMenu } = useMenu();
+const { playOrToggle } = useCollectionPlayback();
 
 const editingDescription = ref(false);
 const draftDescription = ref("");
@@ -42,6 +45,16 @@ const totalDuration = computed(() =>
   items.value.reduce((sum, i) => sum + (i.track?.durationSecs ?? i.entry.durationSecs), 0),
 );
 const artworkId = computed(() => playlist.value?.artwork ?? null);
+
+const listItems = computed<TrackListItem[]>(() =>
+  items.value.map((item) => ({
+    key: String(item.index),
+    track: item.track,
+    fallbackTitle: item.entry.title,
+    fallbackSubtitle: `${item.entry.album} · ${item.entry.artist}`,
+    mixerOverride: !!item.entry.mixer,
+  })),
+);
 
 /**
  * Covers of the first four different songs, which is what a playlist with no
@@ -84,6 +97,10 @@ const playingThisPlaylist = computed(
   () => !!playlist.value && player.queue.context?.id === playlist.value.id,
 );
 
+const currentId = computed(() =>
+  playingThisPlaylist.value ? (player.track?.id ?? null) : null,
+);
+
 function isCurrent(item: ResolvedEntry) {
   return (
     playingThisPlaylist.value && !!item.track && player.track?.id === item.track.id
@@ -96,20 +113,19 @@ async function play(startIndex = 0) {
 }
 
 /** Clicking the row that is already playing toggles it instead of restarting. */
-async function playEntry(item: ResolvedEntry) {
-  if (isCurrent(item)) {
-    await player.toggle();
-    return;
-  }
-  await play(item.index);
+function playEntry(item: ResolvedEntry) {
+  return playOrToggle(isCurrent(item), () => play(item.index));
 }
 
-const listEl = ref<HTMLElement | null>(null);
-const { dragFrom, dropAt, isDragging, onHandleDown, onHandleMove, onHandleUp, onHandleCancel } =
-  useDragReorder(listEl, async (from, to) => {
-    const p = playlist.value;
-    if (p) await playlists.move(p.id, from, to);
-  });
+function playIndex(index: number) {
+  const item = items.value[index];
+  if (item) return playEntry(item);
+}
+
+function reorder(from: number, to: number) {
+  const p = playlist.value;
+  if (p) return playlists.move(p.id, from, to);
+}
 
 async function toggleShuffleOnly() {
   const p = playlist.value;
@@ -147,7 +163,7 @@ async function clearArtwork() {
   await playlists.refresh();
 }
 
-async function shuffle() {
+async function shuffleAndPlay() {
   if (!playlist.value) return;
   await player.setShuffle(true);
   await play(0);
@@ -192,6 +208,11 @@ async function openEntryMixer(item: ResolvedEntry) {
   mixer.panelOpen = true;
 }
 
+function openEntryMixerAt(index: number) {
+  const item = items.value[index];
+  if (item) return openEntryMixer(item);
+}
+
 function startEditingDescription() {
   draftDescription.value = playlist.value?.description ?? "";
   editingDescription.value = true;
@@ -228,12 +249,10 @@ async function saveDescription() {
       :mixer-active="!!playlist.mixer"
       :disabled="available.length === 0"
       @play="play(0)"
-      @shuffle="shuffle"
+      @shuffle="shuffleAndPlay"
       @mixer="openPlaylistMixer"
       @menu="
-        ui.openContextMenu({
-          x: $event.clientX,
-          y: $event.clientY,
+        openMenu($event, {
           tracks: available.map((i) => i.track!),
           playlistOptions: {
             id: playlist!.id,
@@ -310,55 +329,24 @@ async function saveDescription() {
       </p>
     </div>
 
-    <div v-else ref="listEl" class="playlist__list" :class="{ 'is-dragging': isDragging }">
-      <template v-for="item in items" :key="item.index">
-        <div v-if="dropAt === item.index && isDragging" class="playlist__drop" />
-
-        <div
-          data-row
-          class="playlist__row"
-          :class="{ 'is-lifted': dragFrom === item.index }"
-        >
-          <button
-            class="playlist__grip"
-            title="Drag to reorder"
-            aria-label="Drag to reorder"
-            @pointerdown="onHandleDown($event, item.index)"
-            @pointermove="onHandleMove"
-            @pointerup="onHandleUp"
-            @pointercancel="onHandleCancel"
-          >
-            <PnmIcon name="grip" :size="15" />
-          </button>
-
-          <TrackRow
-            class="playlist__row-track"
-            :track="item.track"
-            show-mixer
-            :fallback-title="item.entry.title"
-            :fallback-subtitle="`${item.entry.album} · ${item.entry.artist}`"
-            show-artwork
-            :current="isCurrent(item)"
-            :playing="player.playing"
-            :has-mixer-override="!!item.entry.mixer"
-            @play="playEntry(item)"
-            @mixer="openEntryMixer(item)"
-            @menu="
-              item.track &&
-                ui.openContextMenu({
-                  x: $event.clientX,
-                  y: $event.clientY,
-                  tracks: [item.track],
-                  playlistId: playlist!.id,
-                  entryIndex: item.index,
-                })
-            "
-          />
-        </div>
-      </template>
-
-      <div v-if="dropAt === items.length && isDragging" class="playlist__drop" />
-    </div>
+    <TrackList
+      v-else
+      :items="listItems"
+      :current-id="currentId"
+      :playing="player.playing"
+      show-artwork
+      show-mixer
+      :reorderable="!playlist?.masterMix?.enabled"
+      @play="playIndex"
+      @mixer="(_, index) => openEntryMixerAt(index)"
+      @reorder="reorder"
+      @menu="
+        (event, index) => {
+          const item = items[index];
+          if (item?.track) openMenu(event, { tracks: [item.track], playlistId: playlist!.id, entryIndex: item.index });
+        }
+      "
+    />
   </div>
 
   <div v-else-if="playlists.loading" class="playlist__loading">Loading…</div>
@@ -427,54 +415,5 @@ async function saveDescription() {
   text-align: center;
   font-size: 13px;
   color: var(--text-tertiary);
-}
-
-.playlist__list.is-dragging {
-  cursor: grabbing;
-}
-
-/* Insertion marker, rather than animating every row out of the way. */
-.playlist__drop {
-  height: 2px;
-  margin: 1px 8px;
-  border-radius: 2px;
-  background: var(--accent);
-}
-
-.playlist__row {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.playlist__row.is-lifted {
-  opacity: 0.4;
-}
-
-.playlist__row-track {
-  flex: 1;
-  min-width: 0;
-}
-
-.playlist__grip {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  flex: none;
-  color: var(--text-tertiary);
-  cursor: grab;
-  opacity: 0;
-  touch-action: none;
-  transition: opacity 0.12s var(--ease);
-}
-
-.playlist__row:hover .playlist__grip,
-.playlist__grip:focus-visible {
-  opacity: 1;
-}
-
-.playlist__grip:active {
-  cursor: grabbing;
 }
 </style>

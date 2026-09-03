@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
-import AppKnob from "../AppKnob.vue";
+import AppKnob from "../ui/AppKnob.vue";
 
 describe("AppKnob", () => {
   it("points at the same angle as the value arc", async () => {

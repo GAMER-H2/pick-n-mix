@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
-import QueueList from "../QueueList.vue";
+import QueueList from "../media/QueueList.vue";
 import type { Track } from "@/lib/types";
 
 function track(id: string, title: string): Track {

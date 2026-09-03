@@ -4,28 +4,39 @@
  * of theirs in one list. Designed to sit alongside the album and playlist
  * pages, which the drawings did define.
  */
-import { computed, ref, watch } from "vue";
+import { computed, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import Artwork from "@/components/Artwork.vue";
-import CollectionHeader from "@/components/CollectionHeader.vue";
-import TrackRow from "@/components/TrackRow.vue";
+import Artwork from "@/components/media/Artwork.vue";
+import MediaCard from "@/components/ui/MediaCard.vue";
+import CollectionHeader from "@/components/collections/CollectionHeader.vue";
+import TrackList from "@/components/collections/TrackList.vue";
+import EmptyState from "@/components/ui/EmptyState.vue";
 import { formatTotal } from "@/lib/format";
 import * as api from "@/lib/api";
-import { usePlayerStore } from "@/stores/player";
-import { useUiStore } from "@/stores/ui";
 import { stableAlbumId } from "@/lib/ids";
-import type { Track } from "@/lib/types";
+import { useCollectionMeta } from "@/composables/useCollectionMeta";
+import { useCollectionPlayback } from "@/composables/useCollectionPlayback";
+import { useMenu } from "@/composables/useMenu";
+import { useRouteParamLoader } from "@/composables/useRouteParamLoader";
+import type { PlayContext, Track } from "@/lib/types";
 
 const route = useRoute();
 const router = useRouter();
-const player = usePlayerStore();
-const ui = useUiStore();
+const { openMenu } = useMenu();
 
 const tracks = ref<Track[]>([]);
-const loading = ref(false);
+const { loading } = useRouteParamLoader("id", async (id) => {
+  tracks.value = await api.artistTracks(id);
+});
 
 const name = computed(() => tracks.value[0]?.albumArtist || tracks.value[0]?.artist || "Artist");
-const total = computed(() => tracks.value.reduce((sum, t) => sum + t.durationSecs, 0));
+const { count, totalDuration } = useCollectionMeta(tracks);
+const items = computed(() => tracks.value.map((track) => ({ track })));
+const context = computed<PlayContext>(() => ({
+  kind: "artist",
+  id: String(route.params.id),
+  name: name.value,
+}));
 
 /** Group into albums, newest first, for the shelf above the song list. */
 const albums = computed(() => {
@@ -42,45 +53,18 @@ const albums = computed(() => {
 const meta = computed(
   () =>
     `${albums.value.length} ${albums.value.length === 1 ? "album" : "albums"} · ` +
-    `${tracks.value.length} songs · ${formatTotal(total.value)}`,
+    `${count.value} songs · ${formatTotal(totalDuration.value)}`,
 );
 
-watch(
-  () => route.params.id,
-  async (id) => {
-    if (typeof id !== "string") return;
-    loading.value = true;
-    try {
-      tracks.value = await api.artistTracks(id);
-    } finally {
-      loading.value = false;
-    }
-  },
-  { immediate: true },
-);
+const { player, playFromList, shuffleAndPlay } = useCollectionPlayback();
 
-/**
- * Clicking the row that is already playing toggles it, rather than restarting
- * it from the beginning. Anything else starts the list from that song.
- */
-async function play(index = 0) {
-  const track = tracks.value[index];
-  if (track && player.track?.id === track.id) {
-    await player.toggle();
-    return;
-  }
-  await player.playTracks(tracks.value, index, {
-    kind: "artist",
-    id: String(route.params.id),
-    name: name.value,
-  });
+function play(index: number) {
+  return playFromList(tracks.value, index, context.value);
 }
 
-async function shuffle() {
-  await player.setShuffle(true);
-  await play(0);
+function shuffle() {
+  return shuffleAndPlay(() => play(0));
 }
-
 </script>
 
 <template>
@@ -94,44 +78,41 @@ async function shuffle() {
       :show-mixer="false"
       @play="play(0)"
       @shuffle="shuffle"
-      @menu="ui.openContextMenu({ x: $event.clientX, y: $event.clientY, tracks })"
+      @menu="openMenu($event, { tracks })"
     />
 
     <template v-if="albums.length">
       <h2 class="artist__heading">Albums</h2>
       <div class="artist__albums">
-        <button
+        <MediaCard
           v-for="album in albums"
           :key="album.id"
-          class="card"
-          @click="router.push({ name: 'album', params: { id: album.id } })"
+          :title="album.name"
+          :subtitle="album.year !== null ? String(album.year) : undefined"
+          @open="router.push({ name: 'album', params: { id: album.id } })"
         >
           <Artwork :artwork-id="album.artworkId" :size="140" :radius="7" shadow />
-          <div class="card__title truncate">{{ album.name }}</div>
-          <div class="card__subtitle">{{ album.year ?? "" }}</div>
-        </button>
+        </MediaCard>
       </div>
     </template>
 
     <template v-if="tracks.length">
       <h2 class="artist__heading">All Songs</h2>
-      <div class="artist__list">
-        <TrackRow
-          v-for="(track, index) in tracks"
-          :key="track.id"
-          :track="track"
-          show-artwork
-          :current="player.track?.id === track.id"
-          :playing="player.playing"
-          @play="play(index)"
-          @menu="ui.openContextMenu({ x: $event.clientX, y: $event.clientY, tracks: [track] })"
-        />
-      </div>
+      <TrackList
+        :items="items"
+        :current-id="player.track?.id ?? null"
+        :playing="player.playing"
+        show-artwork
+        @play="play"
+        @menu="(event, index) => { const track = tracks[index]; if (track) openMenu(event, { tracks: [track] }); }"
+      />
     </template>
 
-    <p v-if="!loading && tracks.length === 0" class="artist__empty">
-      This artist is no longer in your library.
-    </p>
+    <EmptyState
+      v-if="!loading && tracks.length === 0"
+      compact
+      message="This artist is no longer in your library."
+    />
   </div>
 </template>
 
@@ -151,42 +132,5 @@ async function shuffle() {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 20px 18px;
-}
-
-.card {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  text-align: left;
-  min-width: 0;
-}
-
-.card :deep(.artwork) {
-  width: 100% !important;
-  height: auto !important;
-  aspect-ratio: 1;
-  margin-bottom: 8px;
-  transition: transform 0.18s var(--ease);
-}
-
-.card:hover :deep(.artwork) {
-  transform: translateY(-2px);
-}
-
-.card__title {
-  font-size: 12.5px;
-  font-weight: 500;
-}
-
-.card__subtitle {
-  font-size: 11.5px;
-  color: var(--text-secondary);
-}
-
-.artist__empty {
-  padding: 60px 0;
-  text-align: center;
-  font-size: 13px;
-  color: var(--text-tertiary);
 }
 </style>
