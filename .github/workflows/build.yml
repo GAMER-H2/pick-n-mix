@@ -41,6 +41,7 @@ jobs:
             build-essential \
             curl \
             file \
+            libasound2-dev \
             libxdo-dev \
             libayatana-appindicator3-dev \
             libssl-dev \
