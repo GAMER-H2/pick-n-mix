@@ -53,6 +53,11 @@ urlencoding = "2"
 # MPNowPlayingInfoCenter.
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
 
+# The client-side window frame talks to GDK directly, to hand the compositor
+# the shadow margin. Same version tao already links, so nothing new is built.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
 # Dependencies are optimised even in a debug build, while this crate stays
 # unoptimised and debuggable.
 #

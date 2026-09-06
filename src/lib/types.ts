@@ -20,6 +20,14 @@ export interface AppPreferences {
   discoverMaxPlays: number;
   hiddenBuiltInPresetIds: string[];
   hiddenBuiltInFilterIds: string[];
+  /**
+   * Rebound keyboard shortcuts, by action id. An action with no entry uses the
+   * default bindings in `lib/shortcuts.ts`, which is where the catalogue of
+   * actions lives — this only carries the overrides.
+   */
+  shortcuts: Record<string, string[]>;
+  /** Playlist ids in the order the user has dragged them into. */
+  playlistOrder: string[];
 }
 
 interface TrackFields {

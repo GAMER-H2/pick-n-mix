@@ -32,8 +32,18 @@ export function albumArtistOf(track: Track): string {
   return track.albumArtist.trim() === "" ? track.artist : track.albumArtist;
 }
 
+/**
+ * Mirrors `album_id_for` in `src-tauri/src/library/db.rs`, including its
+ * fallback: with no album artist tagged, the album name alone is the seed.
+ * Not `albumArtistOf`'s track-artist fallback — that would key the album on a
+ * performer the backend never hashed, and the link would land on an album
+ * that does not exist.
+ */
 export function stableAlbumId(track: Track): string {
-  return stableId("al", `${normalise(albumArtistOf(track))}|${normalise(track.album)}`);
+  const album = normalise(track.album);
+  const albumArtist = track.albumArtist.trim();
+  if (albumArtist === "") return stableId("al", album);
+  return stableId("al", `${normalise(albumArtist)}|${album}`);
 }
 
 export function stableArtistId(track: Track): string {

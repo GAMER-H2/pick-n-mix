@@ -19,8 +19,10 @@ const props = withDefaults(
     size?: number;
     radius?: number;
     shadow?: boolean;
+    /** Passed through to every tile; see `Artwork`. */
+    full?: boolean;
   }>(),
-  { artwork: null, artworkIds: () => [], size: 44, radius: 6, shadow: false },
+  { artwork: null, artworkIds: () => [], size: 44, radius: 6, shadow: false, full: false },
 );
 
 const covers = computed(() => props.artworkIds.slice(0, 4));
@@ -40,6 +42,7 @@ const quilted = computed(() => !props.artwork && covers.value.length >= 4);
       :artwork-id="id"
       :size="Math.ceil(size / 2)"
       :radius="0"
+      :full="full"
     />
   </div>
   <Artwork
@@ -48,6 +51,7 @@ const quilted = computed(() => !props.artwork && covers.value.length >= 4);
     :size="size"
     :radius="radius"
     :shadow="shadow"
+    :full="full"
   />
 </template>
 

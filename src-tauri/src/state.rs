@@ -1,6 +1,6 @@
 //! Application state shared by every Tauri command.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -166,6 +166,12 @@ pub struct AppPreferences {
     pub discover_max_plays: u32,
     pub hidden_built_in_preset_ids: Vec<String>,
     pub hidden_built_in_filter_ids: Vec<String>,
+    /// Rebound keyboard shortcuts, by action id. An action that is absent uses
+    /// the default binding the frontend holds; the backend only stores this.
+    pub shortcuts: BTreeMap<String, Vec<String>>,
+    /// The order playlists are listed in, by id. Ids that are not in here —
+    /// anything created or imported since — follow, sorted by name.
+    pub playlist_order: Vec<String>,
 }
 
 impl Default for AppPreferences {
@@ -184,6 +190,8 @@ impl Default for AppPreferences {
             discover_max_plays: 3,
             hidden_built_in_preset_ids: Vec::new(),
             hidden_built_in_filter_ids: Vec::new(),
+            shortcuts: BTreeMap::new(),
+            playlist_order: Vec::new(),
         }
     }
 }
@@ -209,6 +217,15 @@ impl AppPreferences {
         self.discover_max_plays = self.discover_max_plays.clamp(1, 100);
         deduplicate_non_empty(&mut self.hidden_built_in_preset_ids);
         deduplicate_non_empty(&mut self.hidden_built_in_filter_ids);
+        deduplicate_non_empty(&mut self.playlist_order);
+        // A binding list is written by the shortcut recorder, so the shapes it
+        // can produce are bounded; this only stops a hand-edited or corrupt
+        // settings row from growing without limit.
+        self.shortcuts.retain(|action, keys| {
+            deduplicate_non_empty(keys);
+            keys.truncate(MAX_BINDINGS_PER_ACTION);
+            !action.trim().is_empty() && !keys.is_empty()
+        });
         self
     }
 
@@ -221,6 +238,9 @@ impl AppPreferences {
             || self.discover_max_plays != other.discover_max_plays
     }
 }
+
+/// Enough for the alternates the defaults ship with, and then some.
+const MAX_BINDINGS_PER_ACTION: usize = 4;
 
 fn deduplicate_non_empty(ids: &mut Vec<String>) {
     let mut seen = HashSet::new();
@@ -583,6 +603,48 @@ mod tests {
         assert_eq!(json["discoverMaxPlays"], 3);
         assert_eq!(json["hiddenBuiltInPresetIds"], serde_json::json!([]));
         assert_eq!(json["hiddenBuiltInFilterIds"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn rebound_shortcuts_and_playlist_order_survive_a_round_trip() {
+        let mut shortcuts = BTreeMap::new();
+        shortcuts.insert("playPause".to_string(), vec!["Ctrl+Space".to_string()]);
+        let preferences = AppPreferences {
+            shortcuts,
+            playlist_order: vec!["pl-b".into(), "pl-a".into()],
+            ..AppPreferences::default()
+        }
+        .validated();
+
+        let json = serde_json::to_value(&preferences).unwrap();
+        assert_eq!(json["shortcuts"]["playPause"], serde_json::json!(["Ctrl+Space"]));
+        assert_eq!(json["playlistOrder"], serde_json::json!(["pl-b", "pl-a"]));
+    }
+
+    /// The recorder cannot produce these, but a hand-edited settings row can.
+    #[test]
+    fn nonsense_shortcut_entries_are_dropped() {
+        let mut shortcuts = BTreeMap::new();
+        shortcuts.insert("nextTrack".to_string(), vec![String::new(), "  ".into()]);
+        shortcuts.insert(
+            "playPause".to_string(),
+            vec!["A".into(), "A".into(), "B".into(), "C".into(), "D".into(), "E".into()],
+        );
+        let preferences = AppPreferences {
+            shortcuts,
+            playlist_order: vec!["pl-a".into(), "pl-a".into(), String::new()],
+            ..AppPreferences::default()
+        }
+        .validated();
+
+        // An action with nothing usable left is not an action with no keys; it
+        // simply falls back to its default.
+        assert!(!preferences.shortcuts.contains_key("nextTrack"));
+        assert_eq!(
+            preferences.shortcuts["playPause"],
+            vec!["A".to_string(), "B".into(), "C".into(), "D".into()],
+        );
+        assert_eq!(preferences.playlist_order, vec!["pl-a".to_string()]);
     }
 
     #[test]

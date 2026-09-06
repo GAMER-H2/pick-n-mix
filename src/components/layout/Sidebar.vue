@@ -1,5 +1,12 @@
 <script setup lang="ts">
-/** Navigation and playlists, matching the drawings' left column. */
+/**
+ * Navigation and playlists, matching the drawings' left column.
+ *
+ * Playlist rows are the app's other handle on a playlist: dragged by their
+ * grip to reorder the list, right-clicked (or opened from the row's own "more"
+ * button) for rename, share and delete — the same actions the playlist page
+ * offers, through the same composable.
+ */
 import { ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import PnmIcon from "../icons/PnmIcon.vue";
@@ -8,6 +15,10 @@ import { useHomeStore } from "@/stores/home";
 import { useMixerStore } from "@/stores/mixer";
 import { useUiStore } from "@/stores/ui";
 import { canGoBack, canGoForward } from "@/lib/navigation";
+import { useDragReorder } from "@/lib/dragReorder";
+import { useMenu } from "@/composables/useMenu";
+import { usePlaylistActions } from "@/composables/usePlaylistActions";
+import type { PlaylistSummary } from "@/lib/types";
 
 const route = useRoute();
 const router = useRouter();
@@ -15,9 +26,33 @@ const playlists = usePlaylistStore();
 const home = useHomeStore();
 const mixer = useMixerStore();
 const ui = useUiStore();
+const { openMenu } = useMenu();
+const { askRename, askRemove, share, importFile, reorder } = usePlaylistActions();
 
 const creating = ref(false);
 const draftName = ref("");
+
+/** Only the playlist rows carry `data-row`, so pinned mixes are never a drop target. */
+const listEl = ref<HTMLElement | null>(null);
+const { dragFrom, dropAt, isDragging, onHandleDown, onHandleMove, onHandleUp, onHandleCancel } =
+  useDragReorder(listEl, reorder);
+
+function openPlaylistMenu(event: MouseEvent, playlist: PlaylistSummary) {
+  openMenu(event, {
+    tracks: [],
+    items: [
+      { label: "Rename…", icon: "edit", action: () => askRename(playlist.id, playlist.name) },
+      { label: "Share…", icon: "share", action: () => share(playlist.id, playlist.name) },
+      {
+        label: "Delete Playlist",
+        icon: "trash",
+        separated: true,
+        danger: true,
+        action: () => askRemove(playlist.id, playlist.name),
+      },
+    ],
+  });
+}
 
 async function create() {
   const name = draftName.value.trim();
@@ -99,7 +134,7 @@ function openSettings() {
 
     <div class="sidebar__divider" />
 
-    <div class="sidebar__playlists scroll-area">
+    <div ref="listEl" class="sidebar__playlists scroll-area">
       <!-- Pinned mixes sit above real playlists: they are generated, so a
            listener should be able to tell them apart at a glance. -->
       <RouterLink
@@ -122,22 +157,60 @@ function openSettings() {
         No playlists yet
       </div>
 
-      <RouterLink
-        v-for="playlist in playlists.summaries"
-        :key="playlist.id"
-        :to="{ name: 'playlist', params: { id: playlist.id } }"
-        class="sidebar__playlist"
-        :class="{ 'is-active': isPlaylistOpen(playlist.id) }"
-      >
-        <span class="truncate">{{ playlist.name }}</span>
-        <PnmIcon
-          v-if="playlist.hasMixer"
-          name="mixer"
-          :size="13"
-          class="sidebar__badge"
-          title="This playlist has its own mixer settings"
-        />
-      </RouterLink>
+      <template v-for="(playlist, index) in playlists.summaries" :key="playlist.id">
+        <div v-if="isDragging && dropAt === index" class="sidebar__drop" />
+        <RouterLink
+          data-row
+          :to="{ name: 'playlist', params: { id: playlist.id } }"
+          class="sidebar__playlist"
+          :class="{
+            'is-active': isPlaylistOpen(playlist.id),
+            'is-lifted': dragFrom === index,
+          }"
+          @contextmenu.prevent="openPlaylistMenu($event, playlist)"
+        >
+          <button
+            class="sidebar__grip"
+            title="Drag to reorder"
+            :aria-label="`Drag to reorder ${playlist.name}`"
+            @click.prevent
+            @pointerdown="onHandleDown($event, index)"
+            @pointermove="onHandleMove"
+            @pointerup="onHandleUp"
+            @pointercancel="onHandleCancel"
+          >
+            <PnmIcon name="grip" :size="13" />
+          </button>
+
+          <span class="truncate">{{ playlist.name }}</span>
+
+          <PnmIcon
+            v-if="playlist.hasMixer"
+            name="mixer"
+            :size="13"
+            class="sidebar__badge"
+            title="This playlist has its own mixer settings"
+          />
+          <!-- Only once the timeline is what plays: a built-but-disabled
+               master mix leaves the playlist playing as a plain list. -->
+          <PnmIcon
+            v-if="playlist.masterMixEnabled"
+            name="timeline"
+            :size="13"
+            class="sidebar__badge"
+            title="This playlist plays as a master mix"
+          />
+          <button
+            class="sidebar__more"
+            :title="`More for ${playlist.name}`"
+            :aria-label="`More options for ${playlist.name}`"
+            @click.prevent.stop="openPlaylistMenu($event, playlist)"
+          >
+            <PnmIcon name="more" :size="14" />
+          </button>
+        </RouterLink>
+      </template>
+      <div v-if="isDragging && dropAt === playlists.summaries.length" class="sidebar__drop" />
 
       <div v-if="creating" class="sidebar__create">
         <input
@@ -152,10 +225,22 @@ function openSettings() {
       </div>
     </div>
 
-    <button class="sidebar__new" @click="creating = true">
-      <PnmIcon name="plus" :size="15" />
-      <span>Create New Playlist</span>
-    </button>
+    <div class="sidebar__actions">
+      <button class="sidebar__new" @click="creating = true">
+        <PnmIcon name="plus" :size="15" />
+        <span>Create New Playlist</span>
+      </button>
+      <!-- The other half of sharing: a playlist file someone sent you. -->
+      <button
+        class="icon-button sidebar__import"
+        type="button"
+        title="Import a playlist file"
+        aria-label="Import a playlist file"
+        @click="importFile"
+      >
+        <PnmIcon name="importFile" :size="16" />
+      </button>
+    </div>
 
     <div v-if="ui.toast" class="sidebar__toast" :class="{ 'is-error': ui.toast.kind === 'error' }">
       {{ ui.toast.message }}
@@ -252,6 +337,13 @@ function openSettings() {
   color: var(--text-tertiary);
 }
 
+/* A generated mix has no grip — nothing about it can be reordered — so it
+   takes the space one would occupy as padding instead, and the names in the
+   list stay on one left edge. */
+.sidebar__playlist--mix {
+  padding-left: 26px;
+}
+
 .sidebar__playlists {
   flex: 1;
   min-height: 0;
@@ -269,14 +361,63 @@ function openSettings() {
 .sidebar__playlist {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 6px;
   height: 30px;
-  padding: 0 10px;
+  padding: 0 6px 0 10px;
   border-radius: var(--radius-sm);
   font-size: 12.5px;
   color: var(--text);
   text-decoration: none;
+}
+
+.sidebar__playlist .truncate {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The grip and the "more" button are secondary: they appear on hover, or
+   while this row is the one being dragged, so a resting sidebar is just a
+   list of names. Both stay visible once focused, for keyboard users. */
+.sidebar__grip,
+.sidebar__more {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 26px;
+  margin: 0 -2px;
+  opacity: 0;
+  color: var(--text-tertiary);
+}
+
+.sidebar__grip {
+  cursor: grab;
+  margin-left: -8px;
+}
+
+.sidebar__playlist:hover .sidebar__grip,
+.sidebar__playlist:hover .sidebar__more,
+.sidebar__grip:focus-visible,
+.sidebar__more:focus-visible,
+.sidebar__playlist.is-lifted .sidebar__grip {
+  opacity: 1;
+}
+
+.sidebar__more:hover {
+  color: var(--text);
+}
+
+.sidebar__playlist.is-lifted {
+  opacity: 0.5;
+}
+
+/* Insertion marker, matching the queue's. */
+.sidebar__drop {
+  height: 2px;
+  margin: 1px 8px;
+  border-radius: 2px;
+  background: var(--accent);
 }
 
 .sidebar__playlist:hover {
@@ -297,15 +438,27 @@ function openSettings() {
   padding: 4px 2px;
 }
 
+.sidebar__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+}
+
 .sidebar__new {
+  flex: 1;
   display: flex;
   align-items: center;
   gap: 7px;
   height: 32px;
   padding: 0 10px;
-  margin-top: 8px;
   border-radius: var(--radius-sm);
   font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.sidebar__import {
+  flex: none;
   color: var(--text-secondary);
 }
 

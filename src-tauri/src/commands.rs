@@ -1185,7 +1185,19 @@ pub struct PlaylistSummary {
 
 #[tauri::command]
 pub fn list_playlists(state: State<'_, AppState>) -> Cmd<Vec<PlaylistSummary>> {
-    Ok(playlist::list(&state.paths.playlists)
+    // `playlist::list` sorts by name; the user's own order, where they have
+    // one, comes first. Applied here rather than in the sidebar so every
+    // surface that lists playlists agrees on the order.
+    let order = load_app_preferences(&state.db).playlist_order;
+    let mut found = playlist::list(&state.paths.playlists);
+    found.sort_by_key(|(_, p)| {
+        order
+            .iter()
+            .position(|id| *id == p.id)
+            .unwrap_or(usize::MAX)
+    });
+
+    Ok(found
         .into_iter()
         .map(|(path, p)| PlaylistSummary {
             id: p.id.clone(),
@@ -1262,13 +1274,37 @@ pub fn update_playlist(
     let Some((path, mut p)) = find_playlist(&state, &id) else {
         return Err("playlist not found".into());
     };
-    if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
-        p.name = name;
-    }
+    let renamed = match name.filter(|n| !n.trim().is_empty()) {
+        Some(name) if name != p.name => {
+            p.name = name;
+            true
+        }
+        _ => false,
+    };
     if let Some(description) = description {
         p.description = description;
     }
-    p.save(&path).map_err(err)?;
+
+    // The file is named after the playlist, and the folder is somewhere the
+    // user can see, so a rename moves it rather than leaving "old-name.pnmx"
+    // holding a playlist called something else. Only on a rename: a file this
+    // app did not name — a hand-dropped `.json` — is edited where it lies
+    // rather than being copied to a second file holding the same playlist.
+    let destination = if renamed {
+        state
+            .paths
+            .playlists
+            .join(playlist::file_name_for(&p.name, &p.id))
+    } else {
+        path.clone()
+    };
+    // Written first and only then unlinked: a failure leaves the original,
+    // never nothing.
+    p.save(&destination).map_err(err)?;
+    if destination != path {
+        let _ = std::fs::remove_file(&path);
+    }
+
     let _ = app.emit("playlists-changed", ());
     Ok(())
 }
@@ -3248,6 +3284,20 @@ fn db_to_gain(db: f32) -> f32 {
     } else {
         10f32.powf(db / 20.0)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Window
+// ---------------------------------------------------------------------------
+
+/// Whether the window is currently flush against an edge — maximised,
+/// fullscreen or tiled — and so drawing no shadow.
+///
+/// The frontend is told about later changes by the `window-flush` event; this
+/// is only how it learns the state it started in, which no event will repeat.
+#[tauri::command]
+pub fn window_is_flush() -> bool {
+    crate::window_frame::is_flush()
 }
 
 #[cfg(test)]

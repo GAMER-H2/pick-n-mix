@@ -23,6 +23,7 @@ import { useMasterMixStore } from "@/stores/masterMix";
 import { useUiStore } from "@/stores/ui";
 import { useCollectionPlayback } from "@/composables/useCollectionPlayback";
 import { useMenu } from "@/composables/useMenu";
+import { usePlaylistActions } from "@/composables/usePlaylistActions";
 import type { ResolvedEntry } from "@/lib/types";
 
 const route = useRoute();
@@ -32,6 +33,7 @@ const mixer = useMixerStore();
 const masterMix = useMasterMixStore();
 const ui = useUiStore();
 const { openMenu } = useMenu();
+const { askRename, askRemove, share } = usePlaylistActions();
 const { playOrToggle } = useCollectionPlayback();
 
 const editingDescription = ref(false);
@@ -256,6 +258,7 @@ async function saveDescription() {
           tracks: available.map((i) => i.track!),
           playlistOptions: {
             id: playlist!.id,
+            name: playlist!.name,
             shuffleOnly: playlist!.shuffleOnly,
             hasArtwork: !!playlist!.artwork,
             masterMixEnabled: !!playlist!.masterMix?.enabled,
@@ -264,6 +267,9 @@ async function saveDescription() {
             onToggleShuffleOnly: toggleShuffleOnly,
             onChooseArtwork: chooseArtwork,
             onClearArtwork: clearArtwork,
+            onRename: () => askRename(playlist!.id, playlist!.name),
+            onShare: () => share(playlist!.id, playlist!.name),
+            onDelete: () => askRemove(playlist!.id, playlist!.name),
           },
         })
       "

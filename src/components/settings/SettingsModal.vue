@@ -5,8 +5,17 @@ import AppToggle from "../ui/AppToggle.vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import QueueList from "../media/QueueList.vue";
 import SelectMenu from "../ui/SelectMenu.vue";
+import FormRow from "../ui/FormRow.vue";
+import ShortcutRecorder from "./ShortcutRecorder.vue";
 import AdvancedMixer from "../mixer/AdvancedMixer.vue";
 import { EQ_PRESETS } from "@/lib/eqPresets";
+import {
+  actionFor,
+  bindingLabel,
+  bindingsFor,
+  SHORTCUTS,
+  type ShortcutAction,
+} from "@/lib/shortcuts";
 import * as api from "@/lib/api";
 import type { AppPreferences, FadeMode, FilterInfo, Preset, ThemePreference } from "@/lib/types";
 import { useHomeStore } from "@/stores/home";
@@ -17,7 +26,7 @@ import { usePresetEditorStore } from "@/stores/presetEditor";
 import { useSettingsStore } from "@/stores/settings";
 import { useUiStore } from "@/stores/ui";
 
-type Pane = "theme" | "playback" | "recommendations" | "mixer" | "library";
+type Pane = "theme" | "playback" | "shortcuts" | "recommendations" | "mixer" | "library";
 type NumberPreference =
   | "mixLength"
   | "replayDays"
@@ -29,6 +38,7 @@ type NumberPreference =
 const panes: { id: Pane; label: string; description: string }[] = [
   { id: "theme", label: "Theme", description: "Appearance and accent" },
   { id: "playback", label: "Playback", description: "Audio behaviour" },
+  { id: "shortcuts", label: "Shortcuts", description: "Keyboard control" },
   { id: "recommendations", label: "Recommendations", description: "Mixes and history" },
   { id: "mixer", label: "Mixer", description: "Presets and ambience" },
   { id: "library", label: "Library", description: "Sources and scanning" },
@@ -58,6 +68,8 @@ const eqPresetName = ref("");
 const busy = ref<string | null>(null);
 const pendingFilterDelete = ref<string | null>(null);
 const pendingFolderRemove = ref<string | null>(null);
+/** True while a shortcut recorder has the keyboard. */
+const recordingShortcut = ref(false);
 
 const ui = useUiStore();
 const settings = useSettingsStore();
@@ -141,10 +153,58 @@ function close() {
 
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== "Escape") return;
+  // A shortcut is being recorded: Escape cancels that, not this modal.
+  if (recordingShortcut.value) return;
   event.preventDefault();
   event.stopPropagation();
   if (presetEditor.session) presetEditor.close();
   else close();
+}
+
+/**
+ * Keyboard shortcuts. Only the actions the user has changed are stored; the
+ * rest fall back to the catalogue, so a later change to a default is picked up
+ * rather than being frozen into everyone's settings.
+ */
+const shortcutOverrides = computed(() => settings.preferences.shortcuts);
+
+function shortcutBindings(action: ShortcutAction): string[] {
+  return bindingsFor(action, shortcutOverrides.value);
+}
+
+function shortcutCustomised(action: ShortcutAction): boolean {
+  return (shortcutOverrides.value[action]?.length ?? 0) > 0;
+}
+
+/**
+ * Refused rather than stolen when the key is already taken: leaving the other
+ * action bound to nothing is a worse surprise than being told to pick another
+ * key, and this way nothing changes behind the user's back.
+ */
+async function recordShortcut(action: ShortcutAction, binding: string) {
+  const owner = actionFor(binding, shortcutOverrides.value);
+  if (owner && owner !== action) {
+    const name = SHORTCUTS.find((shortcut) => shortcut.id === owner)?.label ?? owner;
+    ui.notify(`${bindingLabel(binding)} is already used by "${name}"`, "error");
+    return;
+  }
+  await reportFailure("Could not save that shortcut", () =>
+    settings.update({ shortcuts: { ...shortcutOverrides.value, [action]: [binding] } }),
+  );
+}
+
+async function resetShortcut(action: ShortcutAction) {
+  const next = { ...shortcutOverrides.value };
+  delete next[action];
+  await reportFailure("Could not reset that shortcut", () =>
+    settings.update({ shortcuts: next }),
+  );
+}
+
+async function resetAllShortcuts() {
+  await reportFailure("Could not reset the shortcuts", () =>
+    settings.update({ shortcuts: {} }),
+  );
 }
 
 async function reportFailure(label: string, action: () => Promise<unknown>) {
@@ -571,6 +631,42 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
             </div>
           </section>
 
+          <section v-else-if="activePane === 'shortcuts'" class="pane">
+            <div class="section-heading">
+              <div>
+                <h4>Keyboard shortcuts</h4>
+                <p>
+                  Record a key to rebind an action. Shortcuts stand down while you are typing
+                  in a field, and while the Master Mixer is open — it runs its own transport.
+                </p>
+              </div>
+              <button
+                class="pill-button is-plain"
+                type="button"
+                :disabled="Object.keys(shortcutOverrides).length === 0"
+                @click="resetAllShortcuts"
+              >
+                Reset all
+              </button>
+            </div>
+
+            <FormRow
+              v-for="shortcut in SHORTCUTS"
+              :key="shortcut.id"
+              :label="shortcut.label"
+              :hint="shortcut.description"
+            >
+              <ShortcutRecorder
+                :action="shortcut.label"
+                :bindings="shortcutBindings(shortcut.id)"
+                :customised="shortcutCustomised(shortcut.id)"
+                @record="recordShortcut(shortcut.id, $event)"
+                @reset="resetShortcut(shortcut.id)"
+                @recording="recordingShortcut = $event"
+              />
+            </FormRow>
+          </section>
+
           <section v-else-if="activePane === 'recommendations'" class="pane recommendations-pane">
             <div class="number-grid">
               <label v-for="field in numberFields" :key="field.key" class="number-field">
@@ -773,7 +869,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 <style scoped>
 .settings-scrim {
   position: fixed;
-  inset: 0;
+  /* Inside the window's own edge, not the surface's: the outer `--frame-inset`
+     is transparent shadow, and shading it would darken the desktop showing
+     through rather than the app. */
+  inset: var(--frame-inset);
+  border-radius: var(--frame-radius);
   z-index: var(--z-modal);
   display: flex;
   align-items: center;
@@ -787,7 +887,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
   position: relative;
   display: flex;
   width: min(900px, 100%);
-  height: min(650px, calc(100vh - 44px));
+  height: min(650px, calc(var(--frame-height) - 44px));
   transition: width 0.2s var(--ease);
 }
 
@@ -945,7 +1045,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 
 @media (max-width: 700px) {
   .settings-scrim { padding: 10px; }
-  .settings-workspace { height: calc(100vh - 20px); }
+  .settings-workspace { height: calc(var(--frame-height) - 20px); }
   .settings-modal { height: 100%; }
   .settings-layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
   .settings-nav { display: flex; gap: 4px; overflow-x: auto; padding: 7px 8px; border-right: 0; border-bottom: 1px solid var(--separator); }

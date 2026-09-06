@@ -32,8 +32,12 @@
   --z-panel: 300;
   --z-modal: 520;
   --z-modal-top: 530;
+  --z-modal-nested: 535;
   --z-context: 540;
   --z-popover: 600;
+  /* The window's own controls, which stay reachable over anything the app
+     puts on screen — a modal cannot take the close button away. */
+  --z-window-controls: 620;
 
   --sidebar-width: 244px;
   --player-height: 78px;
@@ -52,12 +56,35 @@
      window, above the webview and outside its control. Anything the user has
      to click there needs to start after this. Zero everywhere else. */
   --overlay-controls: 0px;
+
+  /* The transparent margin a client-side-decorated window keeps around itself
+     to cast its own shadow into. Zero where the platform decorates the window
+     for us, so anything that means "the window's edge" — a scrim, a resize
+     grip — can position against this and be right everywhere. The compositor
+     is told the same number; see `src-tauri/src/window_frame.rs`. */
+  --frame-inset: 0px;
+  --frame-radius: 0px;
+  /* The window as the user sees it: the surface, less the shadow margin on
+     each side. What `100vw`/`100vh` would mean if the shadow were not part of
+     the window. */
+  --frame-width: calc(100vw - var(--frame-inset) * 2);
+  --frame-height: calc(100vh - var(--frame-inset) * 2);
 }
 
 /* Set once, in `App.vue`, once the window is confirmed undecorated. */
 html.is-custom-titlebar {
   --titlebar-height: 30px;
   --titlebar-controls: 90px;
+  --frame-inset: 24px;
+  --frame-radius: 11px;
+}
+
+/* A window flush against an edge — maximised or tiled — has nowhere to cast a
+   shadow, so it gives the margin back. Toggled from `useWindowChrome`, which
+   hears about tiling from the backend. */
+html.is-custom-titlebar.is-window-flush {
+  --frame-inset: 0px;
+  --frame-radius: 0px;
 }
 
 /* Also set in `App.vue`, for the macOS overlay title bar. Mutually exclusive
@@ -345,8 +372,10 @@ textarea {
  */
 .pnm-popover {
   position: fixed;
-  z-index: 600;
-  bottom: calc(var(--player-height) + 12px);
+  z-index: var(--z-popover);
+  /* Offsets are from the window's own edges, not the surface's, so they clear
+     the shadow margin instead of floating out into it. */
+  bottom: calc(var(--frame-inset) + var(--player-height) + 12px);
   border-radius: var(--radius-lg);
   background: var(--bg-elevated);
   border: 0.5px solid var(--separator);
@@ -354,12 +383,12 @@ textarea {
 }
 
 .pnm-popover--mixer {
-  right: 14px;
+  right: calc(var(--frame-inset) + 14px);
   transform-origin: bottom right;
 }
 
 .pnm-popover--info {
-  left: 14px;
+  left: calc(var(--frame-inset) + 14px);
   transform-origin: bottom left;
 }
 

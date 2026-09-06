@@ -3213,6 +3213,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "flacenc",
+ "gtk",
  "image",
  "lofty",
  "parking_lot",

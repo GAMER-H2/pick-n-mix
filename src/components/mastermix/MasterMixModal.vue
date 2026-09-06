@@ -55,6 +55,7 @@ import {
 import { formatDuration } from "@/lib/format";
 import { pitchRatio, resolve } from "@/lib/mixer";
 import { useDismiss } from "@/lib/dismiss";
+import { visibleBounds } from "@/lib/frame";
 import { useMasterMixStore, type Tool } from "@/stores/masterMix";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
@@ -119,7 +120,8 @@ function toggleColorPicker(laneIndex: number, event: MouseEvent) {
   }
   const swatch = event.currentTarget as HTMLElement;
   const box = swatch.getBoundingClientRect();
-  const flip = box.bottom + PALETTE_HEIGHT > window.innerHeight;
+  // Against the window's own bottom edge, which the shadow margin sits below.
+  const flip = box.bottom + PALETTE_HEIGHT > visibleBounds().bottom;
   colorAnchor.value = swatch;
   colorLane.value = {
     index: laneIndex,
@@ -1725,7 +1727,11 @@ const summary = computed(() => {
 
 .mm-scrim {
   position: fixed;
-  inset: 0;
+  /* Inside the window's own edge, not the surface's: the outer `--frame-inset`
+     is transparent shadow, and shading it would darken the desktop showing
+     through rather than the app. */
+  inset: var(--frame-inset);
+  border-radius: var(--frame-radius);
   z-index: var(--z-modal-top);
   display: flex;
   align-items: center;

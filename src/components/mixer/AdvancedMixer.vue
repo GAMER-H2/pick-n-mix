@@ -11,6 +11,7 @@ import PnmIcon from "../icons/PnmIcon.vue";
 import AppSlider from "../ui/AppSlider.vue";
 import AppKnob from "../ui/AppKnob.vue";
 import AppToggle from "../ui/AppToggle.vue";
+import SelectMenu, { type SelectOption } from "../ui/SelectMenu.vue";
 import EqSliders from "./EqSliders.vue";
 import EqModal from "./EqModal.vue";
 import PresetSelect from "./PresetSelect.vue";
@@ -114,9 +115,11 @@ function setPanning(patch: Partial<typeof fx.value.panning>) {
   setSection("panning", { ...fx.value.panning, ...patch });
 }
 
-function onPanningMode(event: Event) {
-  setPanning({ mode: (event.target as HTMLSelectElement).value as PanningMode });
-}
+const PANNING_MODES: ReadonlyArray<SelectOption> = [
+  { id: "monoPan", label: "Mono Pan" },
+  { id: "stereoBalance", label: "Stereo Balance" },
+  { id: "trueStereo", label: "True Stereo" },
+];
 
 const panningLabel = computed(() => {
   switch (fx.value.panning.mode) {
@@ -480,19 +483,13 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
           :can-override="canOverride"
           @clear="clearSection('panning')"
         />
-        <label class="panning-mode">
-          <span>Mode</span>
-          <select
-            class="text-field"
-            aria-label="Panning mode"
-            :value="fx.panning.mode"
-            @change="onPanningMode"
-          >
-            <option value="monoPan">Mono Pan</option>
-            <option value="stereoBalance">Stereo Balance</option>
-            <option value="trueStereo">True Stereo</option>
-          </select>
-        </label>
+        <SelectMenu
+          class="panning-mode"
+          label="Mode"
+          :model-value="fx.panning.mode"
+          :options="PANNING_MODES"
+          @update:model-value="setPanning({ mode: $event as PanningMode })"
+        />
         <div class="knobs knobs--panning">
           <AppKnob
             :model-value="fx.panning.position"
@@ -796,13 +793,7 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
 }
 
 .panning-mode {
-  display: grid;
-  grid-template-columns: 68px 1fr;
-  align-items: center;
-  gap: 8px;
   margin-bottom: 10px;
-  font-size: 11.5px;
-  color: var(--text-secondary);
 }
 
 .knobs--panning {

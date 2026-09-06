@@ -23,8 +23,12 @@ const props = withDefaults(
     labelledby?: string;
     closeOnScrim?: boolean;
     closeOnEsc?: boolean;
-    /** `modal-top` sits above another open modal (Master Mix over EQ). */
-    layer?: "modal" | "modal-top";
+    /**
+     * `modal-top` sits above another open modal (the Master Mixer over the
+     * app's dialogs); `modal-nested` above that, for a modal opened from
+     * inside a `modal-top` one.
+     */
+    layer?: "modal" | "modal-top" | "modal-nested";
     /**
      * Remove the shell's own padding for workspace-style content (the EQ
      * modal) that manages its edges like the settings and master modals do.
@@ -101,13 +105,13 @@ defineExpose({ dialogRef });
       <div
         v-if="open"
         class="modal__scrim"
-        :class="{ 'modal__scrim--top': layer === 'modal-top' }"
+        :class="`modal__scrim--${layer}`"
         @click.self="onScrimClick"
       >
         <div
           ref="dialogRef"
           class="modal__dialog"
-          :class="{ 'modal__dialog--top': layer === 'modal-top', 'modal__dialog--flush': flush }"
+          :class="[`modal__dialog--${layer}`, { 'modal__dialog--flush': flush }]"
           :style="{ width: `${width}px` }"
           role="dialog"
           aria-modal="true"
@@ -150,7 +154,11 @@ defineExpose({ dialogRef });
 <style scoped>
 .modal__scrim {
   position: fixed;
-  inset: 0;
+  /* Inside the window's own edge, not the surface's: the outer `--frame-inset`
+     is transparent shadow, and shading it would darken the desktop showing
+     through rather than the app. */
+  inset: var(--frame-inset);
+  border-radius: var(--frame-radius);
   z-index: var(--z-modal);
   display: flex;
   align-items: center;
@@ -160,15 +168,19 @@ defineExpose({ dialogRef });
   backdrop-filter: blur(4px);
 }
 
-.modal__scrim--top {
+.modal__scrim--modal-top {
   z-index: var(--z-modal-top);
+}
+
+.modal__scrim--modal-nested {
+  z-index: var(--z-modal-nested);
 }
 
 .modal__dialog {
   display: flex;
   flex-direction: column;
-  max-width: calc(100vw - 44px);
-  max-height: calc(100vh - 44px);
+  max-width: calc(var(--frame-width) - 44px);
+  max-height: calc(var(--frame-height) - 44px);
   padding: 16px;
   border-radius: var(--radius-lg);
   background: var(--bg-elevated);
@@ -177,8 +189,12 @@ defineExpose({ dialogRef });
   outline: none;
 }
 
-.modal__dialog--top {
+.modal__dialog--modal-top {
   z-index: var(--z-modal-top);
+}
+
+.modal__dialog--modal-nested {
+  z-index: var(--z-modal-nested);
 }
 
 .modal__dialog--flush {

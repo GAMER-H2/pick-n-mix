@@ -72,8 +72,27 @@ Layering is a token, never a magic number:
 | `--z-panel` | 300 | Slide-in side panels (queue, mixer). |
 | `--z-popover` | 600 | Anchored popovers and menus (teleported to `<body>`). |
 | `--z-modal` | 520 | Modal dialogs and workspace modals. |
-| `--z-modal-top` | 530 | A modal that must sit above another modal (Master Mix over EQ). |
+| `--z-modal-top` | 530 | A modal that must sit above another modal (the Master Mixer over the app's dialogs). |
+| `--z-modal-nested` | 535 | A modal opened from inside a `modal-top` one (the EQ modal, expanded from the mixer panel the Master Mixer hosts). |
 | `--z-context` | 540 | The context menu — it can be opened from anywhere, including inside modals. |
+| `--z-window-controls` | 620 | The window's own controls and resize grips. Above everything: a dialog must not take away the close button or make the window unresizable. |
+
+### The window frame
+
+Where the platform has no server-side decorations (Linux), the window is larger
+than the app and casts its own shadow into the margin between the two. That
+margin is a root token, so anything that means *the window's edge* positions
+against it rather than against the viewport:
+
+| Token | Meaning |
+|---|---|
+| `--frame-inset` | The shadow margin per side. `24px` with a custom title bar, `0` otherwise and while the window is maximised or tiled. |
+| `--frame-radius` | The window's corner radius, on the same terms. |
+| `--frame-width`, `--frame-height` | `100vw`/`100vh` less the margin: the window as the user sees it. |
+
+A scrim is `inset: var(--frame-inset)`, not `inset: 0` — shading the margin
+darkens the desktop showing through, not the app. In script, `visibleBounds()`
+from `@/lib/frame` is the same thing for menus that clamp themselves on screen.
 
 ### Type, space, motion
 
@@ -112,6 +131,9 @@ These are not decoration; each maps to a concrete rule below.
 6. **Flexibility and efficiency.** Every list row supports dblclick-to-play and
    right-click-for-more. Keyboard shortcuts are installed once, in
    `lib/keyboard.ts`, and stand down while the Master Mixer owns transport.
+   What each key does comes from the catalogue in `lib/shortcuts.ts` and the
+   user's own bindings — a new shortcut is an entry there plus a case in the
+   handler, and it appears in Settings ▸ Shortcuts for free.
 7. **Accessibility.** Icon-only controls get `aria-label`. Dialogs get
    `role="dialog"`, `aria-modal`, an accessible name, initial focus, and focus
    restore on close. Knobs and sliders are keyboard operable. Hit targets are
@@ -156,12 +178,29 @@ transition, teleport to `<body>`, `role="dialog"` + `aria-modal`.
 
 - Props: `open`, `title?`, `subtitle?`, `width?` (px), `labelledby?` (when the
   title lives in custom header content), `closeOnScrim?` (default true),
-  `closeOnEsc?` (default true), `layer?: "modal" | "modal-top"`.
+  `closeOnEsc?` (default true),
+  `layer?: "modal" | "modal-top" | "modal-nested"`.
 - Slots: `default`, `header` (replaces the title row), `footer`.
 - A modal with its own global key handling (Master Mix) sets `close-on-esc`
   to false and keeps its own handler; everything else defers to BaseModal.
 - Footer buttons: primary = `.pill-button`, secondary = `.pill-button.is-secondary`,
   plain = `.pill-button.is-plain`, destructive = `.pill-button.is-danger`.
+
+### ConfirmDialog / NameDialog
+
+Two `BaseModal`s that come up often enough to exist once:
+
+```vue
+<ConfirmDialog v-if="deleting" title="Delete playlist?" :message="…"
+               confirm-label="Delete" danger @confirm="remove" @close="deleting = null" />
+<NameDialog v-if="renaming" title="Rename playlist" label="Playlist name"
+            confirm-label="Rename" :initial="name" @submit="rename" @close="renaming = null" />
+```
+
+`ConfirmDialog` is for actions that cannot be undone — anything reversible
+should just happen and say so in a toast. `NameDialog` focuses and selects its
+field on open, and Enter submits. Both are parent-`v-if`-ed, like every other
+dialog in the app.
 
 ### MenuSurface
 
@@ -292,6 +331,9 @@ in the queue).
    - Playback: toggle-if-current idiom and shuffle-and-play come from
      `useCollectionPlayback` (or the store-backed equivalent for playlists and
      mixes, which play through the backend).
+   - Playlist-wide actions (rename, delete, share, import, sidebar order) come
+     from `usePlaylistActions`; the dialogs they open are mounted once in
+     `dialogs/PlaylistDialogs.vue` and driven through the `ui` store.
 4. State that should survive Back/Forward (tab, query, sort) goes in the URL
    query, `replace`d while typing, `push`ed on discrete changes.
 
@@ -318,6 +360,11 @@ keep local state. Footer order: Cancel (plain) left of the primary action.
 Build the payload and call `ui.openContextMenu({ x, y, … })` — always via
 `useMenu().openMenu(event, payload)` so coordinates are extracted once.
 The menu itself renders `MenuSurface` inside `overlays/ContextMenu.vue`.
+
+A menu that is not about a song — the sidebar's playlist rows — passes
+`items: ContextMenuItem[]` instead, and those rows are drawn in place of the
+track actions. It is still the one menu, in the one place; do not build a
+second menu component.
 
 ### A settings row or mixer control row
 

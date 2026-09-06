@@ -17,6 +17,8 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   discoverMaxPlays: 3,
   hiddenBuiltInPresetIds: [],
   hiddenBuiltInFilterIds: [],
+  shortcuts: {},
+  playlistOrder: [],
 };
 
 const systemDark = window.matchMedia("(prefers-color-scheme: dark)");

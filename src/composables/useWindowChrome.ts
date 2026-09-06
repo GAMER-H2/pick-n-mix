@@ -7,9 +7,10 @@
  * so they stay true to whatever `decorations` the platform config actually
  * applied instead of being a second, silently divergent source of truth.
  */
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 
 export type ResizeDirection =
   | "East"
@@ -41,10 +42,26 @@ const resizeRegions: ReadonlyArray<ResizeRegion> = [
 export function useWindowChrome() {
   const usesCustomTitlebar = ref(false);
   const isMaximized = ref(false);
+  const isTiled = ref(false);
   const isFocused = ref(true);
+
+  /**
+   * Whether the window sits flush against an edge, and so has no room for its
+   * shadow. Tiling is reported by the backend, the only side that can see it:
+   * neither the window API nor the DOM tells a tiled window from a small one.
+   */
+  const isFlush = computed(() => isMaximized.value || isTiled.value);
+
+  // On the document rather than in the shell, because the shadow margin is a
+  // root token: everything teleported to `<body>` — every scrim — has to know
+  // where the window's real edge is too.
+  watch(isFlush, (flush) => {
+    document.documentElement.classList.toggle("is-window-flush", flush);
+  });
 
   let unlistenResize: UnlistenFn | null = null;
   let unlistenFocus: UnlistenFn | null = null;
+  let unlistenFlush: UnlistenFn | null = null;
 
   /**
    * Whether this window has to draw its own frame.
@@ -128,19 +145,34 @@ export function useWindowChrome() {
       unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload }) => {
         isFocused.value = payload;
       });
+
+      // Tiling, on the platforms that have it, arrives from the backend: it is
+      // also where the compositor's copy of the shadow margin is dropped, so
+      // the two stay in step.
+      unlistenFlush = await listen<boolean>("window-flush", ({ payload }) => {
+        isTiled.value = payload;
+      });
+      // The state the window started in, which no event will repeat.
+      try {
+        isTiled.value = await invoke<boolean>("window_is_flush");
+      } catch (error) {
+        reportWindowControlError(error);
+      }
     }
   });
 
   onBeforeUnmount(() => {
     unlistenResize?.();
     unlistenFocus?.();
+    unlistenFlush?.();
     document.documentElement.classList.remove("is-custom-titlebar");
+    document.documentElement.classList.remove("is-window-flush");
     document.documentElement.classList.remove("is-mac-overlay");
   });
 
   return {
     usesCustomTitlebar,
-    isMaximized,
+    isFlush,
     isFocused,
     resizeRegions,
     minimizeWindow,

@@ -5,8 +5,21 @@ import PnmIcon from "../icons/PnmIcon.vue";
 import { artUrl } from "@/lib/format";
 
 const props = withDefaults(
-  defineProps<{ artworkId?: string | null; size?: number; radius?: number; shadow?: boolean }>(),
-  { size: 44, radius: 6, shadow: false },
+  defineProps<{
+    artworkId?: string | null;
+    size?: number;
+    radius?: number;
+    shadow?: boolean;
+    /**
+     * Serve the original picture rather than a thumbnail. For the few places
+     * showing a cover as the subject rather than a label — the full-screen
+     * player's centrepiece — where the element is also sized by CSS beyond
+     * `size`, so no thumbnail bucket could be picked that would still be
+     * sharp at the size it actually ends up.
+     */
+    full?: boolean;
+  }>(),
+  { size: 44, radius: 6, shadow: false, full: false },
 );
 
 const failed = ref(false);
@@ -14,7 +27,7 @@ const failed = ref(false);
 // backend rounds this up to its nearest cached bucket anyway.
 const requestWidth = computed(() => Math.round(props.size * (window.devicePixelRatio || 1)));
 const src = computed(() =>
-  failed.value ? null : artUrl(props.artworkId, requestWidth.value),
+  failed.value ? null : artUrl(props.artworkId, props.full ? undefined : requestWidth.value),
 );
 
 // A new track means a new chance for the image to work.

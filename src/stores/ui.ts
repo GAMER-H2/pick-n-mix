@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
+import type { IconName } from "@/components/icons/paths";
 import type { Track } from "@/lib/types";
 
 /**
@@ -11,6 +12,7 @@ import type { Track } from "@/lib/types";
  */
 export interface PlaylistMenuOptions {
   id: string;
+  name: string;
   shuffleOnly: boolean;
   hasArtwork: boolean;
   /**
@@ -26,12 +28,35 @@ export interface PlaylistMenuOptions {
   onToggleShuffleOnly: () => Promise<void>;
   onChooseArtwork: () => Promise<void>;
   onClearArtwork: () => Promise<void>;
+  /** Rename, share and delete — the same three the sidebar row offers. */
+  onRename: () => void;
+  onShare: () => Promise<void>;
+  onDelete: () => void;
+}
+
+/**
+ * A menu row built by the caller, for the menus that are not about a song —
+ * the sidebar's playlist rows. The menu draws these instead of the track
+ * actions; the two are never mixed.
+ */
+export interface ContextMenuItem {
+  label: string;
+  icon: IconName;
+  /** Return values are ignored; the menu closes before this is awaited. */
+  action: () => unknown;
+  /** Starts a new group, drawn under a separator. */
+  separated?: boolean;
+  danger?: boolean;
+  checked?: boolean;
 }
 
 export interface ContextMenuState {
   x: number;
   y: number;
+  /** The songs this menu acts on. Empty when `items` is supplied instead. */
   tracks: Track[];
+  /** A menu of the caller's own rows, rather than the song actions. */
+  items?: ContextMenuItem[];
   /** Set when the menu was opened from inside a playlist. */
   playlistId?: string;
   entryIndex?: number;
@@ -57,6 +82,15 @@ export const useUiStore = defineStore("ui", () => {
   const settingsOpen = ref(false);
   const queueOpen = ref(false);
   const addToPlaylistFor = ref<Track[] | null>(null);
+  /**
+   * Playlist-wide dialogs, opened from wherever a playlist can be acted on —
+   * the sidebar row's menu, the playlist page's own — and rendered once by
+   * `dialogs/PlaylistDialogs.vue`.
+   */
+  const playlistRename = ref<{ id: string; name: string } | null>(null);
+  const playlistDelete = ref<{ id: string; name: string } | null>(null);
+  /** Whether the "save the queue as a playlist" dialog is open. */
+  const saveQueueOpen = ref(false);
   const toast = ref<{ message: string; kind: "info" | "error" } | null>(null);
   let toastTimer: number | undefined;
 
@@ -82,6 +116,9 @@ export const useUiStore = defineStore("ui", () => {
     settingsOpen,
     queueOpen,
     addToPlaylistFor,
+    playlistRename,
+    playlistDelete,
+    saveQueueOpen,
     toast,
     openContextMenu,
     closeContextMenu,

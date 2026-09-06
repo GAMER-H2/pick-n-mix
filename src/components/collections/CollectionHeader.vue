@@ -34,12 +34,15 @@ const emit = defineEmits<{ play: []; shuffle: []; mixer: []; menu: [event: Mouse
 
 <template>
   <header class="collection">
+    <!-- `full`: one cover for the whole page, so there is no long list of
+         decodes to keep cheap and nothing to gain from a thumbnail of it. -->
     <PlaylistArtwork
       :artwork="artworkId"
       :artwork-ids="artworkIds"
       :size="188"
       :radius="round ? 94 : 8"
       shadow
+      full
       class="collection__art"
     />
 

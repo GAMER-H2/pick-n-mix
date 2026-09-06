@@ -12,6 +12,7 @@ import PnmIcon from "../icons/PnmIcon.vue";
 import Artwork from "../media/Artwork.vue";
 import PlaylistArtwork from "../media/PlaylistArtwork.vue";
 import QueueList from "../media/QueueList.vue";
+import IconButton from "../ui/IconButton.vue";
 import { artUrl, formatDuration } from "@/lib/format";
 import { usePlayerStore } from "@/stores/player";
 import { useNowPlayingMeta } from "@/composables/useNowPlayingMeta";
@@ -21,7 +22,8 @@ const player = usePlayerStore();
 const router = useRouter();
 
 const { mix, track, title, subtitle } = useNowPlayingMeta();
-const { current, items, jump, remove, move, openMenu } = useQueueActions();
+const { current, items, jump, remove, move, clear, saveAsPlaylist, openMenu } =
+  useQueueActions();
 
 // Blown up 1.6x and blurred 64px, so detail beyond this is invisible; no
 // reason to decode the original multi-megapixel picture for it.
@@ -95,6 +97,9 @@ onBeforeUnmount(() => {
 
     <div class="screen__body">
       <div class="screen__art">
+        <!-- `full`: the cover is the subject here, and the CSS below scales
+             it well past `size` — up to 62vh — so a thumbnail sized for 380px
+             would be visibly soft on a large display. -->
         <PlaylistArtwork
           v-if="mix"
           :artwork="mix.artwork"
@@ -102,8 +107,9 @@ onBeforeUnmount(() => {
           :size="380"
           :radius="12"
           shadow
+          full
         />
-        <Artwork v-else :artwork-id="track?.artworkId" :size="380" :radius="12" shadow />
+        <Artwork v-else :artwork-id="track?.artworkId" :size="380" :radius="12" shadow full />
         <div class="screen__meta">
           <h1 class="clamp" :title="title">{{ title }}</h1>
           <p class="clamp" :title="subtitle">{{ subtitle }}</p>
@@ -114,7 +120,18 @@ onBeforeUnmount(() => {
       </div>
 
       <aside class="screen__queue" :aria-busy="!queueReady">
-        <h2>Playing Next</h2>
+        <header class="screen__queue-head">
+          <h2>Playing Next</h2>
+          <div v-if="queueReady && items.length" class="screen__queue-actions">
+            <IconButton
+              icon="addToPlaylist"
+              label="Save queue as a playlist"
+              :size="16"
+              @click="saveAsPlaylist"
+            />
+            <button class="screen__clear" @click="clear">Clear</button>
+          </div>
+        </header>
         <div v-if="queueReady && items.length === 0" class="screen__empty">Nothing queued.</div>
         <div v-else-if="queueReady" class="screen__list scroll-area">
           <QueueList
@@ -336,10 +353,46 @@ onBeforeUnmount(() => {
   border: 0.5px solid rgba(127, 127, 127, 0.22);
 }
 
-.screen__queue h2 {
+/* The same pairing as the compact queue panel's header: keep, or clear. */
+.screen__queue-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   margin: 0 0 10px;
+}
+
+.screen__queue h2 {
+  margin: 0;
   font-size: 14px;
   font-weight: 600;
+}
+
+.screen__queue-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  /* Over the artwork backdrop the panel sets its own text colour; the buttons
+     follow it rather than the app's default greys, as the close button does. */
+  color: inherit;
+}
+
+.screen__queue-actions .icon-button {
+  color: inherit;
+}
+
+.screen__queue-actions .icon-button:hover {
+  background: rgba(127, 127, 127, 0.25);
+}
+
+.screen__clear {
+  font-size: 11.5px;
+  color: inherit;
+  opacity: 0.8;
+}
+
+.screen__clear:hover {
+  opacity: 1;
 }
 
 .screen__list {

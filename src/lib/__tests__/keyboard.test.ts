@@ -77,7 +77,7 @@ describe("keyboard shortcuts", () => {
     div.remove();
   });
 
-  it("leaves modifier combinations to the operating system", () => {
+  it("leaves unbound modifier combinations to the operating system", () => {
     press(" ", undefined, { metaKey: true });
     press("l", undefined, { ctrlKey: true });
     press("j", undefined, { altKey: true });
@@ -160,6 +160,28 @@ describe("escape closes overlays", () => {
   });
 })
 
+describe("rebound shortcuts", () => {
+  it("runs the user's binding and not the default it replaced", () => {
+    const player = makePlayer();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const off = installShortcuts(player as any, undefined, undefined, {
+      bindings: () => ({ playPause: ["Ctrl+Shift+P"] }),
+    });
+
+    press("p", undefined, { ctrlKey: true, shiftKey: true });
+    expect(player.toggle).toHaveBeenCalledTimes(1);
+
+    // Space belonged to play/pause and was given up when it was rebound.
+    press(" ");
+    expect(player.toggle).toHaveBeenCalledTimes(1);
+
+    // Actions the user has not touched keep their defaults.
+    press("l");
+    expect(player.next).toHaveBeenCalledTimes(1);
+    off();
+  });
+});
+
 /**
  * The Master Mixer runs its own transport against the same engine. With both
  * handlers live, one space bar reached the engine twice — and depending on
@@ -170,7 +192,9 @@ describe("standing aside for another transport", () => {
     const player = makePlayer();
     let suspended = true;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const off = installShortcuts(player as any, undefined, undefined, () => suspended);
+    const off = installShortcuts(player as any, undefined, undefined, {
+      isSuspended: () => suspended,
+    });
 
     press(" ");
     press("l");

@@ -5,11 +5,17 @@
  * A native `<select>` renders with the platform widget, which sits badly
  * against the rest of the interface, so this opens a `MenuSurface` — the one
  * menu look — under a pill-shaped trigger.
+ *
+ * The menu is teleported to `<body>` and placed from the trigger's box rather
+ * than being an absolutely positioned child: a select in a modal with its own
+ * scrolling pane (Settings) otherwise has its menu clipped by that pane, which
+ * hid the longer output device names behind the modal's sidebar.
  */
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import MenuSurface, { type MenuItem } from "./MenuSurface.vue";
 import { useDismiss } from "@/lib/dismiss";
+import { visibleBounds } from "@/lib/frame";
 
 export interface SelectOption {
   id: string;
@@ -28,6 +34,13 @@ const emit = defineEmits<{ "update:modelValue": [value: string] }>();
 const open = ref(false);
 const root = ref<HTMLElement | null>(null);
 const listEl = ref<HTMLElement | null>(null);
+const menuStyle = ref<Record<string, string>>({});
+
+/** Between the trigger and the menu. */
+const GAP = 6;
+/** Below this, opening downwards is not worth it and the menu flips up. */
+const MIN_ROOM = 160;
+const MAX_HEIGHT = 320;
 
 const selected = computed(
   () => props.options.find((option) => option.id === props.modelValue) ?? props.options[0],
@@ -43,22 +56,68 @@ const menuItems = computed<MenuItem[]>(() =>
 
 useDismiss(
   () => open.value,
-  () => (open.value = false),
+  () => {
+    open.value = false;
+    stopTracking();
+  },
   listEl,
   { ignore: [root] },
 );
 
+/**
+ * Pins the menu under (or over) the trigger, right edges aligned, clamped to
+ * the window rather than to the viewport — the outer band of which is the
+ * window's own shadow.
+ */
+function place() {
+  const trigger = root.value?.getBoundingClientRect();
+  if (!trigger) return;
+  const frame = visibleBounds();
+
+  const below = frame.bottom - trigger.bottom - GAP;
+  const above = trigger.top - frame.top - GAP;
+  const flip = below < MIN_ROOM && above > below;
+  const room = Math.max(flip ? above : below, MIN_ROOM);
+
+  menuStyle.value = {
+    right: `${Math.max(frame.left, window.innerWidth - trigger.right)}px`,
+    minWidth: `${Math.max(168, trigger.width)}px`,
+    maxWidth: `${frame.width - 16}px`,
+    maxHeight: `${Math.min(MAX_HEIGHT, room)}px`,
+    transformOrigin: flip ? "bottom right" : "top right",
+    ...(flip
+      ? { bottom: `${window.innerHeight - trigger.top + GAP}px` }
+      : { top: `${trigger.bottom + GAP}px` }),
+  };
+}
+
 async function toggle() {
   open.value = !open.value;
-  if (!open.value) return;
+  if (!open.value) {
+    stopTracking();
+    return;
+  }
+  place();
+  // The menu no longer moves with the trigger, so anything that shifts it has
+  // to be followed: a scrolling pane behind it, a resized window.
+  window.addEventListener("scroll", place, true);
+  window.addEventListener("resize", place);
   // Focus the current option so the arrow keys have somewhere to start.
   await nextTick();
   listEl.value?.querySelector<HTMLElement>("[aria-checked='true']")?.focus();
 }
 
+function stopTracking() {
+  window.removeEventListener("scroll", place, true);
+  window.removeEventListener("resize", place);
+}
+
+onBeforeUnmount(stopTracking);
+
 function choose(id: string) {
   emit("update:modelValue", id);
   open.value = false;
+  stopTracking();
 }
 
 /** Roving focus, so the list behaves like a menu rather than a set of buttons. */
@@ -91,11 +150,19 @@ function onListKeydown(event: KeyboardEvent) {
       <PnmIcon name="chevronDown" :size="13" class="select__caret" />
     </button>
 
-    <Transition name="pop">
-      <div v-if="open" ref="listEl" class="select__menu" @keydown="onListKeydown">
-        <MenuSurface :items="menuItems" @select="choose" />
-      </div>
-    </Transition>
+    <Teleport to="body">
+      <Transition name="pop">
+        <div
+          v-if="open"
+          ref="listEl"
+          class="select__menu"
+          :style="menuStyle"
+          @keydown="onListKeydown"
+        >
+          <MenuSurface :items="menuItems" @select="choose" />
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -139,14 +206,12 @@ function onListKeydown(event: KeyboardEvent) {
   color: var(--text-tertiary);
 }
 
+/* Teleported, so everything that positions it — including the "never narrower
+   than the trigger" minimum the two need to line up on both edges — is set
+   inline by `place`. */
 .select__menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  position: fixed;
   z-index: var(--z-popover);
-  /* Never narrower than the trigger, so the two line up on both edges rather
-     than only on the right. */
-  min-width: max(168px, 100%);
-  transform-origin: top right;
+  overflow-y: auto;
 }
 </style>

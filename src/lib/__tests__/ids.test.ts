@@ -60,5 +60,10 @@ describe("stable ids", () => {
     // A blank album artist falls back to the track artist.
     const noAlbumArtist: Track = { ...base, albumArtist: "  " };
     expect(stableArtistId(noAlbumArtist)).toBe(stableId("ar", normalise("John Lennon")));
+
+    // The album does not, because `album_id_for` does not: it seeds on the
+    // album name alone, and a link built any other way goes nowhere.
+    expect(stableAlbumId(noAlbumArtist)).toBe(stableId("al", normalise("Abbey Road")));
+    expect(stableAlbumId(noAlbumArtist)).not.toBe(stableAlbumId(base));
   });
 });

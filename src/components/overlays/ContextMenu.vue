@@ -5,6 +5,7 @@ import { useRouter } from "vue-router";
 import MenuSurface from "../ui/MenuSurface.vue";
 import type { IconName } from "../icons/paths";
 import { useDismiss } from "@/lib/dismiss";
+import { visibleBounds } from "@/lib/frame";
 import { useUiStore } from "@/stores/ui";
 import { usePlaylistStore } from "@/stores/playlists";
 import { usePlayerStore } from "@/stores/player";
@@ -21,24 +22,22 @@ const router = useRouter();
 const el = ref<HTMLElement | null>(null);
 const menu = computed(() => ui.contextMenu);
 const track = computed(() => menu.value?.tracks[0] ?? null);
-/** Keep the complete menu inside the window, including conditional rows. */
+/** Keep the complete menu inside the window, whichever rows it ended up with. */
 const position = computed(() => {
   const m = menu.value;
-  const t = track.value;
-  if (!m || !t) return { left: "0px", top: "0px" };
+  if (!m) return { left: "0px", top: "0px" };
 
-  const playlistRows = m.playlistId !== undefined && m.entryIndex !== undefined ? 2 : 0;
-  const duplicateRows = m.tracks.length === 1 && t.fileCount > 1 ? 1 : 0;
-  const optionRows = m.playlistOptions ? (m.playlistOptions.hasArtwork ? 3 : 2) : 0;
-  const buttonCount =
-    6 + (t.album.trim() === "" ? 0 : 1) + playlistRows + duplicateRows + optionRows;
-  const separatorCount = 2 + (playlistRows > 0 ? 1 : 0) + (optionRows > 0 ? 1 : 0);
+  const buttonCount = items.value.length;
+  const separatorCount = groups.value.length - 1;
   const width = 232;
-  const height = Math.min(buttonCount * 31 + separatorCount * 11 + 10, window.innerHeight - 16);
+  // Clamped into the window rather than the viewport: the two differ by the
+  // shadow margin where the app draws its own frame.
+  const frame = visibleBounds();
+  const height = Math.min(buttonCount * 31 + separatorCount * 11 + 10, frame.height - 16);
 
   return {
-    left: `${Math.max(8, Math.min(m.x, window.innerWidth - width - 8))}px`,
-    top: `${Math.max(8, Math.min(m.y, window.innerHeight - height - 8))}px`,
+    left: `${Math.max(frame.left + 8, Math.min(m.x, frame.right - width - 8))}px`,
+    top: `${Math.max(frame.top + 8, Math.min(m.y, frame.bottom - height - 8))}px`,
   };
 });
 
@@ -56,7 +55,11 @@ interface Item {
 
 const items = computed<Item[]>(() => {
   const m = menu.value;
-  if (!m || !track.value) return [];
+  if (!m) return [];
+  // A menu the caller built itself: not about a song, so none of the song
+  // actions below apply.
+  if (m.items) return m.items;
+  if (!track.value) return [];
   const t = track.value;
 
   const count = m.tracks.length;
@@ -232,6 +235,16 @@ const items = computed<Item[]>(() => {
         action: options.onClearArtwork,
       });
     }
+    list.push(
+      { label: "Rename…", icon: "edit", separated: true, action: options.onRename },
+      { label: "Share…", icon: "share", action: options.onShare },
+      {
+        label: "Delete Playlist",
+        icon: "trash",
+        danger: true,
+        action: options.onDelete,
+      },
+    );
   }
 
   return list;
@@ -300,7 +313,7 @@ useDismiss(
   z-index: var(--z-context);
   min-width: 214px;
   transform-origin: top left;
-  max-height: calc(100vh - 16px);
+  max-height: calc(var(--frame-height) - 16px);
   overflow-y: auto;
 }
 </style>

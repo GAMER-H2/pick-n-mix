@@ -1,8 +1,9 @@
 Small Tasks:
 - Atmospheres shaders need more refinement (human task, all agents ignore)
 - Settings need ability to change keyboard shortcuts, new sub-section called shortcuts with all the keyboard shortcuts listed and the ability to record a new one
-- Save queue as playlist
+- Save queue as a playlist
 - An easy UI to share playlist files
+- Playlist editing: change name, delete, reorder in sidebar
 
 Medium Tasks:
 - Duplicate song handling - (working but needs some refinement as there are a lot of true negatives)

@@ -3,6 +3,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import AdvancedMixer from "../AdvancedMixer.vue";
 import AppKnob from "@/components/ui/AppKnob.vue";
+import SelectMenu from "@/components/ui/SelectMenu.vue";
 import { useMixerStore } from "@/stores/mixer";
 
 const setGlobalMixer = vi.fn();
@@ -18,18 +19,25 @@ describe("AdvancedMixer panning", () => {
   });
 
   it("starts as identity balance and exposes true-stereo centre and width controls", async () => {
-    const wrapper = mount(AdvancedMixer);
+    // The select menu teleports to <body>; render it inline so the queries
+    // below reach it.
+    const wrapper = mount(AdvancedMixer, { global: { stubs: { teleport: true } } });
     const mixer = useMixerStore();
     const section = wrapper.get("[data-testid='panning-section']");
 
-    expect(wrapper.get<HTMLSelectElement>("[aria-label='Panning mode']").element.value).toBe(
-      "stereoBalance",
-    );
+    const mode = section.getComponent(SelectMenu);
+    expect(mode.props("modelValue")).toBe("stereoBalance");
     const balanceKnobs = section.findAllComponents(AppKnob);
     expect(balanceKnobs).toHaveLength(1);
     expect(balanceKnobs[0].props("label")).toBe("Balance");
 
-    await wrapper.get("[aria-label='Panning mode']").setValue("trueStereo");
+    // Through the menu rather than the emitted event, so the wiring from the
+    // trigger to the store is what is covered.
+    await mode.get("[aria-label='Mode']").trigger("click");
+    const trueStereo = mode
+      .findAll("[role='menuitem']")
+      .find((item) => item.text() === "True Stereo");
+    await trueStereo?.trigger("click");
     await flushPromises();
 
     expect(mixer.targetLayer.panning).toEqual({

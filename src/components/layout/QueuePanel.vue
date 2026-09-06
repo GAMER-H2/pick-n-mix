@@ -2,7 +2,6 @@
 /** Up-next list, opened from the queue button in the player bar. */
 import IconButton from "../ui/IconButton.vue";
 import QueueList from "../media/QueueList.vue";
-import * as api from "@/lib/api";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";
 import { useQueueActions } from "@/composables/useQueueActions";
@@ -10,12 +9,7 @@ import { useQueueActions } from "@/composables/useQueueActions";
 const player = usePlayerStore();
 const ui = useUiStore();
 
-const { current, items, jump, remove, move, openMenu } = useQueueActions();
-
-async function clear() {
-  await api.clearQueue();
-  await player.refreshQueue();
-}
+const { current, items, jump, remove, move, clear, saveAsPlaylist, openMenu } = useQueueActions();
 </script>
 
 <template>
@@ -28,6 +22,13 @@ async function clear() {
         </p>
       </div>
       <div class="queue__actions">
+        <IconButton
+          v-if="items.length"
+          icon="addToPlaylist"
+          label="Save queue as a playlist"
+          :size="17"
+          @click="saveAsPlaylist"
+        />
         <button v-if="items.length" class="queue__clear" @click="clear">Clear</button>
         <IconButton icon="close" label="Close queue" :size="18" @click="ui.queueOpen = false" />
       </div>

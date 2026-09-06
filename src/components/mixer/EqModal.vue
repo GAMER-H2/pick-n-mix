@@ -294,7 +294,16 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
 </script>
 
 <template>
-  <BaseModal :open="true" labelledby="eq-modal-title" :width="1040" flush @close="emit('close')">
+  <!-- Always expanded from inside something else — the mixer panel, which the
+       Master Mixer and Settings both host — so it layers above every modal. -->
+  <BaseModal
+    :open="true"
+    labelledby="eq-modal-title"
+    :width="1040"
+    flush
+    layer="modal-nested"
+    @close="emit('close')"
+  >
     <div class="eq-modal">
       <header class="eq-modal__head">
         <div class="eq-modal__heading">

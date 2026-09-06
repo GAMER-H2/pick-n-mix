@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import SettingsModal from "../settings/SettingsModal.vue";
+import { SHORTCUTS } from "@/lib/shortcuts";
 import { useSettingsStore } from "@/stores/settings";
 import { usePresetEditorStore } from "@/stores/presetEditor";
 import { useUiStore } from "@/stores/ui";
@@ -45,6 +46,11 @@ vi.mock("@/lib/api", () => ({
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: (...args: unknown[]) => openDialog(...args),
 }));
+
+/** The select menus teleport to <body>; render them inline so queries reach them. */
+function mountSettings() {
+  return mount(SettingsModal, { global: { stubs: { teleport: true } } });
+}
 
 function buttonWithText(wrapper: VueWrapper, text: string) {
   return wrapper.findAll("button").find((button) => button.text().trim().startsWith(text));
@@ -90,9 +96,9 @@ describe("SettingsModal", () => {
   });
 
   it("navigates between all settings panes", async () => {
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
 
-    for (const pane of ["Playback", "Recommendations", "Mixer", "Library", "Theme"]) {
+    for (const pane of ["Playback", "Shortcuts", "Recommendations", "Mixer", "Library", "Theme"]) {
       const button = buttonWithText(wrapper, pane);
       if (!button) throw new Error(`Missing ${pane} navigation button`);
       await button.trigger("click");
@@ -105,7 +111,7 @@ describe("SettingsModal", () => {
   });
 
   it("persists a theme selection immediately", async () => {
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     const dark = buttonWithText(wrapper, "Dark");
     if (!dark) throw new Error("Missing Dark theme button");
 
@@ -117,7 +123,7 @@ describe("SettingsModal", () => {
   });
 
   it("requires a two-step confirmation before clearing all history", async () => {
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     const recommendations = buttonWithText(wrapper, "Recommendations");
     if (!recommendations) throw new Error("Missing Recommendations navigation button");
     await recommendations.trigger("click");
@@ -140,7 +146,7 @@ describe("SettingsModal", () => {
   });
 
   it("defaults fading off and exposes a direction selector only when enabled", async () => {
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     const playback = buttonWithText(wrapper, "Playback");
     if (!playback) throw new Error("Missing Playback navigation button");
     await playback.trigger("click");
@@ -160,8 +166,105 @@ describe("SettingsModal", () => {
     expect(setAppPreferences).toHaveBeenLastCalledWith(expect.objectContaining({ fadeMode: "pause" }));
   });
 
+  /**
+   * Recording listens in the capture phase, so the key being bound never runs
+   * whatever it is currently bound to on its way past.
+   */
+  async function recordShortcut(wrapper: VueWrapper, action: string, key: string,
+    modifiers: KeyboardEventInit = {}) {
+    const record = wrapper
+      .findAll("button")
+      .find((button) => button.attributes("aria-label") === `Record a new key for ${action}`);
+    if (!record) throw new Error(`Missing the record button for ${action}`);
+    await record.trigger("click");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key, cancelable: true, ...modifiers }));
+    await settle();
+  }
+
+  async function openShortcuts() {
+    const wrapper = mountSettings();
+    const nav = buttonWithText(wrapper, "Shortcuts");
+    if (!nav) throw new Error("Missing Shortcuts navigation button");
+    await nav.trigger("click");
+    await settle();
+    return wrapper;
+  }
+
+  it("lists every shortcut with the key it is bound to", async () => {
+    const wrapper = await openShortcuts();
+
+    for (const shortcut of SHORTCUTS) {
+      expect(wrapper.text()).toContain(shortcut.label);
+    }
+    // The defaults, drawn as keycaps rather than as raw key names.
+    const keys = wrapper.findAll(".shortcut__key").map((key) => key.text());
+    expect(keys).toContain("Space");
+    expect(keys).toContain("→");
+  });
+
+  it("records a new key and stores it as an override", async () => {
+    const wrapper = await openShortcuts();
+
+    await recordShortcut(wrapper, "Play / Pause", "p", { ctrlKey: true });
+
+    expect(setAppPreferences).toHaveBeenLastCalledWith(
+      expect.objectContaining({ shortcuts: { playPause: ["Ctrl+P"] } }),
+    );
+    expect(wrapper.findAll(".shortcut__key").map((key) => key.text())).toContain("Ctrl + P");
+  });
+
+  /** Stealing it would leave the other action bound to nothing, silently. */
+  it("refuses a key another action already has", async () => {
+    const wrapper = await openShortcuts();
+    const ui = useUiStore();
+
+    await recordShortcut(wrapper, "Play / Pause", "l");
+
+    expect(setAppPreferences).not.toHaveBeenCalled();
+    expect(ui.toast?.kind).toBe("error");
+    expect(ui.toast?.message).toContain("Next song");
+  });
+
+  /** Escape belongs to the recorder while it is listening, not to the modal. */
+  it("cancelling a recording does not close settings", async () => {
+    const wrapper = await openShortcuts();
+    const ui = useUiStore();
+    ui.settingsOpen = true;
+
+    const record = wrapper
+      .findAll("button")
+      .find((button) => button.attributes("aria-label") === "Record a new key for Play / Pause");
+    await record?.trigger("click");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
+    await settle();
+
+    expect(ui.settingsOpen).toBe(true);
+    expect(setAppPreferences).not.toHaveBeenCalled();
+    // And the row is back to showing its keys rather than the prompt.
+    expect(wrapper.find(".shortcut__prompt").exists()).toBe(false);
+  });
+
+  it("resets one shortcut back to its default", async () => {
+    const settings = useSettingsStore();
+    settings.preferences = { ...settings.preferences, shortcuts: { playPause: ["Ctrl+P"] } };
+    const wrapper = await openShortcuts();
+
+    const reset = wrapper
+      .findAll("button")
+      .find((button) =>
+        button.attributes("aria-label") === "Reset Play / Pause to its default key",
+      );
+    if (!reset) throw new Error("Missing the reset button");
+    await reset.trigger("click");
+    await settle();
+
+    expect(setAppPreferences).toHaveBeenLastCalledWith(
+      expect.objectContaining({ shortcuts: {} }),
+    );
+  });
+
   it("keeping reverb on pause is a real setting", async () => {
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     const playback = buttonWithText(wrapper, "Playback");
     if (!playback) throw new Error("Missing Playback navigation button");
     await playback.trigger("click");
@@ -178,7 +281,7 @@ describe("SettingsModal", () => {
 
   it("lists the machine's output devices and switches between them", async () => {
     outputDevices.mockResolvedValue(["Built-in Output", "Studio Monitors"]);
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     const playback = buttonWithText(wrapper, "Playback");
     if (!playback) throw new Error("Missing Playback navigation button");
     await playback.trigger("click");
@@ -198,7 +301,7 @@ describe("SettingsModal", () => {
   /// Choosing the default again has to clear the override, not store its label.
   it("returning to the system default clears the saved device", async () => {
     outputDevices.mockResolvedValue(["Built-in Output"]);
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     const playback = buttonWithText(wrapper, "Playback");
     if (!playback) throw new Error("Missing Playback navigation button");
     await playback.trigger("click");
@@ -224,7 +327,7 @@ describe("SettingsModal", () => {
       },
       track: historyTrack,
     }]);
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     useUiStore().settingsOpen = true;
     const recommendations = buttonWithText(wrapper, "Recommendations");
     if (!recommendations) throw new Error("Missing Recommendations navigation button");
@@ -255,7 +358,7 @@ describe("SettingsModal", () => {
   it("opens presets in the isolated advanced mixer and persists built-in hiding", async () => {
     const builtIn = { id: "flat", name: "Flat", builtIn: true, kind: "mixer", settings: {} };
     mixerState.mockResolvedValue({ global: {}, context: null, track: null, effective: {}, presets: [builtIn], filters: [] });
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     const mixerButton = buttonWithText(wrapper, "Mixer");
     if (!mixerButton) throw new Error("Missing Mixer navigation button");
     await mixerButton.trigger("click");
@@ -293,7 +396,7 @@ describe("SettingsModal", () => {
       global: {}, context: null, track: null, effective: {}, presets: [customEq], filters: [],
     });
     savePreset.mockResolvedValue([customEq]);
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     const mixerButton = buttonWithText(wrapper, "Mixer");
     if (!mixerButton) throw new Error("Missing Mixer navigation button");
     await mixerButton.trigger("click");
@@ -322,7 +425,7 @@ describe("SettingsModal", () => {
   });
 
   it("labels the remote-library controls honestly", async () => {
-    const wrapper = mount(SettingsModal);
+    const wrapper = mountSettings();
     const playback = buttonWithText(wrapper, "Playback");
     if (!playback) throw new Error("Missing Playback navigation button");
     await playback.trigger("click");

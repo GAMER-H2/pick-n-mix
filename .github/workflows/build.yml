@@ -63,7 +63,17 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # linuxdeploy bundles an older `strip` that cannot read the `.relr.dyn`
+      # sections used by current Arch/CachyOS libraries. Keeping the bundled
+      # libraries unstripped makes the AppImage build and run there.
+      - name: Build Tauri application (Linux)
+        if: runner.os == 'Linux'
+        env:
+          NO_STRIP: "1"
+        run: npm run tauri -- build --target ${{ matrix.target }}
+
       - name: Build Tauri application
+        if: runner.os != 'Linux'
         run: npm run tauri -- build --target ${{ matrix.target }}
 
       - name: Upload application bundles

@@ -12,6 +12,7 @@ import AdvancedMixer from "./components/mixer/AdvancedMixer.vue";
 import ContextMenu from "./components/overlays/ContextMenu.vue";
 import AddToPlaylistDialog from "./components/dialogs/AddToPlaylistDialog.vue";
 import DuplicateFilesDialog from "./components/dialogs/DuplicateFilesDialog.vue";
+import PlaylistDialogs from "./components/dialogs/PlaylistDialogs.vue";
 import SettingsModal from "./components/settings/SettingsModal.vue";
 import MasterMixModal from "./components/mastermix/MasterMixModal.vue";
 import BounceProgress from "./components/layout/BounceProgress.vue";
@@ -42,7 +43,7 @@ const mainEl = ref<HTMLElement | null>(null);
 
 const {
   usesCustomTitlebar,
-  isMaximized,
+  isFlush,
   isFocused,
   resizeRegions,
   minimizeWindow,
@@ -63,7 +64,10 @@ onMounted(async () => {
 
   // The Master Mixer runs its own transport against the same engine, so the
   // global keys stand down for as long as it is open.
-  removeShortcuts = installShortcuts(player, ui, router, () => masterMix.open);
+  removeShortcuts = installShortcuts(player, ui, router, {
+    isSuspended: () => masterMix.open,
+    bindings: () => settings.preferences.shortcuts,
+  });
 
   await initBackendEvents();
 });
@@ -79,7 +83,7 @@ onBeforeUnmount(() => {
     class="app"
     :class="{
       'app--framed': usesCustomTitlebar,
-      'is-maximized': isMaximized,
+      'is-flush': isFlush,
       'is-unfocused': !isFocused,
     }"
   >
@@ -156,6 +160,7 @@ onBeforeUnmount(() => {
     <ContextMenu />
     <AddToPlaylistDialog />
     <DuplicateFilesDialog />
+    <PlaylistDialogs />
     <Transition name="fade">
       <SettingsModal v-if="ui.settingsOpen" />
     </Transition>
@@ -166,7 +171,7 @@ onBeforeUnmount(() => {
     <!-- Only meaningful without server-side decorations; on every other
          platform these would be invisible strips swallowing clicks along the
          window edges, including on the scrollbar. -->
-    <template v-if="usesCustomTitlebar && !isMaximized">
+    <template v-if="usesCustomTitlebar && !isFlush">
       <div
         v-for="region in resizeRegions"
         :key="region.direction"
@@ -184,10 +189,19 @@ onBeforeUnmount(() => {
   background: transparent;
 }
 
-/* How much of the window is given over to the shadow on each side. A blur
-   cannot spread further than this, so it sets the softness ceiling. */
+/* `--frame-inset` — how much of the window is given over to the shadow on each
+   side, and so the ceiling on how far a blur can spread — is a root token in
+   `theme.css`: teleported scrims sit outside this component and need it too.
+
+   The grab band for a resize straddles the visible edge instead of filling the
+   whole margin: the soft falloff reaches 24px out from the window, and pointing
+   at the faintest part of it should not read as a window border. The band is
+   `--resize-band` wide, starting `--resize-outer` into the shadow, so the
+   remaining 3px fall just inside the window. */
 .app {
-  --frame-inset: 24px;
+  --resize-outer: 9px;
+  --resize-band: 12px;
+  --resize-corner: 16px;
 }
 
 .app {
@@ -209,7 +223,7 @@ onBeforeUnmount(() => {
   overflow: hidden;
   height: calc(100% - var(--frame-inset) * 2);
   margin: var(--frame-inset);
-  border-radius: 11px;
+  border-radius: var(--frame-radius);
   /* Shaped after KWin's own: a hairline edge, then a broad, soft, mostly
      downward falloff rather than a tight dark ring. The hairline follows the
      theme because a black one disappears into a dark desktop — which is most
@@ -232,11 +246,11 @@ onBeforeUnmount(() => {
 }
 
 /* Maximised and tiled windows sit flush against their edges, so the inset and
-   the shadow would only show as a gap. */
-.app--framed.is-maximized {
-  height: 100%;
-  margin: 0;
-  border-radius: 0;
+   the shadow would only show as a gap. The margin and radius go on their own —
+   `is-window-flush` zeroes the tokens for the whole document — and the backend
+   drops the compositor's copy of the margin at the same time. See
+   `window_frame.rs`. */
+.app--framed.is-flush {
   box-shadow: none;
 }
 
@@ -281,13 +295,17 @@ onBeforeUnmount(() => {
 
 /* Pinned to `.app`'s own corner (not `.app__main`'s), so it is unaffected by
    the sidebar, an open side panel, or `.app__main`'s scrollbar. `.app--framed`
-   already clips to `border-radius: 11px` and squares off when maximised, so
-   the close button's hover fill lands flush with the corner for free. */
+   already clips to `--frame-radius` and squares off when flush, so the close
+   button's hover fill lands flush with the corner for free.
+
+   Above every overlay: these are the window's controls, not the app's, and a
+   dialog covering the close button would leave the window only closable from
+   outside it. */
 .app__window-controls {
   position: absolute;
   top: 0;
   right: 0;
-  z-index: 100;
+  z-index: var(--z-window-controls);
   display: flex;
 }
 
@@ -302,79 +320,87 @@ onBeforeUnmount(() => {
   color: #fff;
 }
 
+/* Part of the window frame rather than of the app, so — like the window
+   controls — they stay live over a modal: a dialog should not make the window
+   unresizable. */
 .app__resize-region {
   position: fixed;
-  z-index: 5;
+  z-index: var(--z-window-controls);
 }
 
 .app__resize-region--north,
 .app__resize-region--south {
-  right: var(--frame-inset);
-  left: var(--frame-inset);
-  height: var(--frame-inset);
+  /* Starting where the corner boxes end, so the two never overlap. */
+  right: calc(var(--frame-inset) - var(--resize-outer) + var(--resize-corner));
+  left: calc(var(--frame-inset) - var(--resize-outer) + var(--resize-corner));
+  height: var(--resize-band);
   cursor: ns-resize;
 }
 
 .app__resize-region--north {
-  top: 0;
+  top: calc(var(--frame-inset) - var(--resize-outer));
 }
 
 .app__resize-region--south {
-  bottom: 0;
+  bottom: calc(var(--frame-inset) - var(--resize-outer));
 }
 
 .app__resize-region--east,
 .app__resize-region--west {
-  top: var(--frame-inset);
-  bottom: var(--frame-inset);
-  width: var(--frame-inset);
+  top: calc(var(--frame-inset) - var(--resize-outer) + var(--resize-corner));
+  bottom: calc(var(--frame-inset) - var(--resize-outer) + var(--resize-corner));
+  width: var(--resize-band);
   cursor: ew-resize;
 }
 
 .app__resize-region--east {
-  right: 0;
+  right: calc(var(--frame-inset) - var(--resize-outer));
 }
 
 .app__resize-region--west {
-  left: 0;
+  left: calc(var(--frame-inset) - var(--resize-outer));
 }
 
+/* The diagonals are a little larger than the edges, as they are aimed at
+   rather than swept into. */
 .app__resize-region--north-east,
 .app__resize-region--north-west,
 .app__resize-region--south-east,
 .app__resize-region--south-west {
-  width: var(--frame-inset);
-  height: var(--frame-inset);
+  width: var(--resize-corner);
+  height: var(--resize-corner);
 }
 
 .app__resize-region--north-east {
-  top: 0;
-  right: 0;
+  top: calc(var(--frame-inset) - var(--resize-outer));
+  right: calc(var(--frame-inset) - var(--resize-outer));
   cursor: nesw-resize;
 }
 
 .app__resize-region--north-west {
-  top: 0;
-  left: 0;
+  top: calc(var(--frame-inset) - var(--resize-outer));
+  left: calc(var(--frame-inset) - var(--resize-outer));
   cursor: nwse-resize;
 }
 
 .app__resize-region--south-east {
-  right: 0;
-  bottom: 0;
+  right: calc(var(--frame-inset) - var(--resize-outer));
+  bottom: calc(var(--frame-inset) - var(--resize-outer));
   cursor: nwse-resize;
 }
 
 .app__resize-region--south-west {
-  bottom: 0;
-  left: 0;
+  bottom: calc(var(--frame-inset) - var(--resize-outer));
+  left: calc(var(--frame-inset) - var(--resize-outer));
   cursor: nesw-resize;
 }
 
 .app__scan {
   position: fixed;
   left: 50%;
-  bottom: calc(var(--player-height) + 14px);
+  /* Fixed, so it measures from the surface: the shadow margin has to be added
+     back or it sits that much lower than the player bar it rides above. */
+  bottom: calc(var(--frame-inset) + var(--player-height) + 14px);
   z-index: 200;
   display: flex;
   align-items: center;

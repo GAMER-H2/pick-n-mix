@@ -1,6 +1,7 @@
 /**
- * Queue row behaviour shared by the compact side panel and the full-screen
- * player: jump, remove, move and the per-row context menu, against the player
+ * Queue behaviour shared by the compact side panel and the full-screen
+ * player: jump, remove, move and the per-row context menu, plus the two
+ * whole-queue verbs — clear it, or keep it as a playlist — against the player
  * store's queue.
  */
 import { computed } from "vue";
@@ -35,6 +36,15 @@ export function useQueueActions() {
     await player.refreshQueue();
   }
 
+  async function clear() {
+    await api.clearQueue();
+    await player.refreshQueue();
+  }
+
+  function saveAsPlaylist() {
+    ui.saveQueueOpen = true;
+  }
+
   function openMenu(index: number, event: MouseEvent) {
     // A mix has no track menu: nothing in it can be reordered or sent
     // elsewhere on its own.
@@ -43,5 +53,5 @@ export function useQueueActions() {
     ui.openContextMenu({ x: event.clientX, y: event.clientY, tracks: [row.track] });
   }
 
-  return { current, items, jump, remove, move, openMenu };
+  return { current, items, jump, remove, move, clear, saveAsPlaylist, openMenu };
 }

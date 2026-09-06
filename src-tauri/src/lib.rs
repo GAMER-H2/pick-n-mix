@@ -8,6 +8,7 @@ pub mod player;
 pub mod playlist;
 pub mod presets;
 pub mod state;
+pub mod window_frame;
 
 use std::time::Duration;
 
@@ -483,6 +484,9 @@ pub fn run() {
             // Size the window before it is shown, then keep the setting in step
             // with however the user leaves it.
             if let Some(window) = app.get_webview_window("main") {
+                // The window draws its own frame on Linux, and the compositor
+                // has to be told which part of it is only shadow.
+                window_frame::install(&window);
                 if let Some(state) = app.try_state::<AppState>() {
                     restore_geometry(&state, &window);
                 }
@@ -612,6 +616,8 @@ pub fn run() {
             commands::asset_waveform,
             commands::bounce_master_mix,
             commands::ffmpeg_status,
+            // window
+            commands::window_is_flush,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Pick n Mix");
