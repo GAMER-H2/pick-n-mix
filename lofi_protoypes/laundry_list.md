@@ -3,6 +3,10 @@ Small Tasks:
 - Atmopsheres need better looping points
 - All atmospheres should be the volume of the rain track
 - Skeleton screen for the playing next widget in full-screen queue view that shimmers and quickly fades in the queue when it's ready
+- Recognise seperate artists on the same track and don't have duplicates
+- Button on homepage to shuffle whole library
+- Full context menu of playlist in sidebar
+- Continue title and subtitle style starting in settings to library and both queues
 
 Medium Tasks:
 - Duplicate song handling - (working but needs some refinement as there are a lot of true negatives)
