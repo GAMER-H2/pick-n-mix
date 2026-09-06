@@ -7,6 +7,17 @@ on:
       - master
   pull_request:
   workflow_dispatch:
+    inputs:
+      add_to_release:
+        description: Add the resulting installers to a draft GitHub Release
+        required: true
+        default: false
+        type: boolean
+      release_version:
+        description: Release version used for the tag and filenames
+        required: true
+        default: "0.0.0"
+        type: string
 
 permissions:
   contents: read
@@ -83,3 +94,62 @@ jobs:
           path: src-tauri/target/${{ matrix.target }}/release/bundle
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Add installers to draft release
+    if: github.event_name == 'workflow_dispatch' && inputs.add_to_release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download application bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pick-n-mix-*
+          path: downloaded-bundles
+
+      - name: Prepare release files
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          from pathlib import Path
+
+          version = os.environ["RELEASE_VERSION"]
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+              raise SystemExit(f"Invalid release version: {version!r}")
+
+          source_dir = Path("downloaded-bundles")
+          output_dir = Path("release-files")
+          output_dir.mkdir()
+          assets = {
+              "*.dmg": f"Pick-n-Mix-{version}-macOS-ARM.dmg",
+              "*.rpm": f"Pick-n-Mix-{version}-Linux-x86.rpm",
+              "*.deb": f"Pick-n-Mix-{version}-Linux-x86.deb",
+              "*.AppImage": f"Pick-n-Mix-{version}-Linux-x86.AppImage",
+              "*.msi": f"Pick-n-Mix-{version}-Windows-x86.msi",
+              "*.exe": f"Pick-n-Mix-{version}-Windows-x86.exe",
+          }
+
+          for pattern, filename in assets.items():
+              matches = list(source_dir.rglob(pattern))
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"Expected exactly one {pattern} release file, found {len(matches)}: {matches}"
+                  )
+              shutil.copy2(matches[0], output_dir / filename)
+          PY
+
+      - name: Add files to draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.release_version }}
+          name: Pick n Mix ${{ inputs.release_version }}
+          draft: true
+          fail_on_unmatched_files: true
+          files: release-files/*
