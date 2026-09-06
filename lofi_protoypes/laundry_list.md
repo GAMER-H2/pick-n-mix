@@ -7,10 +7,13 @@ Small Tasks:
 - Button on homepage to shuffle whole library
 - Full context menu of playlist in sidebar
 - Continue title and subtitle style starting in settings to library and both queues
+- Settings in playback to set parameters for restarting and going previous track, how many seconds to move (sync keyboard shortcuts with buttons)
 
 Medium Tasks:
 - Duplicate song handling - (working but needs some refinement as there are a lot of true negatives)
 - Favourite playlist, heart button for tracks, treated like a mix playlist
+- Database and metadata overhaul
+- Start radio in context menu (mix of genre matching, shuffle, and top picks)
 
 Large Tasks:
 - In the proper queue view, have shaders that create visuals live from the song in the background. These are any combinations of colours, patterns, shapes, moving effects (pulsing, bouncing, squish and squash), and even lyric detection (or pulled from music database if easier) to display words dynamically in the background popping up in random locations. It would be cool if this was 3D visuals but 2D would probably be more reasonable.
