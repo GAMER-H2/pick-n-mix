@@ -88,34 +88,81 @@ jobs:
       # `xattr` workaround the README used to lead with). The steps below sign
       # and notarise whenever the Apple secrets are configured, and fall back
       # to an unsigned build otherwise.
+      #
+      # Tauri decides whether to sign by checking whether APPLE_SIGNING_IDENTITY
+      # is *set*, not whether it is non-empty, so the signing variables are
+      # exported through $GITHUB_ENV here instead of a step-level `env:` block --
+      # otherwise an unset secret becomes an empty string and the build fails
+      # with `codesign -s ""` ("item could not be found in the keychain").
       - name: Import Apple signing certificate (macOS)
         if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
-          if [ -z "$APPLE_CERTIFICATE" ]; then
-            echo "No APPLE_CERTIFICATE secret set; building unsigned."
-            exit 0
-          fi
-          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
-          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
-          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-
-      - name: Build Tauri application (macOS)
-        if: runner.os == 'macOS'
-        env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::notice::No APPLE_CERTIFICATE secret set; building unsigned."
+            exit 0
+          fi
+
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          # Only used to protect this throwaway keychain for the length of the
+          # job, so there is no reason to make it a repository secret.
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+
+          echo -n "$APPLE_CERTIFICATE" | base64 -d -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # No `-t cert`: the .p12 holds the private key as well and the type
+          # filter would drop it. `-T /usr/bin/codesign` is what lets codesign
+          # use that key without an interactive keychain prompt.
+          security import "$CERTIFICATE_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          rm -f "$CERTIFICATE_PATH"
+
+          # Fall back to the identity that was actually imported when no
+          # APPLE_SIGNING_IDENTITY secret is configured.
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            APPLE_SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+              | sed -n 's/.*"\(.*\)"$/\1/p' | head -n 1)"
+          fi
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::error::APPLE_CERTIFICATE was imported but no codesigning identity was found in the keychain."
+            exit 1
+          fi
+          echo "Signing identity: $APPLE_SIGNING_IDENTITY"
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+          # Notarisation is optional: sign-only builds still pass Gatekeeper's
+          # "damaged" check for users who ran the app before, but only a
+          # notarised build opens cleanly on a fresh download.
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            {
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::notice::Apple notarisation secrets incomplete; signing without notarising."
+          fi
+
+      - name: Build Tauri application (macOS)
+        if: runner.os == 'macOS'
         run: npm run tauri -- build --target ${{ matrix.target }}
 
       - name: Build Tauri application

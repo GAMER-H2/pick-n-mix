@@ -476,6 +476,10 @@ fn spawn_ambience_loader(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything touches the webview: on some hosts the default
+    // renderer draws nothing at all.
+    window_frame::configure_renderer();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         // Asynchronous, not the plain synchronous variant: the webview

@@ -39,6 +39,39 @@ pub fn is_flush() -> bool {
     FLUSH.load(Ordering::Relaxed)
 }
 
+/// Picks a WebKit rendering path the host's drivers can actually display.
+///
+/// An AppImage carries its own WebKitGTK, built against whatever Mesa the
+/// build runner had (Ubuntu 22.04, in CI). WebKit's DMA-BUF renderer hands
+/// buffers straight to the GPU stack, and when that bundled WebKit meets the
+/// much newer Mesa on a rolling-release host the formats it asks for are not
+/// the ones the driver offers, so the webview composites nothing at all.
+///
+/// That is normally reported as a blank window. This app's Linux window is
+/// `transparent`, so there is no white page behind the webview to fall back
+/// to and the window is instead completely invisible: present in the task
+/// switcher, occupying space, drawing nothing.
+///
+/// Falling back to WebKit's own compositing costs some GPU acceleration, so it
+/// is only done for AppImage runs, where the mismatch is built in. A native
+/// package uses the distribution's own WebKit, which matches its drivers. An
+/// existing value is always left alone, so `WEBKIT_DISABLE_DMABUF_RENDERER=0`
+/// still gets the accelerated path on a host where it works.
+///
+/// Must run before the webview starts, so it is called first thing in `run`.
+pub fn configure_renderer() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    // `APPIMAGE` is set by the AppImage runtime and by nothing else.
+    if std::env::var_os("APPIMAGE").is_none() {
+        return;
+    }
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn install(_window: &WebviewWindow) {}
 

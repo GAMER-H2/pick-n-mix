@@ -1,5 +1,6 @@
 Small Tasks:
 - Atmospheres shaders need more refinement (human task, all agents ignore)
+- Maybe fix the slight clipping of leaving atmospheres to play and having the track slightly clip in the first time that's enabled
 
 User feedback (from Max):
 - Re-order the advanced DJ effects (not just visually but also the effects chain order (layering))

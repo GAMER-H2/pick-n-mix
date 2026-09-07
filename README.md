@@ -138,9 +138,28 @@ npm install
 npm run tauri build
 ```
 #### AppImage on rolling-release distributions
-`build:appimage` sets `NO_STRIP=1` because Tauri's bundled linuxdeploy uses
-an old `strip` (binutils 2.35) that cannot handle modern `SHT_RELR`
-(`.relr.dyn`) sections:
+Tauri's bundled linuxdeploy uses an old `strip` (binutils 2.35) that cannot
+handle the modern `SHT_RELR` (`.relr.dyn`) sections in current Arch/CachyOS
+libraries, so the AppImage has to be built unstripped:
+```bash
+npm run build:appimage   # NO_STRIP=1 tauri build --bundles appimage
+```
+`NO_STRIP=1` applies to every bundle format, so use it for a full build too:
 ```bash
 NO_STRIP=1 npm run tauri build
 ```
+The released AppImages are built the same way; see the Linux job in
+`.github/workflows/build.yml`.
+
+An AppImage carries the WebKitGTK it was built against, which on a
+rolling-release host is far older than the graphics drivers it then has to
+talk to. When the two disagree the webview composites nothing, and because
+the window is transparent that shows up as an *invisible* window rather than
+a blank one. The app detects an AppImage run and falls back to WebKit's own
+compositing (`WEBKIT_DISABLE_DMABUF_RENDERER=1`). To get the accelerated path
+back on a host where it works, set it yourself:
+```bash
+WEBKIT_DISABLE_DMABUF_RENDERER=0 ./Pick-n-Mix-*.AppImage
+```
+A native package (`.deb`, `.rpm`, or a local `npm run tauri build`) uses the
+distribution's own WebKit and is unaffected either way.
