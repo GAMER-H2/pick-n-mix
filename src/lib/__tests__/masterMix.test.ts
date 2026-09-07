@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   MIN_BLOCK_SECS,
+  barsBeats,
+  beatMinorStep,
+  beatRulerStep,
+  beatSecs,
+  barSecs,
+  gridDivisionLabel,
+  withTempo,
   addAutomationPoint,
   addLane,
   automationGainAt,
@@ -52,6 +59,8 @@ function mix(): MasterMix {
   return {
     enabled: true,
     revision: 1,
+    bpm: 120,
+    beatsPerBar: 4,
     lanes: [
       { id: "l0", name: "One", muted: false, soloed: false, gainDb: 0, blocks: [block("a", 0, 100)] },
       { id: "l1", name: "Two", muted: false, soloed: false, gainDb: 0, blocks: [block("b", 100, 80)] },
@@ -450,5 +459,71 @@ describe("what counts as an audible edit", () => {
     expect(soundSignature(updateLane(mix(), 0, { muted: true }))).not.toBe(before);
     expect(soundSignature(updateLane(mix(), 0, { gainDb: -3 }))).not.toBe(before);
     expect(soundSignature(setBlockMixer(mix(), "a", { enabled: false }))).not.toBe(before);
+  });
+});
+
+/**
+ * The tempo grid.
+ *
+ * It is a way of reading the timeline, not a property of the audio: nothing
+ * here moves a block, and the ruler is the only thing that changes when the
+ * BPM does.
+ */
+describe("the tempo grid", () => {
+  it("counts beats and bars from the tempo", () => {
+    expect(beatSecs(120)).toBeCloseTo(0.5, 9);
+    expect(barSecs(120, 4)).toBeCloseTo(2, 9);
+    expect(barSecs(90, 3)).toBeCloseTo(2, 9);
+  });
+
+  it("only ever offers divisions a musician would count", () => {
+    const beat = beatSecs(120);
+    const bar = barSecs(120, 4);
+    // Zoomed right in: sub-beat divisions. Zoomed out: whole bars, doubling.
+    expect(beatRulerStep(1000, 120, 4)).toBeCloseTo(beat / 4, 9);
+    expect(beatRulerStep(180, 120, 4)).toBeCloseTo(beat, 9);
+    expect(beatRulerStep(90, 120, 4)).toBeCloseTo(bar, 9);
+    expect(beatRulerStep(8, 120, 4)).toBeCloseTo(bar * 8, 9);
+    for (const pps of [0.5, 2, 8, 30, 120, 400]) {
+      const step = beatRulerStep(pps, 128, 4);
+      const inBeats = step / beatSecs(128);
+      expect([0.25, 0.5, 1, 4, 8, 16, 32, 64, 128]).toContain(Number(inBeats.toFixed(4)));
+    }
+  });
+
+  it("divides a bar into its beats, and a sub-beat mark in half", () => {
+    const beat = beatSecs(120);
+    expect(beatMinorStep(barSecs(120, 4), 120, 4)).toBeCloseTo(beat, 9);
+    expect(beatMinorStep(beat / 2, 120, 4)).toBeCloseTo(beat / 4, 9);
+  });
+
+  it("numbers bars and beats from one, with sixteenths when asked", () => {
+    // 120 BPM in 4/4: a bar is 2s, a beat 0.5s.
+    expect(barsBeats(0, 120, 4)).toBe("1.1");
+    expect(barsBeats(2, 120, 4)).toBe("2.1");
+    expect(barsBeats(2.5, 120, 4)).toBe("2.2");
+    expect(barsBeats(2.625, 120, 4, true)).toBe("2.2.2");
+    // A three-beat bar wraps a beat earlier.
+    expect(barsBeats(1.5, 120, 3)).toBe("2.1");
+  });
+
+  it("says how far apart the marks are, in the units they are in", () => {
+    expect(gridDivisionLabel(barSecs(120, 4), 120, 4)).toBe("1 bar");
+    expect(gridDivisionLabel(barSecs(120, 4) * 4, 120, 4)).toBe("4 bars");
+    expect(gridDivisionLabel(beatSecs(120), 120, 4)).toBe("1 beat");
+    expect(gridDivisionLabel(beatSecs(120) / 4, 120, 4)).toBe("1/4 beat");
+  });
+
+  it("clamps a tempo without touching a single block", () => {
+    const before = mix();
+    const faster = withTempo(before, { bpm: 174 });
+    expect(faster.bpm).toBe(174);
+    expect(faster.lanes).toEqual(before.lanes);
+
+    expect(withTempo(before, { bpm: 5 }).bpm).toBe(20);
+    expect(withTempo(before, { bpm: 5000 }).bpm).toBe(300);
+    expect(withTempo(before, { bpm: Number.NaN }).bpm).toBe(120);
+    expect(withTempo(before, { beatsPerBar: 0 }).beatsPerBar).toBe(1);
+    expect(withTempo(before, { beatsPerBar: 7.4 }).beatsPerBar).toBe(7);
   });
 });

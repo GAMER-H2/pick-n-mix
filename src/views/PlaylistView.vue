@@ -7,13 +7,13 @@
  * and greyed out, so a shared playlist tells you what you are missing rather
  * than silently shrinking.
  */
-import { computed, ref, watch } from "vue";
-import { useRoute } from "vue-router";
-import { open } from "@tauri-apps/plugin-dialog";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import PnmIcon from "@/components/icons/PnmIcon.vue";
 import CollectionHeader from "@/components/collections/CollectionHeader.vue";
 import TrackList, { type TrackListItem } from "@/components/collections/TrackList.vue";
 import BounceDialog from "@/components/dialogs/BounceDialog.vue";
+import SearchField from "@/components/ui/SearchField.vue";
 import { formatTotal } from "@/lib/format";
 import * as api from "@/lib/api";
 import { usePlaylistStore } from "@/stores/playlists";
@@ -27,13 +27,14 @@ import { usePlaylistActions } from "@/composables/usePlaylistActions";
 import type { ResolvedEntry } from "@/lib/types";
 
 const route = useRoute();
+const router = useRouter();
 const playlists = usePlaylistStore();
 const player = usePlayerStore();
 const mixer = useMixerStore();
 const masterMix = useMasterMixStore();
 const ui = useUiStore();
 const { openMenu } = useMenu();
-const { askRename, askRemove, share } = usePlaylistActions();
+const { playlistMenuItems } = usePlaylistActions();
 const { playOrToggle } = useCollectionPlayback();
 
 const editingDescription = ref(false);
@@ -48,8 +49,61 @@ const totalDuration = computed(() =>
 );
 const artworkId = computed(() => playlist.value?.artwork ?? null);
 
+/**
+ * The search text lives in the URL, like the library's does: back and forward
+ * restore it, and typing `replace`s the current history entry rather than
+ * pushing one per keystroke. It filters only what the list shows; playback
+ * still goes through the backend, which is given the playlist's own indexes.
+ */
+const query = ref(typeof route.query.q === "string" ? route.query.q : "");
+let queryTimer: number | undefined;
+
+watch(query, (value) => {
+  window.clearTimeout(queryTimer);
+  queryTimer = window.setTimeout(() => {
+    const next = { ...route.query };
+    if (value.trim()) next.q = value;
+    else delete next.q;
+    router.replace({ query: next });
+  }, 200);
+});
+
+// Arriving on a history entry that carried different text, via back or forward.
+watch(
+  () => route.query.q,
+  (value) => {
+    const incoming = typeof value === "string" ? value : "";
+    if (incoming !== query.value) query.value = incoming;
+  },
+);
+
+onBeforeUnmount(() => window.clearTimeout(queryTimer));
+
+const normalizedQuery = computed(() => query.value.trim().toLocaleLowerCase());
+const matches = computed(
+  () =>
+    (...fields: Array<string | null | undefined>) =>
+      !normalizedQuery.value ||
+      fields.some((field) => String(field ?? "").toLocaleLowerCase().includes(normalizedQuery.value)),
+);
+
+/**
+ * The entries the list shows. Missing entries match on what the playlist file
+ * recorded, so they stay visible — greyed out — while a search narrows the
+ * list, rather than silently vanishing with the matched songs.
+ */
+const filteredEntries = computed<ResolvedEntry[]>(() =>
+  items.value.filter((item) =>
+    matches.value(
+      item.track?.title ?? item.entry.title,
+      item.track?.artist ?? item.entry.artist,
+      item.track?.album ?? item.entry.album,
+    ),
+  ),
+);
+
 const listItems = computed<TrackListItem[]>(() =>
-  items.value.map((item) => ({
+  filteredEntries.value.map((item) => ({
     key: String(item.index),
     track: item.track,
     fallbackTitle: item.entry.title,
@@ -120,49 +174,13 @@ function playEntry(item: ResolvedEntry) {
 }
 
 function playIndex(index: number) {
-  const item = items.value[index];
+  const item = filteredEntries.value[index];
   if (item) return playEntry(item);
 }
 
 function reorder(from: number, to: number) {
   const p = playlist.value;
   if (p) return playlists.move(p.id, from, to);
-}
-
-async function toggleShuffleOnly() {
-  const p = playlist.value;
-  if (!p) return;
-  await api.setPlaylistShuffleOnly(p.id, !p.shuffleOnly);
-  await playlists.refresh();
-}
-
-/**
- * Replace the playlist image. The backend copies the file into the artwork
- * cache, so the picture survives the original being moved or deleted.
- */
-async function chooseArtwork() {
-  const p = playlist.value;
-  if (!p) return;
-  const selected = await open({
-    multiple: false,
-    title: "Choose a playlist image",
-    filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
-  });
-  if (typeof selected !== "string") return;
-  try {
-    await api.setPlaylistArtwork(p.id, selected);
-    await playlists.refresh();
-    ui.notify("Playlist image updated");
-  } catch (e) {
-    ui.notify(`Could not use that image: ${e}`, "error");
-  }
-}
-
-async function clearArtwork() {
-  const p = playlist.value;
-  if (!p) return;
-  await api.clearPlaylistArtwork(p.id);
-  await playlists.refresh();
 }
 
 async function shuffleAndPlay() {
@@ -211,25 +229,13 @@ async function openEntryMixer(item: ResolvedEntry) {
 }
 
 function openEntryMixerAt(index: number) {
-  const item = items.value[index];
+  const item = filteredEntries.value[index];
   if (item) return openEntryMixer(item);
 }
 
 function startEditingDescription() {
   draftDescription.value = playlist.value?.description ?? "";
   editingDescription.value = true;
-}
-
-/**
- * Queue this playlist as a whole.
- *
- * Used only for a playlist that plays as a mix: the arrangement goes in as one
- * block, since its songs overlap and cannot be spread across a queue.
- */
-async function queueWholePlaylist(next: boolean) {
-  const p = playlist.value;
-  if (!p) return;
-  await api.queuePlaylist(p.id, next);
 }
 
 async function saveDescription() {
@@ -255,22 +261,8 @@ async function saveDescription() {
       @mixer="openPlaylistMixer"
       @menu="
         openMenu($event, {
-          tracks: available.map((i) => i.track!),
-          playlistOptions: {
-            id: playlist!.id,
-            name: playlist!.name,
-            shuffleOnly: playlist!.shuffleOnly,
-            hasArtwork: !!playlist!.artwork,
-            masterMixEnabled: !!playlist!.masterMix?.enabled,
-            onPlayNext: () => queueWholePlaylist(true),
-            onAddToQueue: () => queueWholePlaylist(false),
-            onToggleShuffleOnly: toggleShuffleOnly,
-            onChooseArtwork: chooseArtwork,
-            onClearArtwork: clearArtwork,
-            onRename: () => askRename(playlist!.id, playlist!.name),
-            onShare: () => share(playlist!.id, playlist!.name),
-            onDelete: () => askRemove(playlist!.id, playlist!.name),
-          },
+          tracks: [],
+          items: playlistMenuItems(playlist!, { includePlay: false }),
         })
       "
     >
@@ -304,19 +296,24 @@ async function saveDescription() {
       </template>
     </CollectionHeader>
 
-    <div class="playlist__description">
-      <input
-        v-if="editingDescription"
-        v-model="draftDescription"
-        class="text-field"
-        placeholder="Add a description"
-        autofocus
-        @keydown.enter="saveDescription"
-        @blur="saveDescription"
-      />
-      <button v-else class="playlist__description-button" @click="startEditingDescription">
-        {{ playlist.description || "Add a description" }}
-      </button>
+    <!-- Description on the left, search tucked into the right of the same row. -->
+    <div class="playlist__inforow">
+      <div class="playlist__description">
+        <input
+          v-if="editingDescription"
+          v-model="draftDescription"
+          class="text-field"
+          placeholder="Add a description"
+          autofocus
+          @keydown.enter="saveDescription"
+          @blur="saveDescription"
+        />
+        <button v-else class="playlist__description-button" @click="startEditingDescription">
+          {{ playlist.description || "Add a description" }}
+        </button>
+      </div>
+
+      <SearchField v-model="query" placeholder="Search this playlist" class="playlist__search" />
     </div>
 
     <p v-if="playlist.missingCount > 0" class="playlist__notice">
@@ -343,12 +340,13 @@ async function saveDescription() {
       show-artwork
       show-mixer
       :reorderable="!playlist?.masterMix?.enabled"
+      :empty-message="`No songs match “${query}”.`"
       @play="playIndex"
       @mixer="(_, index) => openEntryMixerAt(index)"
       @reorder="reorder"
       @menu="
         (event, index) => {
-          const item = items[index];
+          const item = filteredEntries[index];
           if (item?.track) openMenu(event, { tracks: [item.track], playlistId: playlist!.id, entryIndex: item.index });
         }
       "
@@ -373,9 +371,22 @@ async function saveDescription() {
   padding: 6px 26px 40px;
 }
 
-.playlist__description {
+.playlist__inforow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
   margin: -14px 0 18px;
+}
+
+.playlist__description {
+  flex: 1;
+  min-width: 0;
   max-width: 640px;
+}
+
+.playlist__search {
+  flex: none;
 }
 
 .playlist__description-button {

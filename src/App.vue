@@ -67,6 +67,7 @@ onMounted(async () => {
   removeShortcuts = installShortcuts(player, ui, router, {
     isSuspended: () => masterMix.open,
     bindings: () => settings.preferences.shortcuts,
+    seekStep: () => settings.preferences.seekStepSecs,
   });
 
   await initBackendEvents();
@@ -105,7 +106,7 @@ onBeforeUnmount(() => {
       </Transition>
 
       <Transition name="slide-panel">
-        <AdvancedMixer v-if="mixer.panelOpen && !masterMix.open" />
+        <AdvancedMixer v-if="mixer.panelOpen && !masterMix.open" customisable />
       </Transition>
     </div>
 

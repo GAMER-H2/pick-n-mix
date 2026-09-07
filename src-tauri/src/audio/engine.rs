@@ -34,8 +34,8 @@ use serde::Serialize;
 use crate::audio::ambience::{AmbienceMixer, Bank};
 use crate::audio::crossfade::CrossfadeSettings;
 use crate::audio::decode::{StreamInfo, TrackDecoder};
-use crate::audio::dsp::{Chain, Limiter, CHANNELS};
-use crate::audio::params::Resolved;
+use crate::audio::dsp::{BandSolo, Chain, Limiter, CHANNELS};
+use crate::audio::params::{EqBand, Resolved};
 use crate::audio::timeline::TimelineSource;
 
 /// Frames processed per DSP block.
@@ -62,6 +62,18 @@ pub enum EngineEvent {
     /// echoed back in the matching [`AudioEngine::prepare_next`] call; a
     /// mismatched or late reply is ignored.
     NeedNext { token: u64 },
+    /// The crossfade blend has begun: the first fade leg of the curve
+    /// (incoming or outgoing, whichever starts earlier) has been crossed, so
+    /// the outgoing song is fading or the incoming one is about to become
+    /// audible. Emitted once per prepared voice, unlike
+    /// [`EngineEvent::TrackAdvanced`], which only fires at the outgoing
+    /// track's end. The app uses this to time visual transitions (artwork,
+    /// backdrop) to the audio fade.
+    CrossfadeStarted {
+        order_index: usize,
+        track_id: String,
+        lead_secs: f32,
+    },
     /// A prepared voice has taken over from the current one on the worker's
     /// own schedule. The app should move its queue cursor to match — it must
     /// *not* also call `engine.load()`, since the audio never stopped.
@@ -69,6 +81,12 @@ pub enum EngineEvent {
         order_index: usize,
         track_id: String,
     },
+    /// A blend that had already begun has been abandoned: the listener
+    /// seeked, loaded something else, or changed the queue, so the outgoing
+    /// track carries on alone and no [`EngineEvent::TrackAdvanced`] will
+    /// follow. Only ever emitted after a [`EngineEvent::CrossfadeStarted`],
+    /// so the app can unwind visual transitions it began on the back of one.
+    CrossfadeCancelled,
     /// Something went wrong; the message is safe to show to the user.
     Error { message: String },
 }
@@ -141,6 +159,16 @@ struct Shared {
     /// consuming and stays at full gain while it is set, even though
     /// `playing` is already false.
     tail_active: AtomicBool,
+    /// Let ambience beds keep sounding while playback is paused or stopped.
+    ambience_alone: AtomicBool,
+    /// Set by the worker each block: any ambience bed is sounding or still
+    /// fading. With `ambience_alone` on, the callback treats this as playing
+    /// so the beds are not faded away along with the paused music.
+    beds_audible: AtomicBool,
+    /// The EQ band being auditioned on its own, while the listener holds a
+    /// solo button down. Monitoring only: it narrows the master bus and is
+    /// never stored with the mixer settings it is previewing.
+    eq_solo: ArcSwap<Option<EqBand>>,
 }
 
 impl Shared {
@@ -168,6 +196,9 @@ impl Shared {
             analyser_on: AtomicBool::new(false),
             keep_tail: AtomicBool::new(false),
             tail_active: AtomicBool::new(false),
+            ambience_alone: AtomicBool::new(false),
+            beds_audible: AtomicBool::new(false),
+            eq_solo: ArcSwap::from_pointee(None),
         }
     }
 
@@ -556,12 +587,27 @@ impl AudioEngine {
         self.shared.keep_tail.store(enabled, Ordering::Relaxed);
     }
 
+    /// Keep ambience beds sounding while playback is paused or stopped.
+    pub fn set_ambience_alone(&self, enabled: bool) {
+        self.shared.ambience_alone.store(enabled, Ordering::Relaxed);
+    }
+
     /// Start or stop maintaining the spectrum.
     ///
     /// Off by default: the FFT is cheap but not free, and nothing but the
     /// expanded EQ ever looks at it, so it runs only while that is open.
     pub fn set_analyser_enabled(&self, enabled: bool) {
         self.shared.analyser_on.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Narrow the output to one EQ band's own range, or `None` to restore
+    /// the full range.
+    ///
+    /// Held rather than toggled: the UI sends the band on press and `None` on
+    /// release, so nothing is left soloed if the window loses focus or the
+    /// editor closes mid-press.
+    pub fn set_eq_solo(&self, band: Option<EqBand>) {
+        self.shared.eq_solo.store(Arc::new(band));
     }
 
     /// The latest spectrum of the processed output, in dBFS.
@@ -804,8 +850,12 @@ where
                 // A ringing reverb tail counts as playing here: `playing` is
                 // already false the moment pause is pressed, but the tail the
                 // worker is still feeding in has to be heard out rather than
-                // faded away with the music.
-                let playing = shared.audible();
+                // faded away with the music. With ambience-alone enabled, so
+                // do the beds: they are the only thing sounding, and fading
+                // them with the music would silence the whole feature.
+                let playing = shared.audible()
+                    || (shared.ambience_alone.load(Ordering::Relaxed)
+                        && shared.beds_audible.load(Ordering::Relaxed));
                 let target_volume = shared.volume();
 
                 for frame in data.chunks_mut(channels) {
@@ -888,6 +938,12 @@ fn worker(
     let mut master_limiter = Limiter::new();
     master_limiter.prepare(device_rate as f32);
 
+    // The band solo sits on the master bus rather than in either chain: it is
+    // a monitoring filter on everything leaving the app, not an effect
+    // belonging to a voice.
+    let mut band_solo = BandSolo::new();
+    band_solo.prepare(device_rate as f32);
+
     let mut ambience = AmbienceMixer::new();
     ambience.prepare(device_rate as f32);
 
@@ -908,12 +964,17 @@ fn worker(
     // Set once `NeedNext` has been asked and not yet answered (or cancelled),
     // so the trigger does not fire again on every subsequent block.
     let mut next_wait_token: Option<u64> = None;
+    // One-shot guard for `CrossfadeStarted` per prepared voice: the event
+    // fires on the first block where the earliest fade leg begins. Reset when
+    // a new voice is accepted (the only way `next` becomes `Some` again) and
+    // when a voice is promoted, so a seek-back and re-approach still emits.
     // Set once the app has said there is nothing to crossfade into. Without
     // it, a declined request would simply clear the token and the trigger
     // would fire again immediately, spraying events for the rest of the
     // track. Cleared whenever the situation could have changed.
     let mut next_declined = false;
     let mut next_token_gen: u64 = 0;
+    let mut crossfade_started = false;
 
     let mut finished_reported = false;
     let mut requested_beds = crate::audio::ambience::BedRequests::new();
@@ -922,6 +983,14 @@ fn worker(
     // draining one. See the pause handling in the loop below.
     let mut tail_blocks = 0usize;
     let mut was_playing = false;
+    // Set when ambience-alone is switched off (or the voice goes away) while
+    // beds are still sounding: the mixer keeps being processed until the
+    // beds have faded to silence, then the worker goes back to idle.
+    let mut draining_beds = false;
+    // Whether the beds have been the only audible source since playback last
+    // stopped. Used to detect the two moments when the ring holds audio from
+    // a source the listener is no longer meant to hear.
+    let mut beds_only = false;
 
     loop {
         // --- commands ---------------------------------------------------
@@ -972,8 +1041,12 @@ fn worker(
                             shared.tail_active.store(false, Ordering::Relaxed);
                             // Whatever was being prepared for a crossfade no
                             // longer applies either.
-                            next = None;
-                            next_wait_token = None;
+                            abandon_next(
+                                &mut next,
+                                &mut next_wait_token,
+                                &mut crossfade_started,
+                                &events,
+                            );
                             next_declined = false;
                             finished_reported = false;
                             drain(&shared);
@@ -981,8 +1054,12 @@ fn worker(
                         }
                         Err(e) => {
                             current = None;
-                            next = None;
-                            next_wait_token = None;
+                            abandon_next(
+                                &mut next,
+                                &mut next_wait_token,
+                                &mut crossfade_started,
+                                &events,
+                            );
                             shared.stream_info.store(Arc::new(None));
                             let _ = reply.send(Err(e));
                         }
@@ -1020,8 +1097,12 @@ fn worker(
                     chains[1].prepare(device_rate as f32);
                     tail_blocks = 0;
                     shared.tail_active.store(false, Ordering::Relaxed);
-                    next = None;
-                    next_wait_token = None;
+                    abandon_next(
+                        &mut next,
+                        &mut next_wait_token,
+                        &mut crossfade_started,
+                        &events,
+                    );
                     next_declined = false;
                     finished_reported = false;
                     drain(&shared);
@@ -1037,8 +1118,12 @@ fn worker(
                         // A seek can move arbitrarily far from the track's own
                         // end, which invalidates any in-flight crossfade
                         // scheduling against it.
-                        next = None;
-                        next_wait_token = None;
+                        abandon_next(
+                            &mut next,
+                            &mut next_wait_token,
+                            &mut crossfade_started,
+                            &events,
+                        );
                         next_declined = false;
                         drain(&shared);
                         finished_reported = false;
@@ -1050,8 +1135,12 @@ fn worker(
                 }
                 Cmd::Clear => {
                     current = None;
-                    next = None;
-                    next_wait_token = None;
+                    abandon_next(
+                        &mut next,
+                        &mut next_wait_token,
+                        &mut crossfade_started,
+                        &events,
+                    );
                     next_declined = false;
                     tail_blocks = 0;
                     shared.tail_active.store(false, Ordering::Relaxed);
@@ -1083,11 +1172,18 @@ fn worker(
                             }),
                         });
                         next_wait_token = None;
+                        // A fresh voice: its fade has not begun yet, so the
+                        // one-shot `CrossfadeStarted` must be able to fire.
+                        crossfade_started = false;
                     }
                 }
                 Cmd::CancelNext => {
-                    next = None;
-                    next_wait_token = None;
+                    abandon_next(
+                        &mut next,
+                        &mut next_wait_token,
+                        &mut crossfade_started,
+                        &events,
+                    );
                     // The queue changed, so a previous "nothing to play next"
                     // answer may no longer be true.
                     next_declined = false;
@@ -1111,11 +1207,16 @@ fn worker(
                     chains[0].prepare(device_rate as f32);
                     chains[1].prepare(device_rate as f32);
                     master_limiter.prepare(device_rate as f32);
+                    band_solo.prepare(device_rate as f32);
                     ambience.prepare(device_rate as f32);
                     analyser = crate::audio::analyser::Analyser::new(device_rate as f32);
                     current = None;
-                    next = None;
-                    next_wait_token = None;
+                    abandon_next(
+                        &mut next,
+                        &mut next_wait_token,
+                        &mut crossfade_started,
+                        &events,
+                    );
                     tail_blocks = 0;
                     shared.tail_active.store(false, Ordering::Relaxed);
                 }
@@ -1144,6 +1245,10 @@ fn worker(
 
         let crossfade = shared.crossfade.load_full();
         let bank = shared.bank.load_full();
+        // Stands in for the current voice's settings wherever there is no
+        // voice: the master-bus beds, and nothing else, run from the global
+        // mixer while ambience-alone is active.
+        let global_settings = shared.settings.load_full();
 
         // A master mix carries its atmospheres per block rather than on the
         // master bus — each block's cascade resolves its own beds — so the
@@ -1184,6 +1289,29 @@ fn worker(
             shared
                 .speed_millis
                 .store((speed * 1000.0) as u64, Ordering::Relaxed);
+        } else if shared.ambience_alone.load(Ordering::Relaxed) {
+            // No voice, but the listener wants the atmosphere on its own. The
+            // global mixer settings stand in for the current voice's, and
+            // still-undecoded beds are chased through the same request path
+            // so the loader thread serves both cases.
+            let filters: &[crate::audio::params::Filter] = if global_settings.enabled {
+                &global_settings.filters
+            } else {
+                &[]
+            };
+            ambience.sync(filters, &bank);
+            let asked_at = Instant::now();
+            for id in ambience.missing(filters, &bank) {
+                if requested_beds.due(id, asked_at, BED_RETRY) {
+                    let _ = bed_requests.send(id.to_string());
+                }
+            }
+            requested_beds.settled(&bank);
+        } else {
+            // Nothing playing and ambience-alone is off: retire whatever is
+            // still in the mixer so it drains rather than sitting there. The
+            // idle gate below can then put the worker to sleep.
+            ambience.sync(&[], &bank);
         }
 
         // --- pause: start or finish a reverb tail --------------------------
@@ -1213,6 +1341,55 @@ fn worker(
             drain(&shared);
         }
         was_playing = playing;
+
+        // --- ambience-alone state ------------------------------------------
+        // Kept before every `continue` below: the takeover drain must run even
+        // when the ring has no room, otherwise a ring still full of pre-pause
+        // music could starve bed production forever (no room to push, no
+        // callback consumption while faded down).
+        let ambience_alone = shared.ambience_alone.load(Ordering::Relaxed);
+        let beds_audible = ambience.is_audible();
+        if !ambience_alone && current.is_none() && beds_audible {
+            draining_beds = true;
+        }
+        if ambience.is_silent() {
+            draining_beds = false;
+        }
+        let beds_sounding = beds_audible && (ambience_alone || draining_beds);
+        shared
+            .beds_audible
+            .store(ambience_alone && beds_audible, Ordering::Relaxed);
+
+        // The audible source changing while the callback sits faded down would
+        // play whatever the previous source left in the ring: the unheard
+        // pre-pause music when the beds take over, or stale bed audio when
+        // the music takes back over. Both are discarded the same way pause
+        // discards unheard music; on the takeover the decoder is also wound
+        // back to the heard position, so resuming stays exact. Only a truly
+        // silent callback counts — while a reverb tail rings the takeover
+        // waits for it to finish. The `beds_only` latch stays set until
+        // playback resumes, so beds that fade out on their own while stopped
+        // still leave a clean ring behind.
+        let music_silent = !playing && !shared.tail_active.load(Ordering::Relaxed);
+        let beds_taking_over = music_silent && beds_sounding;
+        if beds_taking_over && !beds_only {
+            if let Some(cur) = current.as_mut() {
+                let heard = heard_position(&producer, cur, device_rate, &shared);
+                if cur.source.seek(heard).is_ok() {
+                    drain(&shared);
+                }
+            } else {
+                drain(&shared);
+            }
+        } else if playing && beds_only {
+            // Music taking back over: the beds' audio in the ring goes too.
+            drain(&shared);
+        }
+        beds_only = if playing {
+            false
+        } else {
+            beds_only || beds_taking_over
+        };
 
         // The voice can vanish mid-tail — the queue is cleared, or another
         // track is loaded — and there is nothing left to ring out when it does.
@@ -1251,7 +1428,11 @@ fn worker(
         }
 
         // --- idle / backpressure ------------------------------------------
-        let idle = !playing || current.is_none();
+        // `beds_sounding` (computed before the pause handling, above) keeps
+        // the worker awake while the beds are the only thing there is to
+        // render — including the fade-out after ambience-alone is switched
+        // off. With a current voice the existing pause behaviour is untouched.
+        let idle = (!playing || current.is_none()) && !beds_sounding;
         let room = producer.slots() >= BLOCK * CHANNELS;
         if idle || !room {
             // Let the spectrum fall away rather than freezing the last frame
@@ -1271,7 +1452,9 @@ fn worker(
             .as_ref()
             .map(|cur| cur.source.is_timeline())
             .unwrap_or(false);
-        if crossfade.enabled()
+        if playing
+            && current.is_some()
+            && crossfade.enabled()
             && !playing_a_mix
             && next.is_none()
             && next_wait_token.is_none()
@@ -1300,7 +1483,9 @@ fn worker(
         // a voice that is about to be promoted never has the chance to reach
         // "EOF with an empty ring" and fire `TrackFinished` on its way out —
         // that would otherwise skip the very track being promoted to.
-        if next.is_some() {
+        // Gated on `playing` so ambience-alone playback while paused never
+        // promotes a queued voice mid-pause.
+        if playing && current.is_some() && next.is_some() {
             let cur = current.as_ref().expect("checked by `idle` above");
             let x = cur.source.decoded_secs() - cur.source.info().duration_secs;
             if x >= 0.0 || cur.source.is_eof() {
@@ -1327,6 +1512,8 @@ fn worker(
                 let queue_ref = promoted.queue_ref.clone();
                 current = Some(promoted);
                 next_wait_token = None;
+                // The old voice is gone; the next handoff starts fresh.
+                crossfade_started = false;
                 // A new track is playing, so ask again for whatever follows it.
                 next_declined = false;
                 finished_reported = false;
@@ -1346,7 +1533,19 @@ fn worker(
         // needs `current` mutably: everything after this block only ever
         // reads it, and holding a `&mut` across the next-voice section too
         // would fight the immutable borrow that section needs.
-        let (frames, speed) = {
+        //
+        // When ambience-alone is keeping the worker awake with no voice (or
+        // while paused), the voice part stays silent and `frames` stays at a
+        // full block so the bed mix below has room to write into.
+        let ambience_only = beds_sounding && (!playing || current.is_none());
+        let (frames, speed) = if ambience_only {
+            for ch in 0..CHANNELS {
+                for f in 0..BLOCK {
+                    mix[ch][f] = 0.0;
+                }
+            }
+            (BLOCK, 1.0)
+        } else {
             let cur = current.as_mut().expect("checked by `idle` above");
             let speed = if cur.settings.enabled {
                 cur.settings.pitch.ratio()
@@ -1405,7 +1604,9 @@ fn worker(
         };
 
         // --- produce: next voice, mixed in under the crossfade curve -------
-        if next.is_some() {
+        // Skipped while ambience-alone is sounding without playback: the
+        // queued voice must not be decoded (advancing it) while paused.
+        if next.is_some() && !ambience_only {
             let x = {
                 let cur = current.as_ref().expect("checked by `idle` above");
                 cur.source.decoded_secs() - cur.source.info().duration_secs
@@ -1414,6 +1615,25 @@ fn worker(
             for ch in 0..CHANNELS {
                 for f in 0..frames {
                     mix[ch][f] *= gain_a;
+                }
+            }
+
+            // The blend visually begins with whichever leg starts first: a
+            // curve can fade the outgoing song out before the incoming one is
+            // even read, so the artwork transition has to start at the
+            // earlier crossing to cover the whole blend.
+            let earliest = crossfade
+                .curve
+                .fade_in_start
+                .min(crossfade.curve.fade_out_start);
+            if !crossfade_started && x >= earliest as f64 {
+                crossfade_started = true;
+                if let Some(qref) = next.as_ref().and_then(|nx| nx.queue_ref.as_ref()) {
+                    let _ = events.send(EngineEvent::CrossfadeStarted {
+                        order_index: qref.order_index,
+                        track_id: qref.track_id.clone(),
+                        lead_secs: crossfade.lead_secs(),
+                    });
                 }
             }
 
@@ -1475,12 +1695,23 @@ fn worker(
 
         // --- master bus: ambience, then the one limiter --------------------
         // A single fresh immutable borrow, used through both this and the
-        // reporting step below: nothing mutates `current` in between.
-        let cur = current.as_ref().expect("checked by `idle` above");
-        if cur.settings.enabled && !ambience.is_silent() {
+        // reporting step below: nothing mutates `current` in between. With no
+        // current voice at all, the global mixer settings stand in so the
+        // beds still respect the cascade toggle and normalisation.
+        let settings = match current.as_ref() {
+            Some(cur) => &cur.settings,
+            None => &global_settings,
+        };
+        if settings.enabled && !ambience.is_silent() {
             ambience.process(&mut mix, frames);
         }
-        master_limiter.update(&cur.settings.normalisation, device_rate as f32);
+        // Ahead of the limiter, so what is auditioned is the same signal the
+        // limiter would have seen — and ahead of the analyser tap below, so
+        // the spectrum shows the soloed range too.
+        let solo = shared.eq_solo.load_full();
+        band_solo.update(solo.as_ref().as_ref());
+        band_solo.process(&mut mix, frames);
+        master_limiter.update(&settings.normalisation, device_rate as f32);
         master_limiter.process(&mut mix, frames);
 
         // Tapped here, at the very end of the master bus, so the spectrum
@@ -1503,14 +1734,18 @@ fn worker(
         // What is decoded, less what is still queued, converted back into
         // track time so varispeed does not skew the progress bar. Reports
         // against whichever voice is `current`, which is always the one the
-        // callback is (about to be) audibly dominated by.
-        let capacity = producer.buffer().capacity();
-        let queued_frames = (capacity - producer.slots()) / CHANNELS;
-        let queued_secs = queued_frames as f64 / device_rate as f64 * speed;
-        let position = (cur.source.decoded_secs() - queued_secs).max(0.0);
-        shared
-            .position_ms
-            .store((position * 1000.0) as u64, Ordering::Relaxed);
+        // callback is (about to be) audibly dominated by. Ambience-alone
+        // blocks have no voice to report against, so the position is left
+        // exactly where it was.
+        if let (false, Some(cur)) = (ambience_only, current.as_ref()) {
+            let capacity = producer.buffer().capacity();
+            let queued_frames = (capacity - producer.slots()) / CHANNELS;
+            let queued_secs = queued_frames as f64 / device_rate as f64 * speed;
+            let position = (cur.source.decoded_secs() - queued_secs).max(0.0);
+            shared
+                .position_ms
+                .store((position * 1000.0) as u64, Ordering::Relaxed);
+        }
 
         meter_countdown += 1;
         if meter_countdown >= 4 {
@@ -1520,6 +1755,26 @@ fn worker(
                 .reduction_millidb
                 .store((red * 1000.0) as u32, Ordering::Relaxed);
         }
+    }
+}
+
+/// Drop whatever was prepared to crossfade into, and say so if the blend had
+/// already begun.
+///
+/// Every path that invalidates a pending handoff goes through here: the app
+/// times artwork transitions to `CrossfadeStarted`, so a blend that is torn
+/// down mid-flight has to be announced or those transitions would run to
+/// completion over audio that never changed track.
+fn abandon_next(
+    next: &mut Option<Voice>,
+    next_wait_token: &mut Option<u64>,
+    crossfade_started: &mut bool,
+    events: &Sender<EngineEvent>,
+) {
+    *next = None;
+    *next_wait_token = None;
+    if std::mem::take(crossfade_started) {
+        let _ = events.send(EngineEvent::CrossfadeCancelled);
     }
 }
 

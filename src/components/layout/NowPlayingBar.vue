@@ -18,18 +18,23 @@ import { formatDuration } from "@/lib/format";
 import { stableAlbumId, stableArtistId } from "@/lib/ids";
 import { usePlayerStore } from "@/stores/player";
 import { useMixerStore } from "@/stores/mixer";
+import { useSettingsStore } from "@/stores/settings";
 import { useUiStore } from "@/stores/ui";
 import { useMasterMixStore } from "@/stores/masterMix";
 import { useNowPlayingMeta } from "@/composables/useNowPlayingMeta";
 
 const player = usePlayerStore();
 const mixer = useMixerStore();
+const settings = useSettingsStore();
 const ui = useUiStore();
 const masterMix = useMasterMixStore();
 const route = useRoute();
 const router = useRouter();
 
-const SKIP_SECONDS = 10;
+/** How far the skip buttons jump; the keyboard step shares the same preference. */
+const skipSeconds = computed(() => Math.max(1, Math.round(settings.preferences.seekStepSecs)));
+const backLabel = computed(() => `Back ${skipSeconds.value} seconds`);
+const forwardLabel = computed(() => `Forward ${skipSeconds.value} seconds`);
 /** Quarters, so the level can be set exactly without fighting the pointer. */
 const VOLUME_DETENTS = [0, 0.25, 0.5, 0.75, 1];
 
@@ -271,9 +276,9 @@ async function openMixer(event: MouseEvent) {
         <button
           class="icon-button"
           :disabled="!player.hasPlayback"
-          :title="`Back ${SKIP_SECONDS} seconds`"
-          aria-label="Skip back ten seconds"
-          @click="skip(-SKIP_SECONDS)"
+          :title="backLabel"
+          :aria-label="`Skip back ${skipSeconds} seconds`"
+          @click="skip(-skipSeconds)"
         >
           <PnmIcon name="back10" :size="19" />
         </button>
@@ -307,9 +312,9 @@ async function openMixer(event: MouseEvent) {
         <button
           class="icon-button"
           :disabled="!player.hasPlayback"
-          :title="`Forward ${SKIP_SECONDS} seconds`"
-          aria-label="Skip forward ten seconds"
-          @click="skip(SKIP_SECONDS)"
+          :title="forwardLabel"
+          :aria-label="`Skip forward ${skipSeconds} seconds`"
+          @click="skip(skipSeconds)"
         >
           <PnmIcon name="forward10" :size="19" />
         </button>

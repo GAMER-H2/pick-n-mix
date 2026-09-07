@@ -579,14 +579,16 @@ pub fn next_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
     start_current(&app, &state)
 }
 
-/// Pressing previous within the first few seconds goes back a track; after
-/// that it restarts the current one, which is what every player does.
+/// Pressing previous within the restart threshold goes back a track; after
+/// that it restarts the current one, which is what every player does. The
+/// threshold is the `previousRestartSecs` preference; zero means previous
+/// always goes back a track.
 #[tauri::command]
 pub fn previous_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
     if master_mix_owns_playback(&state) {
         return Ok(());
     }
-    const RESTART_AFTER_SECS: f64 = 3.0;
+    let restart_after_secs = load_app_preferences(&state.db).previous_restart_secs;
     if let Some(playlist_id) = enabled_mix_playing(&state) {
         return seek_chapter(&app, &state, &playlist_id, -1);
     }
@@ -596,7 +598,7 @@ pub fn previous_track(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
         .and_then(|preview| preview.original.as_ref())
         .map(|original| original.position_secs)
         .unwrap_or_else(|| state.engine.snapshot().position_secs);
-    if position > RESTART_AFTER_SECS {
+    if position > restart_after_secs {
         if cancelled.is_some() {
             load_current(&app, &state, 0.0, true)?;
         } else {
@@ -670,6 +672,21 @@ pub struct AnalyserFrame {
 #[tauri::command]
 pub fn set_analyser_enabled(state: State<'_, AppState>, enabled: bool) -> Cmd<()> {
     state.engine.set_analyser_enabled(enabled);
+    Ok(())
+}
+
+/// Audition one EQ band's own frequency range on its own.
+///
+/// Held, not toggled: the expanded EQ sends the band on press and `None` on
+/// release (including on close, blur, and unmount), so the output can never
+/// be left narrowed by a press whose release went missing. Nothing is stored
+/// — the band is a description of what to listen to, not an edit.
+#[tauri::command]
+pub fn set_eq_solo(
+    state: State<'_, AppState>,
+    band: Option<crate::audio::params::EqBand>,
+) -> Cmd<()> {
+    state.engine.set_eq_solo(band);
     Ok(())
 }
 
@@ -813,6 +830,9 @@ pub fn set_app_preferences(
         .map_err(err)?;
     state.engine.set_fade_mode(&preferences.fade_mode);
     state.engine.set_keep_tail(preferences.keep_reverb_on_pause);
+    state
+        .engine
+        .set_ambience_alone(preferences.ambience_without_playback);
     if preferences.output_device != previous.output_device {
         apply_output_device(&app, &state, &preferences.output_device)?;
     }
@@ -2860,8 +2880,10 @@ fn bounce_bank(state: &AppState, plan: &crate::audio::timeline::Plan) -> ambienc
     }
 
     let rate = state.engine.device_sample_rate();
-    let catalogue =
-        ambience::catalogue(state.paths.bundled_ambience.as_deref(), &state.paths.filters);
+    let catalogue = ambience::catalogue(
+        state.paths.bundled_ambience.as_deref(),
+        &state.paths.filters,
+    );
     for id in wanted {
         let Some(path) = catalogue
             .iter()
@@ -3051,12 +3073,7 @@ fn retreat_before_mix(app: &AppHandle, state: &AppState) -> Cmd<()> {
 /// loaded, so they move through its chapters instead. Going back behaves the
 /// way it does everywhere else: part-way into a song it returns to the top of
 /// that song, and only then to the one before.
-fn seek_chapter(
-    app: &AppHandle,
-    state: &AppState,
-    playlist_id: &str,
-    direction: i32,
-) -> Cmd<()> {
+fn seek_chapter(app: &AppHandle, state: &AppState, playlist_id: &str, direction: i32) -> Cmd<()> {
     const RESTART_AFTER_SECS: f64 = 3.0;
     /// Enough to be past the mark we are sitting on, short enough not to skip
     /// a chapter that genuinely starts here.
@@ -3073,7 +3090,10 @@ fn seek_chapter(
     let position = state.engine.snapshot().position_secs;
 
     if direction > 0 {
-        match marks.iter().find(|mark| mark.start_secs > position + EPSILON) {
+        match marks
+            .iter()
+            .find(|mark| mark.start_secs > position + EPSILON)
+        {
             Some(next) => state.engine.seek(next.start_secs),
             // Past the last song, next leaves the mix the way it would leave
             // any queue entry: on to whatever was queued behind it.
@@ -3264,8 +3284,7 @@ fn build_plan(
             };
 
             let block_layer = block.mixer.clone().unwrap_or_default();
-            let settings =
-                MixerSettings::resolve(&[&playlist_layer, &entry_layer, &block_layer]);
+            let settings = MixerSettings::resolve(&[&playlist_layer, &entry_layer, &block_layer]);
             blocks.push(crate::audio::timeline::PlanBlock {
                 path,
                 block: block.clone(),

@@ -159,6 +159,23 @@ impl Biquad {
         self.a2 = a2 / a0;
     }
 
+    /// Constant-peak-gain band pass, the one response the EQ itself has no
+    /// use for: only the band solo needs it, to hear a band's own range.
+    pub fn set_band_pass(&mut self, sample_rate: f32, freq: f32, q: f32) {
+        let freq = freq.clamp(10.0, sample_rate * 0.49);
+        let q = q.max(0.05);
+        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / (2.0 * q);
+        let a0 = 1.0 + alpha;
+
+        self.b0 = alpha / a0;
+        self.b1 = 0.0;
+        self.b2 = -alpha / a0;
+        self.a1 = -2.0 * cos_w0 / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
     /// The normalised coefficients, as `[b0, b1, b2, a1, a2]`.
     ///
     /// The EQ graph in the UI re-derives these in TypeScript so it can redraw
@@ -272,6 +289,151 @@ impl EqChain {
                 buf[ch][i] = s * preamp;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Band solo
+// ---------------------------------------------------------------------------
+
+/// Sections per channel in the solo filter. Two, so the skirts are steep
+/// enough (24 dB/oct on the pass filters) that the neighbouring bands are
+/// genuinely out of the way rather than merely quieter.
+const SOLO_STAGES: usize = 2;
+
+/// Q pair that makes two cascaded 2-pole sections a 4th-order Butterworth:
+/// flat in the pass band, where a pair of 0.707 sections would sag by 3 dB
+/// and make the solo sound duller than the band it is auditioning.
+const BUTTERWORTH_Q: [f32; SOLO_STAGES] = [0.5412, 1.3066];
+
+/// Hold-to-listen preview of one EQ band's own range, in FabFilter's sense of
+/// "solo": the master bus is narrowed to whatever the band acts on, so its
+/// effect can be judged without the rest of the spectrum masking it.
+///
+/// It is a monitoring path, not part of the mixer cascade — nothing about it
+/// is stored, and it applies to the output as a whole rather than to the
+/// track the EQ belongs to.
+pub struct BandSolo {
+    filters: [[Biquad; SOLO_STAGES]; CHANNELS],
+    /// The band being auditioned, so identical updates (this runs every
+    /// block) do not recompute coefficients.
+    current: Option<EqBand>,
+    /// 0 while off, 1 while soloing, ramped: pressing and releasing the
+    /// button must not click.
+    wet: Smoothed,
+    sample_rate: f32,
+}
+
+impl BandSolo {
+    pub fn new() -> Self {
+        BandSolo {
+            filters: [[Biquad::bypass(); SOLO_STAGES]; CHANNELS],
+            current: None,
+            wet: Smoothed::new(0.0),
+            sample_rate: 48000.0,
+        }
+    }
+
+    pub fn prepare(&mut self, sample_rate: f32) {
+        self.sample_rate = sample_rate;
+        self.wet.prepare(sample_rate, 8.0);
+        self.wet.jump_to(0.0);
+        self.current = None;
+        for ch in self.filters.iter_mut() {
+            for f in ch.iter_mut() {
+                f.reset();
+            }
+        }
+    }
+
+    /// Point the filter at a band, or `None` to fall back to the full range.
+    pub fn update(&mut self, band: Option<&EqBand>) {
+        self.wet.set_target(if band.is_some() { 1.0 } else { 0.0 });
+        if self.current.as_ref() == band {
+            return;
+        }
+        self.current = band.cloned();
+        let Some(band) = band else {
+            // Left tuned as it was: the ramp is still fading the filtered
+            // signal out, and retuning underneath it would be audible.
+            return;
+        };
+        for ch in 0..CHANNELS {
+            for (stage, f) in self.filters[ch].iter_mut().enumerate() {
+                match solo_shape(band.kind) {
+                    // A peak acts on a region around its frequency, so what
+                    // it does is heard through a band pass of the band's own
+                    // width: a surgical notch solos narrow, a broad tone
+                    // shape solos broad.
+                    SoloShape::Around => {
+                        f.set_band_pass(self.sample_rate, band.freq, band.q.max(0.5))
+                    }
+                    // A shelf or pass filter acts on everything to one side
+                    // of its corner, so the solo is that whole side.
+                    SoloShape::Below => f.set(
+                        BandKind::LowPass,
+                        self.sample_rate,
+                        band.freq,
+                        0.0,
+                        BUTTERWORTH_Q[stage],
+                    ),
+                    SoloShape::Above => f.set(
+                        BandKind::HighPass,
+                        self.sample_rate,
+                        band.freq,
+                        0.0,
+                        BUTTERWORTH_Q[stage],
+                    ),
+                }
+            }
+        }
+    }
+
+    pub fn process(&mut self, buf: &mut [Vec<f32>], frames: usize) {
+        // Nothing soloed and the ramp already down: the whole node is out of
+        // the signal path, sample-identical to it not existing.
+        if self.current.is_none() && self.wet.is_silent() {
+            return;
+        }
+        for i in 0..frames {
+            let wet = self.wet.next();
+            for ch in 0..CHANNELS {
+                let dry = buf[ch][i];
+                let mut s = dry;
+                for f in self.filters[ch].iter_mut() {
+                    s = f.process(s);
+                }
+                buf[ch][i] = dry + (s - dry) * wet;
+            }
+        }
+        if self.current.is_none() && self.wet.is_silent() {
+            for ch in self.filters.iter_mut() {
+                for f in ch.iter_mut() {
+                    f.reset();
+                }
+            }
+        }
+    }
+}
+
+impl Default for BandSolo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Which side of a band's corner frequency the band actually acts on.
+enum SoloShape {
+    Around,
+    Below,
+    Above,
+}
+
+fn solo_shape(kind: BandKind) -> SoloShape {
+    match kind {
+        BandKind::Peak => SoloShape::Around,
+        BandKind::LowShelf | BandKind::HighPass => SoloShape::Below,
+        BandKind::HighShelf | BandKind::LowPass => SoloShape::Above,
     }
 }
 
@@ -959,6 +1121,71 @@ mod tests {
             worst <= ceiling + 1e-3,
             "peak {worst} exceeded ceiling {ceiling}"
         );
+    }
+
+    /// RMS of a steady sine at `hz` after running it through `node`.
+    fn solo_rms(band: Option<&EqBand>, hz: f32) -> f32 {
+        const RATE: f32 = 48000.0;
+        const FRAMES: usize = 8192;
+        let mut solo = BandSolo::new();
+        solo.prepare(RATE);
+        solo.update(band);
+        let mut buf = silence(FRAMES);
+        for i in 0..FRAMES {
+            let s = (2.0 * std::f32::consts::PI * hz * i as f32 / RATE).sin();
+            buf[0][i] = s;
+            buf[1][i] = s;
+        }
+        solo.process(&mut buf, FRAMES);
+        // Skip the ramp-in, which is deliberately not instant.
+        let tail = &buf[0][FRAMES / 2..];
+        (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn nothing_soloed_leaves_the_signal_alone() {
+        let mut solo = BandSolo::new();
+        solo.prepare(48000.0);
+        solo.update(None);
+        let mut buf = vec![vec![0.4f32; 256]; CHANNELS];
+        solo.process(&mut buf, 256);
+        assert_eq!(buf[0][255], 0.4);
+    }
+
+    #[test]
+    fn soloing_a_peak_keeps_its_own_range_and_rejects_the_rest() {
+        let band = EqBand {
+            kind: BandKind::Peak,
+            freq: 1000.0,
+            gain_db: 6.0,
+            q: 2.0,
+            enabled: true,
+        };
+        let at_band = solo_rms(Some(&band), 1000.0);
+        let far_below = solo_rms(Some(&band), 100.0);
+        let far_above = solo_rms(Some(&band), 10000.0);
+        assert!(at_band > 0.5, "the band's own frequency was lost: {at_band}");
+        assert!(
+            far_below < at_band * 0.1 && far_above < at_band * 0.1,
+            "neighbouring ranges leaked through: {far_below} / {far_above} against {at_band}"
+        );
+    }
+
+    #[test]
+    fn soloing_a_pass_filter_keeps_the_side_it_acts_on() {
+        // A high pass acts on what is below its corner, so that is what its
+        // solo has to play — the opposite of what the filter itself passes.
+        let band = EqBand {
+            kind: BandKind::HighPass,
+            freq: 200.0,
+            gain_db: 0.0,
+            q: 0.71,
+            enabled: true,
+        };
+        let below = solo_rms(Some(&band), 50.0);
+        let above = solo_rms(Some(&band), 4000.0);
+        assert!(below > 0.5, "the range the filter acts on was lost: {below}");
+        assert!(above < below * 0.05, "the untouched range leaked: {above}");
     }
 
     #[test]

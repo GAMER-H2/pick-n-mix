@@ -35,6 +35,8 @@ function mix(): MasterMix {
   return {
     enabled: true,
     revision: 1,
+    bpm: 120,
+    beatsPerBar: 4,
     lanes: [
       {
         id: "l0",

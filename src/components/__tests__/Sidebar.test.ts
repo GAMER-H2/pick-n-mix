@@ -63,17 +63,41 @@ describe("Sidebar playlists", () => {
     vi.clearAllMocks();
   });
 
-  it("offers rename, share and delete on a playlist row", async () => {
+  it("offers the full playlist menu on a row", async () => {
     const wrapper = mountSidebar();
     const ui = useUiStore();
 
     await wrapper.findAll("[data-row]")[1].trigger("contextmenu");
 
+    // The same actions the playlist page's header menu offers, in its order:
+    // playback, how the playlist plays and looks, organisation, destruction.
     expect(ui.contextMenu?.items?.map((item) => item.label)).toEqual([
+      "Play",
+      "Play Next",
+      "Add to Queue",
+      "Add to Playlist",
+      "Shuffle-Only",
+      "Change Image…",
       "Rename…",
       "Share…",
       "Delete Playlist",
     ]);
+    // The shuffle-only toggle reflects the playlist's current state.
+    expect(ui.contextMenu?.items?.find((item) => item.label === "Shuffle-Only")?.checked).toBe(
+      false,
+    );
+  });
+
+  /** With no picture of its own there is nothing to reset. */
+  it("only offers resetting the image when the playlist has one", async () => {
+    const playlists = usePlaylistStore();
+    playlists.summaries = [{ ...summary("a", "Morning"), artwork: "art-1" }];
+    const wrapper = mount(Sidebar, { global: { stubs: { RouterLink } } });
+    const ui = useUiStore();
+
+    await wrapper.findAll("[data-row]")[0].trigger("contextmenu");
+
+    expect(ui.contextMenu?.items?.some((item) => item.label === "Reset Image")).toBe(true);
   });
 
   /** The row's own button, for anyone who does not think to right-click. */
@@ -87,7 +111,7 @@ describe("Sidebar playlists", () => {
     if (!more) throw new Error("Missing the row's more button");
     await more.trigger("click");
 
-    expect(ui.contextMenu?.items).toHaveLength(3);
+    expect(ui.contextMenu?.items).toHaveLength(9);
   });
 
   it("asks before deleting, rather than deleting on the click", async () => {

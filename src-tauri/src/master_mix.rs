@@ -40,6 +40,15 @@ pub const MIN_BLOCK_SECS: f64 = 0.02;
 /// How far apart two blocks of the same song have to be before the second one
 /// counts as starting that song again rather than continuing it.
 pub const CHAPTER_GAP_SECS: f64 = 0.5;
+/// Tempo of a mix's grid, in beats per minute. It describes the arrangement
+/// rather than driving it: the ruler and snapping can be read in bars and
+/// beats instead of seconds, and nothing about the audio changes when it does.
+pub const DEFAULT_BPM: f64 = 120.0;
+pub const MIN_BPM: f64 = 20.0;
+pub const MAX_BPM: f64 = 300.0;
+/// Beats in a bar, for the same grid. Four unless the user says otherwise.
+pub const DEFAULT_BEATS_PER_BAR: u32 = 4;
+pub const MAX_BEATS_PER_BAR: u32 = 32;
 /// Gain range shared by lanes, blocks and automation points.
 pub const MIN_GAIN_DB: f32 = -60.0;
 pub const MAX_GAIN_DB: f32 = 12.0;
@@ -238,7 +247,7 @@ impl Lane {
 }
 
 /// The whole timeline for one playlist.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct MasterMix {
     /// Off until the user asks for it. A playlist with a master mix that is
@@ -248,9 +257,28 @@ pub struct MasterMix {
     /// Bumped by [`MasterMix::touch`] on every edit, so a rendered bounce or a
     /// cached preview can tell whether it is stale without diffing the mix.
     pub revision: u64,
+    /// The tempo the arrangement is written at. Grid only: it changes how the
+    /// ruler is read and what snapping offers, never where a block sits or
+    /// how it sounds.
+    pub bpm: f64,
+    /// Beats to a bar, for that same grid.
+    pub beats_per_bar: u32,
     pub lanes: Vec<Lane>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Default for MasterMix {
+    fn default() -> Self {
+        MasterMix {
+            enabled: false,
+            revision: 0,
+            bpm: DEFAULT_BPM,
+            beats_per_bar: DEFAULT_BEATS_PER_BAR,
+            lanes: Vec::new(),
+            extra: Map::new(),
+        }
+    }
 }
 
 impl MasterMix {
@@ -266,8 +294,7 @@ impl MasterMix {
         let mut mix = MasterMix {
             enabled: true,
             revision: 1,
-            lanes: Vec::new(),
-            extra: Map::new(),
+            ..Default::default()
         };
         let mut cursor = 0.0;
         for (index, duration) in durations.iter().enumerate().take(MAX_LANES) {
@@ -445,6 +472,12 @@ impl MasterMix {
     /// This is the only validation gate. Commands call it before saving, so
     /// the renderer downstream can assume the mix is sane.
     pub fn normalise(&mut self, entry_count: usize) {
+        self.bpm = if self.bpm.is_finite() {
+            self.bpm.clamp(MIN_BPM, MAX_BPM)
+        } else {
+            DEFAULT_BPM
+        };
+        self.beats_per_bar = self.beats_per_bar.clamp(1, MAX_BEATS_PER_BAR);
         self.lanes.truncate(MAX_LANES);
 
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -856,6 +889,43 @@ mod tests {
         assert!((block.gain_at(9.0) - db_to_gain(-12.0)).abs() < 1e-6);
         // Halfway is halfway *in decibels*, which is what a fader does.
         assert!((block.gain_at(4.0) - db_to_gain(-6.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_tempo_grid_is_clamped_and_defaults_for_a_mix_written_before_it_existed() {
+        // A file from a build with no tempo in it: the grid still has one.
+        let mut mix: MasterMix =
+            serde_json::from_str(r#"{ "enabled": true, "lanes": [] }"#).unwrap();
+        assert_eq!(mix.bpm, DEFAULT_BPM);
+        assert_eq!(mix.beats_per_bar, DEFAULT_BEATS_PER_BAR);
+
+        mix.bpm = 5_000.0;
+        mix.beats_per_bar = 0;
+        mix.normalise(0);
+        assert_eq!(mix.bpm, MAX_BPM);
+        assert_eq!(mix.beats_per_bar, 1);
+
+        mix.bpm = f64::NAN;
+        mix.normalise(0);
+        assert_eq!(mix.bpm, DEFAULT_BPM);
+    }
+
+    #[test]
+    fn the_tempo_is_a_grid_and_never_moves_a_block() {
+        let mut mix = mix_of(&[120.0, 90.0]);
+        let before: Vec<f64> = mix
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.blocks.iter().map(|b| b.start_secs))
+            .collect();
+        mix.bpm = 174.0;
+        mix.normalise(2);
+        let after: Vec<f64> = mix
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.blocks.iter().map(|b| b.start_secs))
+            .collect();
+        assert_eq!(before, after);
     }
 
     #[test]

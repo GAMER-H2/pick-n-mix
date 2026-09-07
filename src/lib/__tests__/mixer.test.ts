@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { symmetricCurve } from "../crossfadeCurve";
 import {
+  POPOVER_SECTIONS,
+  REVERB_MACRO_MAX_MIX,
   defaultBands,
   hasGain,
+  orderedSections,
   overlay,
   pitchRatio,
   presetSections,
   resolve,
+  reverbAmount,
+  reverbForAmount,
   tempoPercent,
 } from "../mixer";
 import type { MixerSettings } from "../types";
@@ -118,5 +123,99 @@ describe("varispeed", () => {
   it("expresses the tempo change as a percentage", () => {
     expect(tempoPercent({ semitones: 12, cents: 0 })).toBeCloseTo(100, 6);
     expect(tempoPercent({ semitones: 0, cents: 0 })).toBe(0);
+  });
+});
+
+/**
+ * Which controls a surface shows, and in what order.
+ *
+ * The rule that matters is the last one: a list saved before a section existed
+ * must not hide that section for ever.
+ */
+describe("section order and visibility", () => {
+  it("follows the saved order, then the defaults for anything it does not name", () => {
+    expect(orderedSections(POPOVER_SECTIONS, ["eq", "reverb"], [])).toEqual([
+      "eq",
+      "reverb",
+      "pitch",
+      "normalisation",
+      "crossfade",
+      "filters",
+    ]);
+  });
+
+  it("ignores ids it does not know, and repeats of ones it does", () => {
+    expect(orderedSections(["eq", "pitch"], ["pitch", "nonsense", "pitch"], [])).toEqual([
+      "pitch",
+      "eq",
+    ]);
+  });
+
+  it("drops the hidden ones without losing their place for the rest", () => {
+    expect(orderedSections(POPOVER_SECTIONS, ["filters"], ["pitch", "eq"])).toEqual([
+      "filters",
+      "reverb",
+      "normalisation",
+      "crossfade",
+    ]);
+    expect(orderedSections(POPOVER_SECTIONS, [], POPOVER_SECTIONS)).toEqual([]);
+  });
+});
+
+/**
+ * The popover's one reverb control.
+ *
+ * A slider that only moved the wet/dry balance made a reverb louder without
+ * making it any bigger, so this sweeps the whole effect. What matters is that
+ * every part of it opens out together, and that the slider still knows where
+ * it is afterwards.
+ */
+describe("the one-slider reverb", () => {
+  it("is off at the bottom and fully open at the top", () => {
+    const off = reverbForAmount(0);
+    expect(off.enabled).toBe(false);
+    expect(off.mix).toBe(0);
+
+    const full = reverbForAmount(1);
+    expect(full.enabled).toBe(true);
+    expect(full.mix).toBeCloseTo(REVERB_MACRO_MAX_MIX, 6);
+    expect(full.width).toBeCloseTo(1, 6);
+  });
+
+  it("grows the room and widens the tail as it rises, and opens up the top end", () => {
+    const steps = [0.2, 0.4, 0.6, 0.8, 1].map(reverbForAmount);
+    for (let i = 1; i < steps.length; i += 1) {
+      expect(steps[i].size).toBeGreaterThan(steps[i - 1].size);
+      expect(steps[i].width).toBeGreaterThan(steps[i - 1].width);
+      expect(steps[i].mix).toBeGreaterThan(steps[i - 1].mix);
+      // Damping falls: a big room that ate its own high end would sound
+      // smaller, not larger.
+      expect(steps[i].damping).toBeLessThan(steps[i - 1].damping);
+    }
+  });
+
+  it("stays inside the ranges the engine clamps to", () => {
+    for (let a = 0; a <= 1.0001; a += 0.05) {
+      const reverb = reverbForAmount(a);
+      for (const value of [reverb.size, reverb.damping, reverb.width, reverb.mix]) {
+        expect(value).toBeGreaterThanOrEqual(0);
+        expect(value).toBeLessThanOrEqual(1);
+      }
+      expect(reverb.predelayMs).toBeGreaterThanOrEqual(0);
+      expect(reverb.predelayMs).toBeLessThanOrEqual(250);
+    }
+  });
+
+  it("reads back the position it was set to", () => {
+    for (const amount of [0, 0.25, 0.5, 0.75, 1]) {
+      expect(reverbAmount(reverbForAmount(amount))).toBeCloseTo(amount, 6);
+    }
+  });
+
+  it("puts a hand-set reverb somewhere sensible, and a bypassed one at zero", () => {
+    const byHand = { enabled: true, size: 0.1, damping: 0.9, width: 0.2, mix: 1, predelayMs: 120 };
+    expect(reverbAmount(byHand)).toBe(1);
+    expect(reverbAmount({ ...byHand, enabled: false })).toBe(0);
+    expect(reverbAmount({ ...byHand, mix: 0.3 })).toBeCloseTo(0.5, 6);
   });
 });

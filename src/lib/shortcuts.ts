@@ -49,13 +49,13 @@ export const SHORTCUTS: ReadonlyArray<ShortcutDefinition> = [
   {
     id: "seekForward",
     label: "Seek forward",
-    description: "Jump five seconds ahead",
+    description: "Jump ahead by the configured skip step",
     defaults: ["ArrowRight"],
   },
   {
     id: "seekBackward",
     label: "Seek back",
-    description: "Jump five seconds back",
+    description: "Jump back by the configured skip step",
     defaults: ["ArrowLeft"],
   },
   {

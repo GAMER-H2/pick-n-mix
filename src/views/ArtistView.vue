@@ -4,10 +4,11 @@
  * of theirs in one list. Designed to sit alongside the album and playlist
  * pages, which the drawings did define.
  */
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import Artwork from "@/components/media/Artwork.vue";
 import MediaCard from "@/components/ui/MediaCard.vue";
+import SearchField from "@/components/ui/SearchField.vue";
 import CollectionHeader from "@/components/collections/CollectionHeader.vue";
 import TrackList from "@/components/collections/TrackList.vue";
 import EmptyState from "@/components/ui/EmptyState.vue";
@@ -31,7 +32,6 @@ const { loading } = useRouteParamLoader("id", async (id) => {
 
 const name = computed(() => tracks.value[0]?.albumArtist || tracks.value[0]?.artist || "Artist");
 const { count, totalDuration } = useCollectionMeta(tracks);
-const items = computed(() => tracks.value.map((track) => ({ track })));
 const context = computed<PlayContext>(() => ({
   kind: "artist",
   id: String(route.params.id),
@@ -58,13 +58,57 @@ const meta = computed(
 
 const { player, playFromList, shuffleAndPlay } = useCollectionPlayback();
 
+/** Rows are played from the filtered list, so indexes line up with what is shown. */
 function play(index: number) {
-  return playFromList(tracks.value, index, context.value);
+  return playFromList(filteredTracks.value, index, context.value);
 }
 
 function shuffle() {
   return shuffleAndPlay(() => play(0));
 }
+
+/**
+ * The search text lives in the URL, like the library's does: back and forward
+ * restore it, and typing `replace`s the current history entry rather than
+ * pushing one per keystroke. It filters only the song list below it; the album
+ * shelf stays whole.
+ */
+const query = ref(typeof route.query.q === "string" ? route.query.q : "");
+let queryTimer: number | undefined;
+
+watch(query, (value) => {
+  window.clearTimeout(queryTimer);
+  queryTimer = window.setTimeout(() => {
+    const next = { ...route.query };
+    if (value.trim()) next.q = value;
+    else delete next.q;
+    router.replace({ query: next });
+  }, 200);
+});
+
+// Arriving on a history entry that carried different text, via back or forward.
+watch(
+  () => route.query.q,
+  (value) => {
+    const incoming = typeof value === "string" ? value : "";
+    if (incoming !== query.value) query.value = incoming;
+  },
+);
+
+onBeforeUnmount(() => window.clearTimeout(queryTimer));
+
+const normalizedQuery = computed(() => query.value.trim().toLocaleLowerCase());
+const matches = computed(
+  () =>
+    (...fields: Array<string | number | null | undefined>) =>
+      !normalizedQuery.value ||
+      fields.some((field) => String(field ?? "").toLocaleLowerCase().includes(normalizedQuery.value)),
+);
+
+const filteredTracks = computed(() =>
+  tracks.value.filter((track) => matches.value(track.title, track.artist, track.album)),
+);
+const filteredItems = computed(() => filteredTracks.value.map((track) => ({ track })));
 </script>
 
 <template>
@@ -97,14 +141,18 @@ function shuffle() {
     </template>
 
     <template v-if="tracks.length">
+      <div class="artist__tools">
+        <SearchField v-model="query" placeholder="Search songs" />
+      </div>
       <h2 class="artist__heading">All Songs</h2>
       <TrackList
-        :items="items"
+        :items="filteredItems"
         :current-id="player.track?.id ?? null"
         :playing="player.playing"
         show-artwork
+        :empty-message="`No songs match “${query}”.`"
         @play="play"
-        @menu="(event, index) => { const track = tracks[index]; if (track) openMenu(event, { tracks: [track] }); }"
+        @menu="(event, index) => { const track = filteredTracks[index]; if (track) openMenu(event, { tracks: [track] }); }"
       />
     </template>
 
@@ -126,6 +174,12 @@ function shuffle() {
   font-size: 18px;
   font-weight: 600;
   letter-spacing: -0.01em;
+}
+
+.artist__tools {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 20px;
 }
 
 .artist__albums {

@@ -20,6 +20,121 @@ export const MAX_GAIN_DB = 12;
 /** How close, in pixels, a drag has to come before it snaps. */
 export const SNAP_PIXELS = 7;
 
+/*
+ * Tempo, matching the constants in `master_mix.rs`.
+ *
+ * A mix's tempo describes the arrangement; it does not drive it. Blocks are
+ * laid out in timeline seconds — that is invariant 1 of the format — so
+ * changing the BPM re-reads the ruler and the snap grid in bars and beats and
+ * changes nothing about where a block sits or how it sounds.
+ */
+export const DEFAULT_BPM = 120;
+export const MIN_BPM = 20;
+export const MAX_BPM = 300;
+export const DEFAULT_BEATS_PER_BAR = 4;
+export const MAX_BEATS_PER_BAR = 32;
+
+export function beatSecs(bpm: number): number {
+  return 60 / clamp(bpm || DEFAULT_BPM, MIN_BPM, MAX_BPM);
+}
+
+export function barSecs(bpm: number, beatsPerBar: number): number {
+  return beatSecs(bpm) * clamp(Math.round(beatsPerBar) || DEFAULT_BEATS_PER_BAR, 1, MAX_BEATS_PER_BAR);
+}
+
+/**
+ * Spacing between labelled ruler marks on a musical grid, from a ladder that
+ * only ever lands on a division a musician would count: quarter and half
+ * beats when zoomed right in, then beats, then whole bars.
+ */
+export function beatRulerStep(
+  pixelsPerSecond: number,
+  bpm: number,
+  beatsPerBar: number,
+): number {
+  const beat = beatSecs(bpm);
+  const bar = barSecs(bpm, beatsPerBar);
+  const ladder = [
+    beat / 4,
+    beat / 2,
+    beat,
+    bar,
+    bar * 2,
+    bar * 4,
+    bar * 8,
+    bar * 16,
+    bar * 32,
+  ];
+  const wanted = 90 / Math.max(pixelsPerSecond, 0.01);
+  return ladder.find((step) => step >= wanted) ?? ladder[ladder.length - 1];
+}
+
+/**
+ * The unlabelled division inside a labelled one: beats inside a bar, or half
+ * of whatever sub-beat division is already showing.
+ */
+export function beatMinorStep(stepSecs: number, bpm: number, beatsPerBar: number): number {
+  const beat = beatSecs(bpm);
+  return stepSecs >= barSecs(bpm, beatsPerBar) - 1e-9 ? beat : stepSecs / 2;
+}
+
+/**
+ * "9.3" — bar and beat, both counted from one, as every DAW numbers them.
+ * `withTicks` adds the sixteenth within the beat, for zoom levels whose marks
+ * are closer together than a beat and would otherwise all read the same.
+ */
+export function barsBeats(
+  secs: number,
+  bpm: number,
+  beatsPerBar: number,
+  withTicks = false,
+): string {
+  const beat = beatSecs(bpm);
+  const perBar = clamp(Math.round(beatsPerBar) || DEFAULT_BEATS_PER_BAR, 1, MAX_BEATS_PER_BAR);
+  const beats = Math.max(0, secs) / beat;
+  // Nudged before flooring: a mark *at* a beat can land a hair under it in
+  // floating point and would then be numbered as the beat before.
+  const total = Math.floor(beats + 1e-6);
+  const bar = Math.floor(total / perBar) + 1;
+  const beatInBar = (total % perBar) + 1;
+  if (!withTicks) return `${bar}.${beatInBar}`;
+  const tick = Math.floor((beats - total) * 4 + 1e-6) + 1;
+  return `${bar}.${beatInBar}.${tick}`;
+}
+
+/** "1 bar", "1 beat", "1/2 beat" — how far apart the grid marks are. */
+export function gridDivisionLabel(stepSecs: number, bpm: number, beatsPerBar: number): string {
+  const beat = beatSecs(bpm);
+  const bar = barSecs(bpm, beatsPerBar);
+  if (stepSecs >= bar - 1e-9) {
+    const bars = Math.round(stepSecs / bar);
+    return bars === 1 ? "1 bar" : `${bars} bars`;
+  }
+  if (stepSecs >= beat - 1e-9) {
+    const beats = Math.round(stepSecs / beat);
+    return beats === 1 ? "1 beat" : `${beats} beats`;
+  }
+  return `1/${Math.round(beat / stepSecs)} beat`;
+}
+
+/** Set the tempo, clamped the way the backend will clamp it anyway. */
+export function withTempo(
+  mix: MasterMix,
+  patch: { bpm?: number; beatsPerBar?: number },
+): MasterMix {
+  const bpm = patch.bpm === undefined ? mix.bpm : patch.bpm;
+  const beatsPerBar = patch.beatsPerBar === undefined ? mix.beatsPerBar : patch.beatsPerBar;
+  return {
+    ...mix,
+    bpm: clamp(Number.isFinite(bpm) ? bpm : DEFAULT_BPM, MIN_BPM, MAX_BPM),
+    beatsPerBar: clamp(
+      Math.round(Number.isFinite(beatsPerBar) ? beatsPerBar : DEFAULT_BEATS_PER_BAR),
+      1,
+      MAX_BEATS_PER_BAR,
+    ),
+  };
+}
+
 export function newId(prefix: string): string {
   const random =
     typeof crypto !== "undefined" && "randomUUID" in crypto

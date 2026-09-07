@@ -27,9 +27,15 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   MAX_GAIN_DB,
   MIN_GAIN_DB,
+  MAX_BEATS_PER_BAR,
+  MAX_BPM,
+  MIN_BPM,
   SNAP_PIXELS,
   addAutomationPoint,
   addLane,
+  barsBeats,
+  beatMinorStep,
+  beatRulerStep,
   cloneMix,
   curveFromMidGain,
   deleteBlocks,
@@ -42,6 +48,7 @@ import {
   placeAsset,
   removeAutomationPoint,
   removeLane,
+  gridDivisionLabel,
   rulerStep,
   setAutomationCurve,
   snapCandidates,
@@ -95,7 +102,25 @@ const pps = computed(() => store.pixelsPerSecond);
 const laneHeight = computed(() => store.laneHeight);
 const contentSecs = computed(() => Math.max(store.duration, 30) + TAIL_SECS);
 const contentWidth = computed(() => contentSecs.value * pps.value);
-const step = computed(() => rulerStep(pps.value));
+/**
+ * Whether the ruler is counting the mix's bars and beats rather than seconds.
+ *
+ * The tempo is only ever a way of reading the timeline: blocks stay where they
+ * are in seconds either way, and switching this changes the marks above the
+ * tracks and what the grid offers to snap to, nothing else.
+ */
+const inBars = computed(() => store.rulerMode === "bars");
+const step = computed(() =>
+  inBars.value
+    ? beatRulerStep(pps.value, mix.value.bpm, mix.value.beatsPerBar)
+    : rulerStep(pps.value),
+);
+/** The finer, unlabelled division: beats inside bars, or quarters of a second mark. */
+const minorStep = computed(() =>
+  inBars.value
+    ? beatMinorStep(step.value, mix.value.bpm, mix.value.beatsPerBar)
+    : step.value / 4,
+);
 /**
  * The lane colour picker.
  *
@@ -133,8 +158,17 @@ function toggleColorPicker(laneIndex: number, event: MouseEvent) {
 
 const ticks = computed(() => {
   const out: { secs: number; label: string }[] = [];
+  // A mark closer together than a beat would number every one of them the
+  // same, so those zoom levels count sixteenths as well.
+  const withTicks =
+    inBars.value && step.value < 60 / Math.max(mix.value.bpm, MIN_BPM) - 1e-9;
   for (let t = 0; t <= contentSecs.value; t += step.value) {
-    out.push({ secs: t, label: formatDuration(t) });
+    out.push({
+      secs: t,
+      label: inBars.value
+        ? barsBeats(t, mix.value.bpm, mix.value.beatsPerBar, withTicks)
+        : formatDuration(t),
+    });
   }
   return out;
 });
@@ -146,10 +180,10 @@ const ticks = computed(() => {
  * start being a grey band.
  */
 const minorTicks = computed(() => {
-  const spacing = (step.value / 4) * pps.value;
+  const spacing = minorStep.value * pps.value;
   if (spacing < 12) return [];
   const out: number[] = [];
-  for (let t = step.value / 4; t <= contentSecs.value; t += step.value / 4) {
+  for (let t = minorStep.value; t <= contentSecs.value; t += minorStep.value) {
     if (Math.abs(t / step.value - Math.round(t / step.value)) > 1e-6) out.push(t);
   }
   return out;
@@ -160,11 +194,23 @@ const minorTicks = computed(() => {
  * is, so "snap to the second points above the tracks" means the marks the user
  * can actually see rather than a hidden grid of its own.
  */
-const gridSecs = computed(() => (minorTicks.value.length > 0 ? step.value / 4 : step.value));
-/** "0.25s", "2s", "1:00" — how far apart those marks currently are. */
-const gridLabel = computed(() =>
-  gridSecs.value < 60 ? `${Number(gridSecs.value.toFixed(2))}s` : formatDuration(gridSecs.value),
+const gridSecs = computed(() =>
+  minorTicks.value.length > 0 ? minorStep.value : step.value,
 );
+/** "0.25s", "2s", "1:00", "1 beat" — how far apart those marks currently are. */
+const gridLabel = computed(() => {
+  if (inBars.value) return gridDivisionLabel(gridSecs.value, mix.value.bpm, mix.value.beatsPerBar);
+  return gridSecs.value < 60
+    ? `${Number(gridSecs.value.toFixed(2))}s`
+    : formatDuration(gridSecs.value);
+});
+
+/** Committed on change rather than per keystroke, so undo has whole values. */
+function onTempoInput(event: Event, key: "bpm" | "beatsPerBar") {
+  const value = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(value)) return;
+  store.setTempo({ [key]: value });
+}
 
 /**
  * Everything a gesture may snap to.
@@ -1421,6 +1467,48 @@ const summary = computed(() => {
 
         <span class="mm__divider" />
 
+        <!-- The mix's own tempo. It reads the timeline; it does not move it:
+             blocks stay exactly where they are in seconds, and only the marks
+             above them and what the grid snaps to change. -->
+        <div class="mm__tempo" role="group" aria-label="Mix tempo">
+          <input
+            class="mm__number"
+            type="number"
+            :value="Math.round(mix.bpm)"
+            :min="MIN_BPM"
+            :max="MAX_BPM"
+            step="1"
+            aria-label="Tempo in beats per minute"
+            title="The tempo this mix is written at, for the bars and beats ruler"
+            @change="onTempoInput($event, 'bpm')"
+          />
+          <span class="mm__tempo-unit">BPM</span>
+          <input
+            class="mm__number mm__number--narrow"
+            type="number"
+            :value="mix.beatsPerBar"
+            min="1"
+            :max="MAX_BEATS_PER_BAR"
+            step="1"
+            aria-label="Beats in a bar"
+            title="Beats in a bar"
+            @change="onTempoInput($event, 'beatsPerBar')"
+          />
+          <span class="mm__tempo-unit">/bar</span>
+          <button
+            class="mm__toggle"
+            type="button"
+            :class="{ 'is-on': store.rulerMode === 'bars' }"
+            :aria-pressed="store.rulerMode === 'bars'"
+            title="Read the ruler in bars and beats instead of minutes and seconds"
+            @click="store.rulerMode = store.rulerMode === 'bars' ? 'time' : 'bars'"
+          >
+            Bars
+          </button>
+        </div>
+
+        <span class="mm__divider" />
+
         <div class="mm__zoom-group" role="group" aria-label="Timeline zoom">
           <span>Time</span>
           <button class="icon-button" type="button" aria-label="Zoom timeline out" @click="zoomTime(1 / 1.4)">
@@ -1891,6 +1979,45 @@ const summary = computed(() => {
   color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* The tempo group: two small number fields reading like the zoom groups
+   around them, and the ruler toggle that uses them. */
+.mm__tempo {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mm__tempo-unit {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mm__number {
+  width: 46px;
+  height: 22px;
+  padding: 0 4px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.mm__number--narrow {
+  width: 34px;
+}
+
+.mm__number::-webkit-outer-spin-button,
+.mm__number::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 .mm__spacer {

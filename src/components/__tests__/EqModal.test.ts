@@ -1,16 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { mount, type VueWrapper } from "@vue/test-utils";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import EqModal from "../mixer/EqModal.vue";
 import { defaultBands } from "@/lib/mixer";
-import type { Eq } from "@/lib/types";
+import type { Eq, EqBand } from "@/lib/types";
 
 const setAnalyserEnabled = vi.fn();
 const analyserFrame = vi.fn();
+const setEqSolo = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   setAnalyserEnabled: (...args: unknown[]) => setAnalyserEnabled(...args),
   analyserFrame: (...args: unknown[]) => analyserFrame(...args),
+  setEqSolo: (...args: unknown[]) => setEqSolo(...args),
 }));
 
 function eq(overrides: Partial<Eq> = {}): Eq {
@@ -63,6 +65,7 @@ describe("EqModal", () => {
       maxHz: 20000,
       floorDb: -90,
     });
+    setEqSolo.mockReset().mockResolvedValue(undefined);
   });
 
   it("draws a node per band", () => {
@@ -198,6 +201,80 @@ describe("EqModal", () => {
     expect(next.enabled).toBe(false);
     expect(next.bands).toHaveLength(8);
     wrapper.unmount();
+  });
+
+  /**
+   * The solo is a momentary audition, so what matters is that every way a
+   * press can end puts the output back.
+   */
+  describe("band solo", () => {
+    /** happy-dom has no pointer capture, which the hold relies on. */
+    function stubCapture(button: HTMLElement) {
+      button.setPointerCapture = () => {};
+      button.releasePointerCapture = () => {};
+    }
+
+    it("holds a band's range while the button is pressed", async () => {
+      const wrapper = mountModal();
+      const solo = wrapper.findAll(".band__solo")[2];
+      stubCapture(solo.element as HTMLElement);
+
+      await solo.trigger("pointerdown", { pointerId: 1 });
+      expect(setEqSolo).toHaveBeenCalledWith(defaultBands()[2]);
+      expect(solo.classes()).toContain("is-on");
+      expect(solo.attributes("aria-pressed")).toBe("true");
+
+      await solo.trigger("pointerup", { pointerId: 1 });
+      await flushPromises();
+      expect(setEqSolo).toHaveBeenLastCalledWith(null);
+      expect(solo.classes()).not.toContain("is-on");
+      wrapper.unmount();
+    });
+
+    it("holds on Space and releases on key up", async () => {
+      const wrapper = mountModal();
+      const solo = wrapper.findAll(".band__solo")[1];
+
+      await solo.trigger("keydown", { key: " " });
+      expect(setEqSolo).toHaveBeenCalledWith(defaultBands()[1]);
+      // Auto-repeat must not re-send the same band over and over.
+      await solo.trigger("keydown", { key: " " });
+      expect(setEqSolo).toHaveBeenCalledTimes(1);
+
+      await solo.trigger("keyup", { key: " " });
+      await flushPromises();
+      expect(setEqSolo).toHaveBeenLastCalledWith(null);
+      wrapper.unmount();
+    });
+
+    it("releases when the editor closes mid-press", async () => {
+      const wrapper = mountModal();
+      const solo = wrapper.findAll(".band__solo")[0];
+      stubCapture(solo.element as HTMLElement);
+
+      await solo.trigger("pointerdown", { pointerId: 1 });
+      wrapper.unmount();
+      await flushPromises();
+      expect(setEqSolo).toHaveBeenLastCalledWith(null);
+    });
+
+    it("re-aims at the band as it is edited under the hold", async () => {
+      const wrapper = mountModal();
+      stubPlotBox(wrapper);
+      const solo = wrapper.findAll(".band__solo")[1];
+      stubCapture(solo.element as HTMLElement);
+
+      await solo.trigger("pointerdown", { pointerId: 1 });
+      const node = wrapper.findAll(".node")[1];
+      await node.trigger("pointerdown", { pointerId: 2 });
+      await node.trigger("pointermove", { pointerId: 2, clientX: 500, clientY: 100 });
+
+      await wrapper.setProps({ eq: lastChange(wrapper) });
+      await flushPromises();
+      const aimed = setEqSolo.mock.calls[setEqSolo.mock.calls.length - 1][0] as EqBand;
+      expect(aimed.freq).toBe(lastChange(wrapper).bands[1].freq);
+      wrapper.unmount();
+    });
   });
 
   it("applies an EQ-only preset", async () => {

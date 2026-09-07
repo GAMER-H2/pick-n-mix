@@ -12,6 +12,35 @@ export interface AppPreferences {
   keepReverbOnPause: boolean;
   /** Output device by name; empty means the system default. */
   outputDevice: string;
+  /** How far into a track "previous" restarts it instead of going back. */
+  previousRestartSecs: number;
+  /** Seconds the skip commands (player bar buttons and keyboard) move by. */
+  seekStepSecs: number;
+  /** Keep ambience beds sounding while playback is paused or stopped. */
+  ambienceWithoutPlayback: boolean;
+  /** Crossfade the full-screen artwork and backdrop between tracks. */
+  crossfadeArt: boolean;
+  /**
+   * Scroll the queue to the song that has just started playing, when it is
+   * not already on screen.
+   */
+  queueFollowsCurrent: boolean;
+  /**
+   * Mixer sections hidden from the sidebar panel, by section id. Empty — the
+   * default — shows all of them, and only the sidebar honours this: the master
+   * mixer's block panel and the preset editor always show everything.
+   */
+  hiddenMixerSections: string[];
+  /**
+   * The same, for the compact mixer popover, which has its own shorter list of
+   * controls and so its own choice of what to show.
+   */
+  hiddenPopoverSections: string[];
+  /**
+   * The order the popover lists its sections in, by id. Ids that are not in
+   * here follow in the popover's own default order.
+   */
+  popoverSectionOrder: string[];
   mixLength: number;
   replayDays: number;
   replayMinPlays: number;
@@ -408,6 +437,14 @@ export interface MasterMix {
   enabled: boolean;
   /** Bumped on every saved edit, so caches can tell they are stale. */
   revision: number;
+  /**
+   * The tempo the arrangement is written at. Grid only: it changes how the
+   * ruler is read and what snapping offers, never where a block sits or how
+   * it sounds.
+   */
+  bpm: number;
+  /** Beats to a bar, for that same grid. */
+  beatsPerBar: number;
   lanes: MixLane[];
   [extra: string]: unknown;
 }

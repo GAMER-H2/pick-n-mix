@@ -18,19 +18,34 @@ import PresetSelect from "./PresetSelect.vue";
 import FilterGrid from "./FilterGrid.vue";
 import SectionHeader from "./SectionHeader.vue";
 import CrossfadeGraph from "./CrossfadeGraph.vue";
-import { audibleMix, defaultBands, tempoPercent } from "@/lib/mixer";
+import { audibleMix, defaultBands, tempoPercent, SECTION_LABELS } from "@/lib/mixer";
 import { formatHz, semitonesLabel } from "@/lib/format";
 import { formatSeconds } from "@/lib/crossfadeCurve";
 import { withCrossfadeLength } from "@/lib/crossfadeCurve";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
 import { usePresetEditorStore } from "@/stores/presetEditor";
+import { useSettingsStore } from "@/stores/settings";
 import { useUiStore } from "@/stores/ui";
 import type { Section } from "@/lib/mixer";
 import type { CrossfadeCurve, Eq, MixerSettings, PanningMode } from "@/lib/types";
 
-const props = withDefaults(defineProps<{ mode?: "live" | "preset" }>(), { mode: "live" });
+const props = withDefaults(
+  defineProps<{
+    mode?: "live" | "preset";
+    /**
+     * Whether this panel is the sidebar, whose section list the user can trim
+     * in Settings ▸ Mixer. The master mixer's block panel and the preset
+     * editor always show everything they can edit: a section hidden from the
+     * sidebar is still part of a preset, and hiding it there would leave a
+     * saved setting with nothing to change it back with.
+     */
+    customisable?: boolean;
+  }>(),
+  { mode: "live", customisable: false },
+);
 const mixer = useMixerStore();
+const settings = useSettingsStore();
 const player = usePlayerStore();
 const presetEditor = usePresetEditorStore();
 const ui = useUiStore();
@@ -51,6 +66,17 @@ const isBlockTarget = computed(() => !isPreset.value && mixer.target.kind === "b
 const canEditCrossfade = computed(
   () => isPreset.value || (mixer.target.kind !== "entry" && mixer.target.kind !== "block"),
 );
+
+/**
+ * Whether a section is drawn at all.
+ *
+ * Hiding is a sidebar-only preference and never touches the settings
+ * themselves: a hidden section keeps whatever it was set to, and showing it
+ * again brings the same values back.
+ */
+function sectionShown(section: Section): boolean {
+  return !props.customisable || !settings.preferences.hiddenMixerSections.includes(section);
+}
 
 const MAX_CROSSFADE_SECS = 12;
 const crossfadeSettings = computed(() => fx.value.crossfade);
@@ -228,9 +254,9 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </p>
 
       <!-- EQ ---------------------------------------------------------------->
-      <section class="panel__section">
+      <section v-if="sectionShown('eq')" class="panel__section">
         <SectionHeader
-          title="EQ"
+          :title="SECTION_LABELS.eq"
           :overridden="overridden('eq')"
           :can-override="canOverride && !isEqPreset"
           @clear="clearSection('eq')"
@@ -253,9 +279,9 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       <template v-if="!isEqPreset">
 
       <!-- Pitch ------------------------------------------------------------->
-      <section class="panel__section">
+      <section v-if="sectionShown('pitch')" class="panel__section">
         <SectionHeader
-          title="Pitch"
+          :title="SECTION_LABELS.pitch"
           :overridden="overridden('pitch')"
           :can-override="canOverride"
           @clear="clearSection('pitch')"
@@ -281,9 +307,9 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </section>
 
       <!-- Reverb ------------------------------------------------------------>
-      <section class="panel__section">
+      <section v-if="sectionShown('reverb')" class="panel__section">
         <SectionHeader
-          title="Reverb"
+          :title="SECTION_LABELS.reverb"
           :overridden="overridden('reverb')"
           :can-override="canOverride"
           @clear="clearSection('reverb')"
@@ -337,9 +363,9 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </section>
 
       <!-- Delay ------------------------------------------------------------->
-      <section class="panel__section">
+      <section v-if="sectionShown('delay')" class="panel__section">
         <SectionHeader
-          title="Delay"
+          :title="SECTION_LABELS.delay"
           :overridden="overridden('delay')"
           :can-override="canOverride"
           @clear="clearSection('delay')"
@@ -396,9 +422,9 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </section>
 
       <!-- Normalisation ----------------------------------------------------->
-      <section class="panel__section">
+      <section v-if="sectionShown('normalisation')" class="panel__section">
         <SectionHeader
-          title="Normalisation"
+          :title="SECTION_LABELS.normalisation"
           :overridden="overridden('normalisation')"
           :can-override="canOverride"
           @clear="clearSection('normalisation')"
@@ -476,9 +502,9 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </section>
 
       <!-- Panning ----------------------------------------------------------->
-      <section class="panel__section" data-testid="panning-section">
+      <section v-if="sectionShown('panning')" class="panel__section" data-testid="panning-section">
         <SectionHeader
-          title="Panning"
+          :title="SECTION_LABELS.panning"
           :overridden="overridden('panning')"
           :can-override="canOverride"
           @clear="clearSection('panning')"
@@ -511,9 +537,9 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </section>
 
       <!-- Crossfade ----------------------------------------------------------->
-      <section v-if="canEditCrossfade" class="panel__section">
+      <section v-if="canEditCrossfade && sectionShown('crossfade')" class="panel__section">
         <SectionHeader
-          title="Crossfade"
+          :title="SECTION_LABELS.crossfade"
           :overridden="overridden('crossfade')"
           :can-override="canOverride"
           @clear="clearSection('crossfade')"
@@ -551,9 +577,9 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </section>
 
       <!-- Atmospheres ------------------------------------------------------->
-      <section class="panel__section">
+      <section v-if="sectionShown('filters')" class="panel__section">
         <SectionHeader
-          title="Atmospheres"
+          :title="SECTION_LABELS.filters"
           :overridden="overridden('filters')"
           :can-override="canOverride"
           @clear="clearSection('filters')"
@@ -571,9 +597,9 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
       </section>
 
       <!-- Sample rate ------------------------------------------------------->
-      <section class="panel__section">
+      <section v-if="sectionShown('lofi')" class="panel__section">
         <SectionHeader
-          title="Sample Rate"
+          :title="SECTION_LABELS.lofi"
           :overridden="overridden('lofi')"
           :can-override="canOverride"
           @clear="clearSection('lofi')"

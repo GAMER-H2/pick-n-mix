@@ -148,7 +148,9 @@ pub const SETTING_WINDOW: &str = "window.geometry";
 /// into [`SETTING_GLOBAL_MIXER`] when that mixer has no crossfade section.
 pub const SETTING_CROSSFADE: &str = "crossfade.global";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// `Eq` was dropped when `previous_restart_secs`/`seek_step_secs` (f64) were
+// added: floats cannot be `Eq`, and nothing requires it.
 #[serde(rename_all = "camelCase", default)]
 pub struct AppPreferences {
     pub theme: String,
@@ -158,6 +160,31 @@ pub struct AppPreferences {
     pub keep_reverb_on_pause: bool,
     /// Output device to use, by name. Empty means the system default.
     pub output_device: String,
+    /// How long into a track the previous command restarts it rather than
+    /// going back. Zero means previous always goes back a track.
+    pub previous_restart_secs: f64,
+    /// How many seconds the skip commands — the player bar's buttons and the
+    /// keyboard shortcuts — move by.
+    pub seek_step_secs: f64,
+    /// Keep ambience beds sounding while playback is paused or stopped.
+    pub ambience_without_playback: bool,
+    /// Crossfade the full-screen artwork and backdrop between tracks.
+    pub crossfade_art: bool,
+    /// Scroll the queue to the song that has just started playing, when it is
+    /// not already on screen.
+    pub queue_follows_current: bool,
+    /// Mixer sections the user has hidden from the sidebar panel, by section
+    /// id. Empty — the default — shows all of them. Only the sidebar honours
+    /// this: the master mixer's block panel and the preset editor always show
+    /// everything they can edit.
+    pub hidden_mixer_sections: Vec<String>,
+    /// The same, for the compact mixer popover, which has its own shorter list
+    /// of controls and so its own choice of what to show.
+    pub hidden_popover_sections: Vec<String>,
+    /// The order the popover lists its sections in, by id. Ids that are not in
+    /// here — anything added by a later version — follow in the popover's own
+    /// default order.
+    pub popover_section_order: Vec<String>,
     pub mix_length: usize,
     pub replay_days: u32,
     pub replay_min_plays: u32,
@@ -182,6 +209,14 @@ impl Default for AppPreferences {
             fade_mode: "off".into(),
             keep_reverb_on_pause: false,
             output_device: String::new(),
+            previous_restart_secs: 3.0,
+            seek_step_secs: 10.0,
+            ambience_without_playback: false,
+            crossfade_art: true,
+            queue_follows_current: true,
+            hidden_mixer_sections: Vec::new(),
+            hidden_popover_sections: Vec::new(),
+            popover_section_order: Vec::new(),
             mix_length: 50,
             replay_days: 30,
             replay_min_plays: 2,
@@ -215,6 +250,11 @@ impl AppPreferences {
         self.archive_days = self.archive_days.clamp(1, 3_650);
         self.archive_min_plays = self.archive_min_plays.clamp(1, 100);
         self.discover_max_plays = self.discover_max_plays.clamp(1, 100);
+        self.previous_restart_secs = self.previous_restart_secs.clamp(0.0, 60.0);
+        self.seek_step_secs = self.seek_step_secs.clamp(1.0, 60.0);
+        deduplicate_non_empty(&mut self.hidden_mixer_sections);
+        deduplicate_non_empty(&mut self.hidden_popover_sections);
+        deduplicate_non_empty(&mut self.popover_section_order);
         deduplicate_non_empty(&mut self.hidden_built_in_preset_ids);
         deduplicate_non_empty(&mut self.hidden_built_in_filter_ids);
         deduplicate_non_empty(&mut self.playlist_order);
@@ -314,6 +354,7 @@ impl AppState {
         let preferences = load_app_preferences(&db);
         engine.set_fade_mode(&preferences.fade_mode);
         engine.set_keep_tail(preferences.keep_reverb_on_pause);
+        engine.set_ambience_alone(preferences.ambience_without_playback);
         // A device that has since been unplugged simply falls back to the
         // system default rather than leaving the app with no audio.
         if !preferences.output_device.is_empty() {
@@ -600,6 +641,9 @@ mod tests {
         assert_eq!(json["fadeMode"], "off");
         assert!(json.get("fadePausePlay").is_none());
         assert_eq!(json["mixLength"], 50);
+        assert_eq!(json["previousRestartSecs"], 3.0);
+        assert_eq!(json["seekStepSecs"], 10.0);
+        assert_eq!(json["ambienceWithoutPlayback"], false);
         assert_eq!(json["discoverMaxPlays"], 3);
         assert_eq!(json["hiddenBuiltInPresetIds"], serde_json::json!([]));
         assert_eq!(json["hiddenBuiltInFilterIds"], serde_json::json!([]));
@@ -617,7 +661,10 @@ mod tests {
         .validated();
 
         let json = serde_json::to_value(&preferences).unwrap();
-        assert_eq!(json["shortcuts"]["playPause"], serde_json::json!(["Ctrl+Space"]));
+        assert_eq!(
+            json["shortcuts"]["playPause"],
+            serde_json::json!(["Ctrl+Space"])
+        );
         assert_eq!(json["playlistOrder"], serde_json::json!(["pl-b", "pl-a"]));
     }
 
@@ -628,7 +675,14 @@ mod tests {
         shortcuts.insert("nextTrack".to_string(), vec![String::new(), "  ".into()]);
         shortcuts.insert(
             "playPause".to_string(),
-            vec!["A".into(), "A".into(), "B".into(), "C".into(), "D".into(), "E".into()],
+            vec![
+                "A".into(),
+                "A".into(),
+                "B".into(),
+                "C".into(),
+                "D".into(),
+                "E".into(),
+            ],
         );
         let preferences = AppPreferences {
             shortcuts,
@@ -697,6 +751,27 @@ mod tests {
         assert_eq!(preferences.mix_length, 50);
         assert!(preferences.hidden_built_in_preset_ids.is_empty());
         assert!(preferences.hidden_built_in_filter_ids.is_empty());
+    }
+
+    #[test]
+    fn seek_and_restart_thresholds_are_clamped() {
+        let preferences = AppPreferences {
+            previous_restart_secs: -1.0,
+            seek_step_secs: 0.0,
+            ..AppPreferences::default()
+        }
+        .validated();
+        assert_eq!(preferences.previous_restart_secs, 0.0);
+        assert_eq!(preferences.seek_step_secs, 1.0);
+
+        let preferences = AppPreferences {
+            previous_restart_secs: f64::MAX,
+            seek_step_secs: f64::MAX,
+            ..AppPreferences::default()
+        }
+        .validated();
+        assert_eq!(preferences.previous_restart_secs, 60.0);
+        assert_eq!(preferences.seek_step_secs, 60.0);
     }
 
     #[test]

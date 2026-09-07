@@ -123,6 +123,21 @@ const DEFS = {
     d: ["M3.6 6.4h11.2", "M3.6 12h11.2", "M3.6 17.6h7"],
     circles: [{ cx: 18.6, cy: 16.2, r: 2.6 }],
   },
+  // Where the playing song is in the list: the marks of a queue with a target
+  // ring over the row the crosshair's arms point at.
+  locateCurrent: {
+    mode: "stroke",
+    d: [
+      "M3.4 6.6h7.2",
+      "M3.4 12h4.6",
+      "M3.4 17.4h7.2",
+      "M15.4 12h-1.9",
+      "M22 12h-1.9",
+      "M18.7 8.7V6.8",
+      "M18.7 17.2v-1.9",
+    ],
+    circles: [{ cx: 18.7, cy: 12, r: 3.1 }],
+  },
   // The top line is the short one: it stands for the new "next" slot, and the
   // hook curves up from below to point straight at it — inserted right after
   // what's currently playing, not appended at the end.

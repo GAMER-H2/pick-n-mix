@@ -24,8 +24,8 @@ import type { useUiStore } from "@/stores/ui";
 type Player = ReturnType<typeof usePlayerStore>;
 type Ui = ReturnType<typeof useUiStore>;
 
-/** How far the seek keys jump, and how much the volume keys move. */
-const SEEK_SECONDS = 5;
+/** How much the volume keys move. The seek step is a preference instead. */
+const DEFAULT_SEEK_SECONDS = 10;
 const VOLUME_STEP = 0.05;
 
 function isTyping(target: EventTarget | null): boolean {
@@ -45,6 +45,8 @@ export interface ShortcutOptions {
   isSuspended?: () => boolean;
   /** The user's rebindings, read on every press so changes apply at once. */
   bindings?: () => Record<string, string[]>;
+  /** How far the seek keys jump, read on every press like the bindings. */
+  seekStep?: () => number;
 }
 
 export function installShortcuts(
@@ -86,10 +88,10 @@ export function installShortcuts(
         await player.previous();
         break;
       case "seekForward":
-        await player.seek(Math.min(player.duration, player.position + SEEK_SECONDS));
+        await player.seek(Math.min(player.duration, player.position + (options.seekStep?.() ?? DEFAULT_SEEK_SECONDS)));
         break;
       case "seekBackward":
-        await player.seek(Math.max(0, player.position - SEEK_SECONDS));
+        await player.seek(Math.max(0, player.position - (options.seekStep?.() ?? DEFAULT_SEEK_SECONDS)));
         break;
       case "volumeUp":
         await player.setVolume(Math.min(1, player.snapshot.volume + VOLUME_STEP));

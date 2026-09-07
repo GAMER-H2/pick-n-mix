@@ -166,6 +166,7 @@ async function poll() {
 }
 
 onMounted(async () => {
+  window.addEventListener("blur", endSolo);
   try {
     await api.setAnalyserEnabled(true);
   } catch {
@@ -177,8 +178,84 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   stopped = true;
   if (frame !== null) cancelAnimationFrame(frame);
+  window.removeEventListener("blur", endSolo);
+  // Closing mid-press must not leave the output narrowed.
+  endSolo();
   void api.setAnalyserEnabled(false).catch(() => {});
 });
+
+// -- band solo ---------------------------------------------------------------
+
+/*
+ * Hold-to-listen preview of one band's own range, as Pro-Q does it: while the
+ * button is held the engine narrows the master bus to whatever that band acts
+ * on — a pass around a peak's frequency, or the whole side of a shelf's or
+ * pass filter's corner — so its effect can be judged without the rest of the
+ * spectrum masking it.
+ *
+ * Held rather than latched, so the audition cannot outlive the press. Release
+ * is therefore wired to every way a press can end: pointer up or cancel (the
+ * pointer is captured, so a release anywhere still lands here), key up, the
+ * button losing focus, the window losing focus, and unmount.
+ *
+ * The engine is told over a serialised chain rather than fire-and-forget:
+ * press and release are two commands that must not be allowed to arrive out
+ * of order, or a quick tap would leave the output narrowed for good.
+ */
+const soloed = ref<number | null>(null);
+let soloChain: Promise<unknown> = Promise.resolve();
+/** What the engine was last told, so an unchanged band is not re-sent. */
+let soloSent: string | null = null;
+
+function sendSolo(band: EqBand | null) {
+  const next = band === null ? null : JSON.stringify(band);
+  if (next === soloSent) return;
+  soloSent = next;
+  soloChain = soloChain.then(() => api.setEqSolo(band)).catch(() => {});
+}
+
+function startSolo(index: number) {
+  if (soloed.value === index) return;
+  soloed.value = index;
+  selected.value = index;
+  sendSolo(props.eq.bands[index]);
+}
+
+function endSolo() {
+  if (soloed.value === null) return;
+  soloed.value = null;
+  sendSolo(null);
+}
+
+function onSoloDown(event: PointerEvent, index: number) {
+  event.preventDefault();
+  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  startSolo(index);
+}
+
+/** Space and Enter hold the same way the pointer does, repeats included. */
+function onSoloKeyDown(event: KeyboardEvent, index: number) {
+  if (event.key !== " " && event.key !== "Enter") return;
+  event.preventDefault();
+  startSolo(index);
+}
+
+function onSoloKeyUp(event: KeyboardEvent) {
+  if (event.key !== " " && event.key !== "Enter") return;
+  endSolo();
+}
+
+// A band edited while it is being auditioned re-aims the filter, so dragging
+// a node with the solo held tracks what is heard.
+watch(
+  () => (soloed.value === null ? null : props.eq.bands[soloed.value]),
+  (band) => {
+    if (soloed.value === null) return;
+    if (band) sendSolo(band);
+    else endSolo();
+  },
+  { deep: true },
+);
 
 // -- editing -----------------------------------------------------------------
 
@@ -264,6 +341,7 @@ watch(
   () => props.eq.bands.length,
   (length) => {
     if (selected.value >= length) selected.value = Math.max(0, length - 1);
+    if (soloed.value !== null && soloed.value >= length) endSolo();
   },
 );
 
@@ -362,7 +440,11 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
             :key="band.index"
             :d="band.d"
             class="plot__band"
-            :class="{ 'is-selected': band.index === selected }"
+            :class="{
+              'is-selected': band.index === selected,
+              'is-soloed': band.index === soloed,
+              'is-dimmed': soloed !== null && band.index !== soloed,
+            }"
             :stroke="band.colour"
             vector-effect="non-scaling-stroke"
           />
@@ -428,6 +510,23 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
               @click.stop="patchBand(index, { enabled: !band.enabled })"
             >
               <span class="band__swatch" />
+            </button>
+            <button
+              class="band__solo"
+              type="button"
+              :class="{ 'is-on': soloed === index }"
+              :aria-pressed="soloed === index"
+              :aria-label="`Hold to solo band ${index + 1}`"
+              title="Hold to hear only this band's range"
+              @pointerdown="onSoloDown($event, index)"
+              @pointerup="endSolo"
+              @pointercancel="endSolo"
+              @keydown="onSoloKeyDown($event, index)"
+              @keyup="onSoloKeyUp"
+              @blur="endSolo"
+              @click.stop
+            >
+              S
             </button>
             <button
               v-if="eq.bands.length > 1"
@@ -498,6 +597,7 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
       <footer class="eq-modal__foot">
         <p class="eq-modal__hint">
           Drag a node to move it, scroll over it for Q, double-click to flatten it.
+          Hold a band's S to hear only the range it acts on.
         </p>
         <div class="eq-modal__preamp">
           <label>Preamp</label>
@@ -612,6 +712,17 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
   opacity: 0.85;
 }
 
+/* While a band is auditioned on its own, the graph says which one: its curve
+   comes forward and the rest step back. */
+.plot__band.is-soloed {
+  stroke-width: 2;
+  opacity: 1;
+}
+
+.plot__band.is-dimmed {
+  opacity: 0.15;
+}
+
 .plot__fill {
   fill: var(--accent);
   opacity: 0.12;
@@ -723,8 +834,39 @@ function commitNumber(index: number, key: "freq" | "gainDb" | "q", raw: string) 
 .band__top {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  height: 14px;
+  gap: 5px;
+  height: 17px;
+}
+
+/* The solo sits hard against the swatch as one group; remove stays at the
+   far end, where a destructive control belongs. */
+.band__remove {
+  margin-left: auto;
+}
+
+/* The same momentary control as the master mixer's lane solo, down to the
+   secondary accent that tells "soloed" from every other active state. */
+.band__solo {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 15px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: 3px;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  touch-action: none;
+}
+
+.band__solo:hover {
+  background: var(--bg-hover);
+}
+
+.band__solo.is-on {
+  background: var(--accent-secondary);
+  border-color: var(--accent-secondary);
+  color: var(--accent-contrast);
 }
 
 .band__power {

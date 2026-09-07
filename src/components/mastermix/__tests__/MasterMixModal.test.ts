@@ -52,6 +52,8 @@ function twoLaneMix(): MasterMix {
   return {
     enabled: true,
     revision: 1,
+    bpm: 120,
+    beatsPerBar: 4,
     lanes: [
       {
         id: "l0",
@@ -731,5 +733,64 @@ describe("MasterMixModal", () => {
     const { wrapper, store } = await open();
     await wrapper.find(".mm__ruler").trigger("pointerdown", { clientX: 9000, clientY: 10 });
     expect(store.playhead).toBe(180);
+  });
+});
+
+/**
+ * The tempo grid.
+ *
+ * It changes how the timeline is *read* — the marks above the tracks and what
+ * the grid offers to snap to — and nothing else. No block moves when it does.
+ */
+describe("MasterMixModal tempo grid", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    vi.clearAllMocks();
+    masterMix.mockResolvedValue(view());
+    setMasterMix.mockImplementation(async (_id: string, sent: MasterMix) => ({
+      ...view(),
+      mix: sent,
+    }));
+    entryWaveform.mockResolvedValue({ peaks: [], peaksPerSec: 25, durationSecs: 100 });
+  });
+
+  function tempoField(wrapper: Awaited<ReturnType<typeof open>>["wrapper"]) {
+    return wrapper.get("[aria-label='Tempo in beats per minute']");
+  }
+
+  it("reads the ruler in bars and beats, and back again", async () => {
+    const { wrapper } = await open();
+    const timeLabels = wrapper.findAll(".mm__tick").map((tick) => tick.text());
+    expect(timeLabels.some((label) => label.includes(":"))).toBe(true);
+
+    await wrapper.get("[title^='Read the ruler in bars']").trigger("click");
+    const barLabels = wrapper.findAll(".mm__tick").map((tick) => tick.text()).filter(Boolean);
+    expect(barLabels[0]).toBe("1.1");
+    expect(barLabels.every((label) => /^\d+\.\d+(\.\d+)?$/.test(label))).toBe(true);
+  });
+
+  it("re-reads the same arrangement when the tempo changes, without moving it", async () => {
+    const { wrapper, store } = await open();
+    await wrapper.get("[title^='Read the ruler in bars']").trigger("click");
+    const before = JSON.stringify(store.mix.lanes);
+
+    await tempoField(wrapper).setValue("174");
+    await tempoField(wrapper).trigger("change");
+
+    expect(store.mix.bpm).toBe(174);
+    expect(JSON.stringify(store.mix.lanes)).toBe(before);
+    // A slower tempo has fewer bars in the same stretch of timeline, so the
+    // labels have to have changed.
+    expect(wrapper.findAll(".mm__tick").map((t) => t.text())).not.toEqual(["1.1"]);
+
+    store.undo();
+    expect(store.mix.bpm).toBe(120);
+  });
+
+  it("clamps a tempo typed outside the range the engine allows", async () => {
+    const { wrapper, store } = await open();
+    await tempoField(wrapper).setValue("2000");
+    await tempoField(wrapper).trigger("change");
+    expect(store.mix.bpm).toBe(300);
   });
 });

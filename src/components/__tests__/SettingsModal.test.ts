@@ -407,7 +407,9 @@ describe("SettingsModal", () => {
     const customItem = wrapper.findAll(".item-main").find((item) => item.text().includes("My EQ"));
     await customItem!.trigger("click");
     expect(wrapper.text()).toContain("EQ Preset Editor");
-    expect(wrapper.text()).not.toContain("Pitch");
+    // Scoped to the editor panel: "Pitch" is also a row in the pane behind it,
+    // where the sidebar's section list names every section there is.
+    expect(wrapper.get(".preset-editor").text()).not.toContain("Pitch");
 
     usePresetEditorStore().close();
     await wrapper.vm.$nextTick();
@@ -445,5 +447,128 @@ describe("SettingsModal", () => {
     const connectButtons = wrapper.findAll("button").filter((button) => button.text() === "Connect");
     expect(connectButtons).toHaveLength(2);
     expect(connectButtons.every((button) => "disabled" in button.attributes())).toBe(true);
+  });
+});
+
+/**
+ * The mixer pane's two section lists.
+ *
+ * The sidebar's is visibility only; the pop-up's is visibility *and* order,
+ * because it is a short list of shortcuts where what sits at the top matters.
+ */
+describe("SettingsModal mixer sections", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    vi.clearAllMocks();
+    setAppPreferences.mockImplementation(async (preferences) => preferences);
+    outputDevices.mockResolvedValue([]);
+    mixerState.mockResolvedValue({ global: {}, presets: [], filters: [] });
+    filtersDirectory.mockResolvedValue("/tmp/filters");
+  });
+
+  async function openMixerPane() {
+    const wrapper = mountSettings();
+    const mixerButton = buttonWithText(wrapper, "Mixer");
+    if (!mixerButton) throw new Error("Missing Mixer navigation button");
+    await mixerButton.trigger("click");
+    await settle();
+    return wrapper;
+  }
+
+  /** The pop-up list's rows, in the order the pane draws them. */
+  function popoverRows(wrapper: VueWrapper) {
+    return wrapper.findAll(".reorder-list li[data-row]").map((row) => row.get("strong").text());
+  }
+
+  it("hides a section from the sidebar without touching the pop-up's own list", async () => {
+    const wrapper = await openMixerPane();
+    const settings = useSettingsStore();
+
+    const reverbToggle = wrapper.get("[aria-label='Show Reverb in the mixer sidebar']");
+    await reverbToggle.trigger("click");
+    await settle();
+
+    expect(settings.preferences.hiddenMixerSections).toEqual(["reverb"]);
+    expect(settings.preferences.hiddenPopoverSections).toEqual([]);
+  });
+
+  it("reorders the pop-up list with the keyboard, writing the whole order", async () => {
+    const wrapper = await openMixerPane();
+    const settings = useSettingsStore();
+
+    expect(popoverRows(wrapper)).toEqual([
+      "Reverb",
+      "Pitch",
+      "EQ",
+      "Normalisation",
+      "Crossfade",
+      "Atmospheres",
+    ]);
+
+    // Move EQ up one, from third to second.
+    await wrapper.get("[aria-label='Reorder EQ']").trigger("keydown", { key: "ArrowUp" });
+    await settle();
+
+    expect(settings.preferences.popoverSectionOrder).toEqual([
+      "reverb",
+      "eq",
+      "pitch",
+      "normalisation",
+      "crossfade",
+      "filters",
+    ]);
+    expect(popoverRows(wrapper)[1]).toBe("EQ");
+  });
+
+  it("drags a row into place, marking the gap it will land in", async () => {
+    const wrapper = await openMixerPane();
+    const settings = useSettingsStore();
+
+    // happy-dom gives every box zero height, so the rows are measured for it:
+    // 45px each, which is what decides the gap a drag is over.
+    wrapper.findAll(".reorder-list li[data-row]").forEach((row, index) => {
+      (row.element as HTMLElement).getBoundingClientRect = () =>
+        ({ top: index * 45, bottom: (index + 1) * 45, height: 45 }) as DOMRect;
+    });
+
+    const grip = wrapper.get("[aria-label='Reorder Reverb']");
+    (grip.element as HTMLElement).setPointerCapture = () => {};
+    (grip.element as HTMLElement).releasePointerCapture = () => {};
+
+    await grip.trigger("pointerdown", { pointerId: 1 });
+    // Past the middle of the third row: the gap below it.
+    await grip.trigger("pointermove", { pointerId: 1, clientY: 3 * 45 - 5 });
+
+    // A hairline in that gap, like the queue's and the sidebar's — the row
+    // being dragged steps back rather than being drawn twice.
+    expect(wrapper.findAll(".reorder-drop")).toHaveLength(1);
+    // Third gap down: after the three rows above it, and before the fourth.
+    expect(wrapper.findAll(".reorder-list li")[3].classes()).toContain("reorder-drop");
+    expect(wrapper.get(".reorder-list li[data-row]").classes()).toContain("is-lifted");
+
+    await grip.trigger("pointerup", { pointerId: 1 });
+    await settle();
+
+    expect(settings.preferences.popoverSectionOrder).toEqual([
+      "pitch",
+      "eq",
+      "reverb",
+      "normalisation",
+      "crossfade",
+      "filters",
+    ]);
+    expect(wrapper.find(".reorder-drop").exists()).toBe(false);
+  });
+
+  it("keeps a hidden pop-up row listed, so it can be brought back where it was", async () => {
+    const wrapper = await openMixerPane();
+    const settings = useSettingsStore();
+
+    await wrapper.get("[aria-label='Show Pitch in the mixer pop-up']").trigger("click");
+    await settle();
+
+    expect(settings.preferences.hiddenPopoverSections).toEqual(["pitch"]);
+    expect(popoverRows(wrapper)).toContain("Pitch");
+    expect(wrapper.text()).toContain("Hidden from the pop-up");
   });
 });

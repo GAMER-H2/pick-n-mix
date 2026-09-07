@@ -6,13 +6,22 @@ import {
   scaleBlockForSpeed,
   setBlockMixer as patchBlockMixer,
   soundSignature,
+  withTempo,
+  DEFAULT_BPM,
+  DEFAULT_BEATS_PER_BAR,
 } from "@/lib/masterMix";
 import type { MasterMix, MixEntry, MixerSettings, Waveform } from "@/lib/types";
 
 /** Which of the three tools in the drawing is armed. */
 export type Tool = "select" | "blade" | "automation";
 
-const EMPTY: MasterMix = { enabled: false, revision: 0, lanes: [] };
+const EMPTY: MasterMix = {
+  enabled: false,
+  revision: 0,
+  bpm: DEFAULT_BPM,
+  beatsPerBar: DEFAULT_BEATS_PER_BAR,
+  lanes: [],
+};
 /** How many edits back the user can go. Snapshots are small — a mix is a few
  *  hundred numbers — so this can be generous. */
 const UNDO_DEPTH = 100;
@@ -89,6 +98,12 @@ export const useMasterMixStore = defineStore("masterMix", () => {
    * transport can always be asked for again.
    */
   const followPlayhead = ref(false);
+  /**
+   * Whether the ruler counts seconds or the mix's own bars and beats. A view
+   * setting, not part of the arrangement: the tempo it reads by is stored with
+   * the mix, but which way you happen to be reading it is not.
+   */
+  const rulerMode = ref<"time" | "bars">("time");
 
   /** One waveform per playlist entry, fetched lazily and kept for the session. */
   const waveforms = ref<Record<number, Waveform>>({});
@@ -449,6 +464,17 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     schedulePreviewReload();
   }
 
+  /**
+   * Change the grid's tempo. Undoable like any other edit to the document,
+   * and — unlike most of them — silent: nothing about the audio depends on it,
+   * so `commit` will not reload the preview for it either.
+   */
+  function setTempo(patch: { bpm?: number; beatsPerBar?: number }) {
+    const next = withTempo(mix.value, patch);
+    if (next.bpm === mix.value.bpm && next.beatsPerBar === mix.value.beatsPerBar) return;
+    commit(next);
+  }
+
   function select(ids: string[]) {
     selection.value = ids;
   }
@@ -490,6 +516,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     snapping,
     gridSnapping,
     followPlayhead,
+    rulerMode,
     waveforms,
     assetWaveforms,
     duration,
@@ -515,6 +542,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     loadWaveform,
     loadAssetWaveform,
     setBlockMixer,
+    setTempo,
     noteBlockSpeed,
     blockSpeeds,
     select,

@@ -4,8 +4,8 @@
  *
  * Playlist rows are the app's other handle on a playlist: dragged by their
  * grip to reorder the list, right-clicked (or opened from the row's own "more"
- * button) for rename, share and delete — the same actions the playlist page
- * offers, through the same composable.
+ * button) for the full set of playlist actions — the same menu the playlist
+ * page's header shows, built once in `usePlaylistActions`.
  */
 import { ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
@@ -27,7 +27,7 @@ const home = useHomeStore();
 const mixer = useMixerStore();
 const ui = useUiStore();
 const { openMenu } = useMenu();
-const { askRename, askRemove, share, importFile, reorder } = usePlaylistActions();
+const { playlistMenuItems, importFile, reorder } = usePlaylistActions();
 
 const creating = ref(false);
 const draftName = ref("");
@@ -37,21 +37,9 @@ const listEl = ref<HTMLElement | null>(null);
 const { dragFrom, dropAt, isDragging, onHandleDown, onHandleMove, onHandleUp, onHandleCancel } =
   useDragReorder(listEl, reorder);
 
+/** The shared playlist menu; the sidebar's rows always include Play. */
 function openPlaylistMenu(event: MouseEvent, playlist: PlaylistSummary) {
-  openMenu(event, {
-    tracks: [],
-    items: [
-      { label: "Rename…", icon: "edit", action: () => askRename(playlist.id, playlist.name) },
-      { label: "Share…", icon: "share", action: () => share(playlist.id, playlist.name) },
-      {
-        label: "Delete Playlist",
-        icon: "trash",
-        separated: true,
-        danger: true,
-        action: () => askRemove(playlist.id, playlist.name),
-      },
-    ],
-  });
+  openMenu(event, { tracks: [], items: playlistMenuItems(playlist) });
 }
 
 async function create() {

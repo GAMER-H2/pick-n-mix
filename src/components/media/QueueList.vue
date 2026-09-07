@@ -5,7 +5,7 @@
  * Rows are reordered by dragging a handle rather than the row itself, so a
  * drag can never be mistaken for a click on the song.
  */
-import { nextTick, onMounted, ref } from "vue";
+import { nextTick, onMounted, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import Artwork from "../media/Artwork.vue";
 import PlaylistArtwork from "../media/PlaylistArtwork.vue";
@@ -37,10 +37,16 @@ const props = withDefaults(
     removeLabel?: string;
     /** Where the current row has got to, for marking a mix's chapters. */
     positionSecs?: number;
+    /**
+     * Bring the playing row back into view when the song changes under the
+     * list. Off for lists with no live playhead (the history in settings).
+     */
+    followCurrent?: boolean;
   }>(),
   {
     playing: false,
     positionSecs: 0,
+    followCurrent: false,
     roomy: false,
     reorderable: true,
     removable: true,
@@ -96,38 +102,77 @@ function scrollParent(element: HTMLElement): HTMLElement | null {
   return null;
 }
 
+/** The playing row and the element that scrolls it, when both exist. */
+function currentRow(): { row: HTMLElement; scroller: HTMLElement } | null {
+  const container = listEl.value;
+  const index = props.currentIndex;
+  if (!container || index === null) return null;
+  const row = container.querySelectorAll<HTMLElement>("[data-row]")[index];
+  const scroller = scrollParent(container);
+  if (!row || !scroller) return null;
+  return { row, scroller };
+}
+
+/** Whether the playing row is whole on screen right now. */
+function currentInView(): boolean {
+  const found = currentRow();
+  if (!found) return true;
+  const rowBox = found.row.getBoundingClientRect();
+  const scrollerBox = found.scroller.getBoundingClientRect();
+  return rowBox.top >= scrollerBox.top && rowBox.bottom <= scrollerBox.bottom;
+}
+
 /**
- * Put the playing track in the middle of the view when the queue is opened.
+ * Put the playing track in the middle of the view.
  *
  * Done by hand rather than with `scrollIntoView({ block: "center" })`, which
  * walks every scrollable ancestor and would drag the page behind the panel
  * along with it.
  */
-function centreOnCurrent() {
-  const container = listEl.value;
-  const index = props.currentIndex;
-  if (!container || index === null) return;
-
-  const rows = container.querySelectorAll<HTMLElement>("[data-row]");
-  const row = rows[index];
-  const scroller = scrollParent(container);
-  if (!row || !scroller) return;
+function centreOnCurrent(smooth = false) {
+  const found = currentRow();
+  if (!found) return;
+  const { row, scroller } = found;
 
   // Measured against the scroller rather than via `offsetTop`, which is
   // relative to the nearest positioned ancestor and need not be this one.
   const rowBox = row.getBoundingClientRect();
   const scrollerBox = scroller.getBoundingClientRect();
   const offsetWithin = scroller.scrollTop + rowBox.top - scrollerBox.top;
-  const target = offsetWithin - scroller.clientHeight / 2 + rowBox.height / 2;
-  scroller.scrollTop = Math.max(0, target);
+  const top = Math.max(0, offsetWithin - scroller.clientHeight / 2 + rowBox.height / 2);
+  const reduced =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (smooth && !reduced && typeof scroller.scrollTo === "function") {
+    scroller.scrollTo({ top, behavior: "smooth" });
+  } else {
+    scroller.scrollTop = top;
+  }
 }
 
-// On mount only: the queue is centred when it is brought up, and left alone
-// afterwards so it cannot yank itself away from someone scrolling it.
+// On mount: the queue is centred when it is brought up.
 onMounted(async () => {
   await nextTick();
   centreOnCurrent();
 });
+
+/*
+ * ...and afterwards only when the song itself changes, and only when the new
+ * row is not already on screen. A list that scrolled on every render — or that
+ * re-centred a row the user can already see — would yank itself away from
+ * someone reading further down it.
+ */
+watch(
+  () => props.currentIndex,
+  async (index, previous) => {
+    if (!props.followCurrent || index === null || index === previous) return;
+    await nextTick();
+    if (!currentInView()) centreOnCurrent(true);
+  },
+);
+
+/** The queue surfaces put a "jump to the playing song" button in their header. */
+defineExpose({ centreOnCurrent: () => centreOnCurrent(true) });
 
 </script>
 

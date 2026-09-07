@@ -5,6 +5,8 @@ import AdvancedMixer from "../AdvancedMixer.vue";
 import AppKnob from "@/components/ui/AppKnob.vue";
 import SelectMenu from "@/components/ui/SelectMenu.vue";
 import { useMixerStore } from "@/stores/mixer";
+import { useSettingsStore } from "@/stores/settings";
+import { SECTION_LABELS } from "@/lib/mixer";
 
 const setGlobalMixer = vi.fn();
 
@@ -75,5 +77,42 @@ describe("AdvancedMixer panning", () => {
     expect(wrapper.text()).toContain("Semitones");
     expect(wrapper.text()).toContain("Atmospheres");
     expect(wrapper.text()).not.toContain("Crossfade");
+  });
+});
+
+/**
+ * Which sections the sidebar draws.
+ *
+ * Visibility only, and only in the sidebar: the settings themselves are
+ * untouched, and the panels that edit a preset or a timeline block always show
+ * everything so a hidden setting can still be reached.
+ */
+describe("AdvancedMixer sidebar sections", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    setGlobalMixer.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("hides the sections the preference names, and only in the sidebar", () => {
+    useSettingsStore().preferences.hiddenMixerSections = ["reverb", "lofi"];
+
+    const sidebar = mount(AdvancedMixer, { props: { customisable: true } });
+    expect(sidebar.text()).not.toContain("Reverb");
+    expect(sidebar.text()).not.toContain("Sample Rate");
+    expect(sidebar.text()).toContain("Delay");
+
+    // The master mixer's block panel mounts the same component without asking
+    // for the preference, and still has everything.
+    const blockPanel = mount(AdvancedMixer);
+    expect(blockPanel.text()).toContain("Reverb");
+    expect(blockPanel.text()).toContain("Sample Rate");
+  });
+
+  it("shows every section when nothing is hidden", () => {
+    useSettingsStore().preferences.hiddenMixerSections = [];
+    const wrapper = mount(AdvancedMixer, { props: { customisable: true } });
+    for (const label of Object.values(SECTION_LABELS)) {
+      expect(wrapper.text()).toContain(label);
+    }
   });
 });

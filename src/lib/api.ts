@@ -8,6 +8,7 @@ import type {
   Artist,
   CrossfadeCurve,
   CrossfadeSettings,
+  EqBand,
   FfmpegStatus,
   FilterInfo,
   HomeShelves,
@@ -102,6 +103,12 @@ export const streamInfo = () => invoke<StreamInfo | null>("stream_info");
 export const setAnalyserEnabled = (enabled: boolean) =>
   invoke<void>("set_analyser_enabled", { enabled });
 export const analyserFrame = () => invoke<AnalyserFrame>("analyser_frame");
+
+/**
+ * Narrow the output to one EQ band's own range while its solo button is held,
+ * or `null` to restore the full range. Monitoring only — nothing is stored.
+ */
+export const setEqSolo = (band: EqBand | null) => invoke<void>("set_eq_solo", { band });
 
 // -- queue -----------------------------------------------------------------
 export const queueState = () => invoke<QueueView>("queue_state");

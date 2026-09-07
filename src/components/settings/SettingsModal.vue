@@ -10,6 +10,14 @@ import ShortcutRecorder from "./ShortcutRecorder.vue";
 import AdvancedMixer from "../mixer/AdvancedMixer.vue";
 import { EQ_PRESETS } from "@/lib/eqPresets";
 import {
+  POPOVER_SECTIONS,
+  SECTION_LABELS,
+  SIDEBAR_SECTIONS,
+  orderedSections,
+  type Section,
+} from "@/lib/mixer";
+import { useDragReorder } from "@/lib/dragReorder";
+import {
   actionFor,
   bindingLabel,
   bindingsFor,
@@ -33,7 +41,9 @@ type NumberPreference =
   | "replayMinPlays"
   | "archiveDays"
   | "archiveMinPlays"
-  | "discoverMaxPlays";
+  | "discoverMaxPlays"
+  | "previousRestartSecs"
+  | "seekStepSecs";
 
 const panes: { id: Pane; label: string; description: string }[] = [
   { id: "theme", label: "Theme", description: "Appearance and accent" },
@@ -140,6 +150,70 @@ function presetHidden(preset: Preset): boolean {
 
 function filterHidden(filter: FilterInfo): boolean {
   return filter.builtIn && settings.preferences.hiddenBuiltInFilterIds.includes(filter.id);
+}
+
+/*
+ * Which sections the mixer sidebar draws.
+ *
+ * Visibility only: a hidden section keeps whatever it was set to and goes on
+ * being applied — this decides what is on the panel, not what is in the mix.
+ * The master mixer's block panel and the preset editor ignore it entirely, so
+ * a setting can always be reached again.
+ */
+function sectionHidden(section: Section): boolean {
+  return settings.preferences.hiddenMixerSections.includes(section);
+}
+
+function setSectionHidden(section: Section, hidden: boolean) {
+  const current = settings.preferences.hiddenMixerSections.filter(
+    (candidate) => candidate !== section,
+  );
+  updatePreference({ hiddenMixerSections: hidden ? [...current, section] : current });
+}
+
+/*
+ * The compact popover's own list.
+ *
+ * It gets an order as well as a choice of rows: it is a short list of
+ * shortcuts, so which one is nearest the top is worth deciding. The sidebar
+ * stays in its fixed signal-chain order. Hidden rows keep their place here so
+ * bringing one back puts it where it was.
+ */
+const popoverSections = computed(() =>
+  orderedSections(POPOVER_SECTIONS, settings.preferences.popoverSectionOrder, []),
+);
+
+function popoverHidden(section: Section): boolean {
+  return settings.preferences.hiddenPopoverSections.includes(section);
+}
+
+function setPopoverHidden(section: Section, hidden: boolean) {
+  const current = settings.preferences.hiddenPopoverSections.filter(
+    (candidate) => candidate !== section,
+  );
+  updatePreference({ hiddenPopoverSections: hidden ? [...current, section] : current });
+}
+
+/** The whole order is written each time, so it never depends on what was saved. */
+function movePopoverSection(from: number, to: number) {
+  const order = [...popoverSections.value];
+  if (from === to || from < 0 || from >= order.length) return;
+  const target = Math.min(Math.max(to, 0), order.length - 1);
+  const [moved] = order.splice(from, 1);
+  order.splice(target, 0, moved);
+  updatePreference({ popoverSectionOrder: order });
+}
+
+const popoverListEl = ref<HTMLElement | null>(null);
+const popoverDrag = useDragReorder(popoverListEl, movePopoverSection);
+
+/** Arrow keys move a row too: a reorder that only a pointer can do is not one
+ *  everybody can do. */
+function onPopoverGripKey(event: KeyboardEvent, index: number) {
+  const delta = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
+  if (delta === 0) return;
+  event.preventDefault();
+  movePopoverSection(index, index + delta);
 }
 
 function errorMessage(error: unknown): string {
@@ -281,6 +355,12 @@ function updateNumber(key: NumberPreference, raw: string, min: number, max: numb
   if (!Number.isFinite(parsed)) return;
   updatePreference({ [key]: Math.min(max, Math.max(min, Math.round(parsed))) });
 }
+
+/** Seconds the previous key will restart a track within; zero never restarts. */
+const ambienceWithoutPlayback = computed({
+  get: () => settings.preferences.ambienceWithoutPlayback,
+  set: (enabled: boolean) => updatePreference({ ambienceWithoutPlayback: enabled }),
+});
 
 async function clearAllHistory() {
   if (!clearHistoryArmed.value) {
@@ -568,9 +648,68 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
                 Custom
               </label>
             </div>
+
+            <div class="section-heading">
+              <div>
+                <h4>Motion</h4>
+                <p>How the queue and the full-screen player move as songs change.</p>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div>
+                <h4>Follow the playing song</h4>
+                <p>
+                  Scroll the queue back to the song that has just started, when it is not
+                  already on screen. The jump button in the queue's header does the same
+                  thing at any time.
+                </p>
+              </div>
+              <AppToggle
+                :model-value="settings.preferences.queueFollowsCurrent"
+                label="Follow the playing song"
+                @update:model-value="updatePreference({ queueFollowsCurrent: $event })"
+              />
+            </div>
+            <div class="setting-row">
+              <div>
+                <h4>Crossfade artwork</h4>
+                <p>
+                  Blend the artwork and blurred backdrop into the next track over the
+                  crossfade, instead of switching when the track changes.
+                </p>
+              </div>
+              <AppToggle
+                :model-value="settings.preferences.crossfadeArt"
+                label="Crossfade artwork"
+                @update:model-value="updatePreference({ crossfadeArt: $event })"
+              />
+            </div>
           </section>
 
           <section v-else-if="activePane === 'playback'" class="pane">
+            <div class="section-heading">
+              <div>
+                <h4>Audio output</h4>
+                <p>Currently playing through <strong>{{ outputDevice }}</strong><template v-if="player.snapshot.deviceSampleRate"> at {{ (player.snapshot.deviceSampleRate / 1000).toFixed(1) }} kHz</template>.</p>
+              </div>
+            </div>
+            <div class="field">
+              <SelectMenu
+                :model-value="selectedDevice"
+                :options="deviceOptions"
+                label="Output device"
+                @update:model-value="updateOutputDevice"
+              />
+              <small v-if="savedDeviceMissing">
+                <strong>{{ settings.preferences.outputDevice }}</strong> is not connected, so
+                the system default is being used until it comes back.
+              </small>
+              <small v-else>
+                Switching device briefly reloads the current track, since the new output may
+                run at a different sample rate.
+              </small>
+            </div>
+
             <div class="setting-row">
               <div>
                 <h4>Fade on pause and play</h4>
@@ -607,28 +746,67 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
               />
             </div>
 
-            <div class="section-heading output-heading">
+            <div class="setting-row">
               <div>
-                <h4>Audio output</h4>
-                <p>Currently playing through <strong>{{ outputDevice }}</strong><template v-if="player.snapshot.deviceSampleRate"> at {{ (player.snapshot.deviceSampleRate / 1000).toFixed(1) }} kHz</template>.</p>
+                <h4>Restart threshold</h4>
+                <p>
+                  How long into a song pressing Previous restarts it instead of going back a
+                  track. At zero, Previous always goes back.
+                </p>
               </div>
+              <label class="setting-number">
+                <input
+                  type="number"
+                  :value="settings.preferences.previousRestartSecs"
+                  min="0"
+                  max="30"
+                  step="1"
+                  aria-label="Restart threshold in seconds"
+                  @change="
+                    updateNumber(
+                      'previousRestartSecs',
+                      ($event.target as HTMLInputElement).value,
+                      0,
+                      30,
+                    )
+                  "
+                />
+                <span>seconds</span>
+              </label>
             </div>
-            <div class="field">
-              <SelectMenu
-                :model-value="selectedDevice"
-                :options="deviceOptions"
-                label="Output device"
-                @update:model-value="updateOutputDevice"
+
+            <div class="setting-row">
+              <div>
+                <h4>Skip step</h4>
+                <p>How far the skip buttons and keyboard shortcuts jump.</p>
+              </div>
+              <label class="setting-number">
+                <input
+                  type="number"
+                  :value="settings.preferences.seekStepSecs"
+                  min="1"
+                  max="60"
+                  step="1"
+                  aria-label="Skip step in seconds"
+                  @change="
+                    updateNumber('seekStepSecs', ($event.target as HTMLInputElement).value, 1, 60)
+                  "
+                />
+                <span>seconds</span>
+              </label>
+            </div>
+
+            <div class="setting-row">
+              <div>
+                <h4>Atmosphere playback without track</h4>
+                <p>Keep atmospheres playing while playback is paused or stopped.</p>
+              </div>
+              <AppToggle
+                v-model="ambienceWithoutPlayback"
+                label="Atmosphere playback without track"
               />
-              <small v-if="savedDeviceMissing">
-                <strong>{{ settings.preferences.outputDevice }}</strong> is not connected, so
-                the system default is being used until it comes back.
-              </small>
-              <small v-else>
-                Switching device briefly reloads the current track, since the new output may
-                run at a different sample rate.
-              </small>
             </div>
+
           </section>
 
           <section v-else-if="activePane === 'shortcuts'" class="pane">
@@ -727,6 +905,98 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 
           <section v-else-if="activePane === 'mixer'" class="pane">
             <div class="section-heading">
+              <div>
+                <h4>Sidebar sections</h4>
+                <p>
+                  Which controls the DJ mixer panel shows. Hiding one only takes it off
+                  the panel — its settings stay as they are, and the master mixer and
+                  preset editor still show everything.
+                </p>
+              </div>
+              <button
+                v-if="settings.preferences.hiddenMixerSections.length"
+                class="text-button"
+                type="button"
+                @click="updatePreference({ hiddenMixerSections: [] })"
+              >Show all</button>
+            </div>
+            <ul class="item-list">
+              <!-- Not greyed like the hidden-built-in rows above: the control
+                   that brings a section back is the row's own toggle, and
+                   dimming what you have to click to undo it reads as
+                   disabled. The sub-label says the state instead. -->
+              <li v-for="section in SIDEBAR_SECTIONS" :key="section">
+                <div>
+                  <strong>{{ SECTION_LABELS[section] }}</strong>
+                  <span>{{ sectionHidden(section) ? "Hidden from the sidebar" : "Shown in the sidebar" }}</span>
+                </div>
+                <AppToggle
+                  :model-value="!sectionHidden(section)"
+                  :label="`Show ${SECTION_LABELS[section]} in the mixer sidebar`"
+                  @update:model-value="setSectionHidden(section, !$event)"
+                />
+              </li>
+            </ul>
+
+            <div class="section-heading filters-heading">
+              <div>
+                <h4>Pop-up sections</h4>
+                <p>
+                  The same for the compact mixer bubble, which can also be put in whatever
+                  order suits you. Drag a row by its handle, or focus one and use the arrow
+                  keys.
+                </p>
+              </div>
+              <button
+                v-if="settings.preferences.hiddenPopoverSections.length || settings.preferences.popoverSectionOrder.length"
+                class="text-button"
+                type="button"
+                @click="updatePreference({ hiddenPopoverSections: [], popoverSectionOrder: [] })"
+              >Reset</button>
+            </div>
+            <ul ref="popoverListEl" class="item-list reorder-list">
+              <template v-for="(section, index) in popoverSections" :key="section">
+                <li
+                  v-if="popoverDrag.isDragging.value && popoverDrag.dropAt.value === index"
+                  class="reorder-drop"
+                  aria-hidden="true"
+                />
+                <li
+                  data-row
+                  :class="{ 'is-lifted': popoverDrag.dragFrom.value === index }"
+                >
+                  <button
+                    class="reorder-grip"
+                    type="button"
+                    :aria-label="`Reorder ${SECTION_LABELS[section]}`"
+                    :title="`Drag, or use the arrow keys, to move ${SECTION_LABELS[section]}`"
+                    @pointerdown="popoverDrag.onHandleDown($event, index)"
+                    @pointermove="popoverDrag.onHandleMove"
+                    @pointerup="popoverDrag.onHandleUp"
+                    @pointercancel="popoverDrag.onHandleCancel"
+                    @keydown="onPopoverGripKey($event, index)"
+                  >
+                    <PnmIcon name="grip" :size="15" />
+                  </button>
+                  <div>
+                    <strong>{{ SECTION_LABELS[section] }}</strong>
+                    <span>{{ popoverHidden(section) ? "Hidden from the pop-up" : "Shown in the pop-up" }}</span>
+                  </div>
+                  <AppToggle
+                    :model-value="!popoverHidden(section)"
+                    :label="`Show ${SECTION_LABELS[section]} in the mixer pop-up`"
+                    @update:model-value="setPopoverHidden(section, !$event)"
+                  />
+                </li>
+              </template>
+              <li
+                v-if="popoverDrag.isDragging.value && popoverDrag.dropAt.value === popoverSections.length"
+                class="reorder-drop"
+                aria-hidden="true"
+              />
+            </ul>
+
+            <div class="section-heading filters-heading">
               <div>
                 <h4>Mixer presets</h4>
                 <p>Save the current {{ mixer.targetLabel.toLowerCase() }} mixer layer for reuse.</p>
@@ -950,6 +1220,10 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 .segmented button { padding: 8px; border-radius: var(--radius-sm); color: var(--text-secondary); font-size: 12px; }
 .segmented button.active { background: var(--bg-elevated); color: var(--text); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12); }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 27px; }
+/* A pane that opens on a section heading — Playback on its output device,
+   Mixer on its sidebar list — starts flush with the pane title above it,
+   like the panes that open on a plain h4. */
+.pane > .section-heading:first-child { margin-top: 0; }
 .section-heading p, .setting-row p, .remote-heading p { margin: 4px 0 0; font-size: 11.5px; line-height: 1.45; }
 .accent-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 13px; }
 .swatch { width: 28px; height: 28px; border-radius: 50%; border: 2px solid transparent; box-shadow: inset 0 0 0 1px rgba(255,255,255,.2); }
@@ -957,11 +1231,12 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 .custom-colour { display: flex; align-items: center; gap: 7px; color: var(--text-secondary); font-size: 11.5px; }
 .custom-colour input { width: 32px; height: 28px; padding: 0; border: 0; background: transparent; }
 .setting-row { min-height: 66px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 13px 0; border-bottom: 1px solid var(--separator); }
+.setting-row > .slider-row { flex: 1; max-width: 250px; }
+.setting-row > .slider-row :deep(.slider) { flex: 1; min-width: 0; }
 .setting-row.is-disabled { opacity: .65; }
 .status-tag { display: inline-block; margin-left: 5px; padding: 2px 6px; border-radius: 999px; background: var(--control-track); color: var(--text-tertiary); font-size: 9px; font-weight: 600; text-transform: uppercase; }
-.output-heading { margin-top: 25px; }
 .field { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; margin-top: 12px; font-size: 11.5px; font-weight: 600; }
-.inline-form input, .number-field input {
+.inline-form input, .number-field input, .setting-number input {
   height: 30px; padding: 0 10px;
   border: 1px solid var(--separator); border-radius: var(--radius-sm);
   background: var(--bg-elevated); color: var(--text);
@@ -975,6 +1250,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 .number-field { display: grid; grid-template-columns: 1fr 82px; align-items: center; gap: 5px 10px; font-size: 11.5px; font-weight: 600; }
 .number-field input { width: 82px; }
 .number-field small { grid-column: 1 / -1; }
+/* The playback pane's number selects: same box, type size, weight and number
+   placement as the recommendations pane's `.number-field input`. */
+.setting-number { display: flex; align-items: center; gap: 6px; }
+.setting-number input { width: 82px; font-size: 11.5px; font-weight: 600; }
+.setting-number span { font-size: 11.5px; font-weight: 600; color: var(--text-secondary); }
 .history-heading { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-top: 28px; }
 .history-heading p { margin: 4px 0 0; font-size: 11px; }
 .warning { margin-top: 10px; padding: 10px 12px; border: 1px solid rgba(215,55,63,.35); border-radius: var(--radius-sm); background: rgba(215,55,63,.08); color: #d7373f; font-size: 11.5px; line-height: 1.45; }
@@ -1016,6 +1296,31 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 .hidden-builtins { margin-top: 9px; color: var(--text-secondary); font-size: 11px; }
 .item-list span { color: var(--text-tertiary); font-size: 10px; }
 .text-button { color: var(--accent); font-size: 10.5px; white-space: nowrap; }
+/* Reorderable rows, with the same grip-and-gap vocabulary the queue and the
+   playlist sidebar use. */
+.reorder-list li[data-row] { gap: 10px; }
+/* The dragged row steps back, as it does in the queue and the sidebar. */
+.reorder-list li.is-lifted { opacity: 0.5; }
+.reorder-list li > div { flex: 1; }
+.reorder-grip {
+  display: flex; align-items: center; justify-content: center;
+  width: 22px; height: 26px; flex: none;
+  color: var(--text-tertiary); cursor: grab; touch-action: none;
+}
+.reorder-grip:active { cursor: grabbing; }
+/* Insertion marker, matching the queue's and the sidebar's: a hairline in the
+   gap the row will land in, not a filled row of its own. Qualified by
+   `.item-list` so it outweighs the row height and padding that list gives
+   every `li`, which would otherwise stretch it into a block. */
+.item-list li.reorder-drop {
+  min-height: 0;
+  height: 2px;
+  padding: 0;
+  margin: 1px 8px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--accent);
+}
 .danger-text { color: #d7373f; }
 .filters-heading { margin-top: 28px; }
 .path-note, .scan-report { overflow: hidden; margin: 8px 2px 0; color: var(--text-tertiary) !important; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }

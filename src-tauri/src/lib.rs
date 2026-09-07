@@ -231,6 +231,14 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                     EngineEvent::Error { message } => {
                         let _ = app.emit("engine-error", message);
                     }
+                    EngineEvent::CrossfadeCancelled => {
+                        // Paired with `crossfade-started`, which previews
+                        // never emit, so there is nothing to unwind for one.
+                        if state.is_previewing() {
+                            continue;
+                        }
+                        let _ = app.emit("crossfade-cancelled", ());
+                    }
                     EngineEvent::NeedNext { token } => {
                         if state.is_previewing() {
                             state.engine.decline_next(token);
@@ -299,6 +307,25 @@ fn spawn_event_pump(app: tauri::AppHandle) {
                             // stops asking for the rest of this track.
                             None => state.engine.decline_next(token),
                         }
+                    }
+                    EngineEvent::CrossfadeStarted {
+                        order_index,
+                        track_id,
+                        lead_secs,
+                    } => {
+                        // Previews audition one track at a time; their internal
+                        // handoffs are not crossfades anyone sees.
+                        if state.is_previewing() {
+                            continue;
+                        }
+                        let _ = app.emit(
+                            "crossfade-started",
+                            serde_json::json!({
+                                "orderIndex": order_index,
+                                "trackId": track_id,
+                                "leadSecs": lead_secs,
+                            }),
+                        );
                     }
                     EngineEvent::TrackAdvanced {
                         order_index,
@@ -542,6 +569,7 @@ pub fn run() {
             commands::playback_state,
             commands::set_analyser_enabled,
             commands::analyser_frame,
+            commands::set_eq_solo,
             // home
             commands::home_shelves,
             commands::mix_tracks,

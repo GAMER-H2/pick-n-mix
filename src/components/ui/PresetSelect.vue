@@ -44,11 +44,16 @@ const open = ref(false);
 const naming = ref(false);
 const draftName = ref("");
 const menuEl = ref<HTMLElement | null>(null);
+const buttonEl = ref<HTMLElement | null>(null);
 
+// The trigger is ignored so its own click still toggles: without this the
+// dismiss runs on pointerdown, closes the menu, and the click handler then
+// reopens it — so clicking the button could never close the menu.
 useDismiss(
   () => open.value,
   () => (open.value = false),
   menuEl,
+  { ignore: [buttonEl] },
 );
 
 async function toggle() {
@@ -85,7 +90,13 @@ defineExpose({ closeSaveRow });
 
 <template>
   <div class="preset" :class="{ 'preset--stretch': props.stretch }">
-    <button class="preset__button" aria-haspopup="menu" :aria-expanded="open" @click="toggle">
+    <button
+      ref="buttonEl"
+      class="preset__button"
+      aria-haspopup="menu"
+      :aria-expanded="open"
+      @click="toggle"
+    >
       <span class="truncate">{{ label }}</span>
       <PnmIcon name="chevronDown" :size="14" />
     </button>

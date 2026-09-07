@@ -6,8 +6,9 @@
  * The background uses the same artwork scaled up and blurred, giving each
  * track a matching colour field without needing a separate palette service.
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { onBeforeRouteLeave, useRouter } from "vue-router";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import PnmIcon from "../icons/PnmIcon.vue";
 import Artwork from "../media/Artwork.vue";
 import PlaylistArtwork from "../media/PlaylistArtwork.vue";
@@ -15,27 +16,312 @@ import QueueList from "../media/QueueList.vue";
 import IconButton from "../ui/IconButton.vue";
 import { artUrl, formatDuration } from "@/lib/format";
 import { usePlayerStore } from "@/stores/player";
+import { useSettingsStore } from "@/stores/settings";
 import { useNowPlayingMeta } from "@/composables/useNowPlayingMeta";
 import { useQueueActions } from "@/composables/useQueueActions";
 
 const player = usePlayerStore();
+const settings = useSettingsStore();
 const router = useRouter();
 
 const { mix, track, title, subtitle } = useNowPlayingMeta();
 const { current, items, jump, remove, move, clear, saveAsPlaylist, openMenu } =
   useQueueActions();
 
+/** What one artwork layer draws: a mix's quilt, or a single track's cover. */
+interface ArtRef {
+  mix: { artwork: string | null; artworkIds: string[] } | null;
+  artworkId: string | null;
+}
+
+const currentArt = computed<ArtRef>(() => ({
+  mix: mix.value ? { artwork: mix.value.artwork, artworkIds: mix.value.artworkIds } : null,
+  artworkId: track.value?.artworkId ?? null,
+}));
+
 // Blown up 1.6x and blurred 64px, so detail beyond this is invisible; no
 // reason to decode the original multi-megapixel picture for it.
-const backdrop = computed(() =>
-  artUrl(mix.value ? (mix.value.artwork ?? mix.value.artworkIds[0] ?? null) : track.value?.artworkId, 640),
-);
+function backdropFor(art: ArtRef): string | null {
+  return artUrl(art.mix ? (art.mix.artwork ?? art.mix.artworkIds[0] ?? null) : art.artworkId, 640);
+}
+
 const queueReady = ref(false);
+/** The queue list owns its scrolling; the header only asks it to go there. */
+const queueListEl = ref<InstanceType<typeof QueueList> | null>(null);
+
+/*
+ * Crossfaded art handoff.
+ *
+ * The engine emits `crossfade-started` when the blend actually begins: the
+ * first fade leg of its curve (incoming or outgoing, whichever starts
+ * earlier) is crossed, so the outgoing song is fading or the incoming one is
+ * about to become audible. The incoming track's art and the matching backdrop
+ * are layered on top and fade in over the event's lead seconds — the same
+ * window the audio blend spans — completing as the outgoing track ends, when
+ * the engine promotes it and fires `track-changed`.
+ *
+ * While a fade runs, the layer *underneath* it is pinned to the outgoing art
+ * rather than following the store. Both ends of the blend then stay put for
+ * its whole length, and the only thing that changes is the overlay's opacity.
+ * Letting the base follow the store instead was what made the transition look
+ * wrong: `track-changed` can land well before the fade is up — a curve whose
+ * lead is longer than the audible tail, or a file that hits EOF before its
+ * declared duration — and the backdrop would snap from the blend straight to
+ * the incoming art while the overlay was still on its way in.
+ *
+ * Only the engine knows a handoff is a crossfade. Guessing from the remaining
+ * track time mistook a manual start near a track's end for one, so every
+ * other track change is an instant swap. `track-changed` therefore only ever
+ * *ends* a fade — by confirming the handoff it predicted, or by revealing a
+ * different track that the listener asked for — and never starts one.
+ */
+interface ArtFade {
+  /** Pinned under the overlay: what was playing when the blend began. */
+  from: ArtRef;
+  /** Layered on top and faded in: what the engine is blending into. */
+  to: ArtRef;
+  /** The track the engine named, so its arrival can be recognised. */
+  trackId: string;
+  /** Wall-clock fade length. */
+  secs: number;
+}
+
+/** How long the overlay takes to unwind when a blend is abandoned or lands early. */
+const UNWIND_SECS = 0.24;
+/**
+ * How long after the fade the overlay may be held waiting for `track-changed`
+ * to confirm the handoff. Only reached if the event never comes at all; the
+ * overlay is opaque and showing the incoming art by then, so holding it is
+ * invisible either way.
+ */
+const CONFIRM_GRACE_MS = 3000;
+
+const artFade = ref<ArtFade | null>(null);
+/**
+ * Bumped for each blend, and keyed onto the overlay layers so a new one
+ * always remounts them. A fade that begins while the last one is still
+ * unwinding would otherwise inherit that animation — running backwards,
+ * under script control — instead of starting cleanly from transparent.
+ */
+const fadeKey = ref(0);
+const artFadeEl = ref<HTMLElement | null>(null);
+const backdropFadeEl = ref<HTMLElement | null>(null);
+/** The engine has confirmed the handoff this fade predicted. */
+let landed = false;
+/** The fade has run its full length, so the overlay is fully opaque. */
+let faded = false;
+/** An unwind is already under way; further requests are ignored. */
+let unwinding = false;
+let fadeTimer: number | null = null;
+let confirmTimer: number | null = null;
+let unlistenCrossfade: UnlistenFn | null = null;
+let unlistenCancelled: UnlistenFn | null = null;
+
+const reducedMotion =
+  typeof window.matchMedia === "function"
+    ? window.matchMedia("(prefers-reduced-motion: reduce)")
+    : null;
+
+/** The art under the overlay: pinned while a fade runs, live otherwise. */
+const baseArt = computed<ArtRef>(() => artFade.value?.from ?? currentArt.value);
+const backdrop = computed(() => backdropFor(baseArt.value));
+const fadeBackdrop = computed(() =>
+  artFade.value ? backdropFor(artFade.value.to) : null,
+);
+
+const artStageStyle = computed(() => ({
+  "--screen-fade": `${artFade.value?.secs ?? 0}s`,
+}));
+
+function clearTimers() {
+  if (fadeTimer !== null) window.clearTimeout(fadeTimer);
+  if (confirmTimer !== null) window.clearTimeout(confirmTimer);
+  fadeTimer = null;
+  confirmTimer = null;
+}
+
+/** Drop the overlay; the base layer goes back to following the store. */
+function clearFade() {
+  clearTimers();
+  artFade.value = null;
+  landed = false;
+  faded = false;
+  unwinding = false;
+}
+
+/**
+ * The overlay's running CSS animations, where the browser exposes them.
+ *
+ * The fade itself is a plain CSS animation — it belongs on the compositor,
+ * not in a per-frame script — but ending one early has to start from
+ * wherever it has got to, which only the animation object knows. Where
+ * `getAnimations` is missing there is nothing to adjust and the caller falls
+ * back to dropping the overlay outright.
+ */
+function fadeAnimations(): Animation[] {
+  return [artFadeEl.value, backdropFadeEl.value].flatMap((el) =>
+    el && typeof el.getAnimations === "function" ? el.getAnimations() : [],
+  );
+}
+
+function elapsedMs(animation: Animation): number {
+  return typeof animation.currentTime === "number" ? animation.currentTime : 0;
+}
+
+/** Drop the overlay once the fade has run *and* the engine has confirmed it. */
+function settleFade() {
+  if (faded && landed) clearFade();
+}
+
+/**
+ * Run the rest of the fade off in `UNWIND_SECS` instead of dropping it where
+ * it stands: the blend was abandoned (a seek, a queue edit, a fresh load), so
+ * the incoming art has to come back off the art that is still playing.
+ */
+function unwindFade() {
+  if (!artFade.value || unwinding) return;
+  const animations = fadeAnimations();
+  if (animations.length === 0) {
+    clearFade();
+    return;
+  }
+  unwinding = true;
+  clearTimers();
+  const fade = artFade.value;
+  for (const animation of animations) {
+    const elapsed = elapsedMs(animation);
+    animation.reverse();
+    animation.updatePlaybackRate(-Math.max(elapsed, 1) / (UNWIND_SECS * 1000));
+  }
+  void Promise.all(animations.map((a) => a.finished))
+    .then(() => {
+      if (artFade.value === fade) clearFade();
+    })
+    .catch(() => {
+      // Superseded by a newer fade, which owns the overlay now.
+    });
+}
+
+/**
+ * The handoff landed before the fade was up — an early promotion, most often
+ * a file that reaches EOF short of its declared duration. The audio has
+ * already switched, so the overlay finishes promptly rather than spending the
+ * rest of its window arriving at art that is already playing.
+ */
+function hurryFade() {
+  const animations = fadeAnimations();
+  if (animations.length === 0) return;
+  const fade = artFade.value;
+  for (const animation of animations) {
+    const total = artFade.value ? artFade.value.secs * 1000 : 0;
+    const remaining = Math.max(total - elapsedMs(animation), 0);
+    if (remaining <= UNWIND_SECS * 1000) continue;
+    animation.updatePlaybackRate(remaining / (UNWIND_SECS * 1000));
+  }
+  clearTimers();
+  fadeTimer = window.setTimeout(() => {
+    fadeTimer = null;
+    faded = true;
+    if (artFade.value === fade) settleFade();
+  }, UNWIND_SECS * 1000 + 80);
+}
+
+/** The queued track the engine named, which carries the cover to fade to. */
+function artworkForTrack(trackId: string): string | null {
+  const entries = [...player.queue.upcoming, ...player.queue.items];
+  for (const entry of entries) {
+    if (entry.kind === "track" && entry.track.id === trackId) return entry.track.artworkId;
+  }
+  return null;
+}
+
+/** The engine began mixing the next track in underneath the current one. */
+function onCrossfadeStarted(payload: { trackId: string; leadSecs: number }) {
+  // The preference disables the visual handoff entirely; reduced motion:
+  // theme.css would hold the overlay at full opacity, which would show the
+  // next cover before the audio has got to it.
+  if (!settings.preferences.crossfadeArt || reducedMotion?.matches || mix.value) return;
+  const artworkId = artworkForTrack(payload.trackId);
+  if (artworkId === null) return;
+  // The lead is track-seconds; rescale to wall-clock and let the overlay run
+  // the whole window — up to the boundary itself, however long the user's
+  // crossfade is. Clamping it shorter would drop the overlay mid-blend,
+  // snapping back to the old art before the track changes.
+  const speed = Math.max(player.snapshot.speed || 1, 0.05);
+  const secs = Math.max(payload.leadSecs / speed, 0.1);
+  clearTimers();
+  fadeKey.value += 1;
+  landed = false;
+  faded = false;
+  unwinding = false;
+  artFade.value = {
+    from: currentArt.value,
+    to: { mix: null, artworkId },
+    trackId: payload.trackId,
+    secs,
+  };
+  const fade = artFade.value;
+  // A little past the fade so the animation always finishes before the layer
+  // is dropped.
+  fadeTimer = window.setTimeout(() => {
+    fadeTimer = null;
+    faded = true;
+    if (artFade.value === fade) settleFade();
+  }, secs * 1000 + 100);
+  confirmTimer = window.setTimeout(() => {
+    confirmTimer = null;
+    if (artFade.value === fade) clearFade();
+  }, secs * 1000 + CONFIRM_GRACE_MS);
+}
+
+/**
+ * The engine abandoned a blend it had already begun: the listener seeked,
+ * loaded something else, or changed what comes next. The outgoing track plays
+ * on, so the art it is playing under has to come back.
+ */
+function onCrossfadeCancelled() {
+  unwindFade();
+}
+
+watch(
+  () => [mix.value, track.value] as const,
+  () => {
+    const fade = artFade.value;
+    // No fade running (manual start, skip, crossfade off): instant swap, and
+    // the base layer follows the store on its own.
+    if (!fade) return;
+    if (!mix.value && track.value?.id === fade.trackId) {
+      // The handoff the engine predicted: hold the overlay until it has run,
+      // then drop it onto art that is now identical underneath.
+      landed = true;
+      if (!faded && !unwinding) hurryFade();
+      settleFade();
+      return;
+    }
+    // Something else is playing — a skip, or a queue jump — so what the
+    // listener asked for wins over the blend that was under way.
+    clearFade();
+  },
+);
+
 const curtainVisible = ref(true);
 let queueTimer: number | null = null;
 let curtainFrame: number | null = null;
 
 onMounted(() => {
+  // The engine's own announcement that a crossfade began. Component-scoped:
+  // the fan-out in `useBackendEvents` has nothing of its own to do with it.
+  listen<{ trackId: string; leadSecs: number }>("crossfade-started", (e) =>
+    onCrossfadeStarted(e.payload),
+  ).then((fn) => {
+    unlistenCrossfade = fn;
+  });
+  // Its counterpart: the engine tore the blend down again — a seek, a queue
+  // edit — and the audio never changed track after all.
+  listen("crossfade-cancelled", () => onCrossfadeCancelled()).then((fn) => {
+    unlistenCancelled = fn;
+  });
+
   // Give the webview two paints to rasterize the static artwork blur and panel
   // behind an opaque layer. Only that cheap layer changes opacity afterward.
   curtainFrame = window.requestAnimationFrame(() => {
@@ -67,16 +353,35 @@ onBeforeRouteLeave(async () => {
 });
 
 onBeforeUnmount(() => {
+  if (unlistenCrossfade !== null) unlistenCrossfade();
+  if (unlistenCancelled !== null) unlistenCancelled();
+  clearTimers();
   if (queueTimer !== null) window.clearTimeout(queueTimer);
   if (curtainFrame !== null) window.cancelAnimationFrame(curtainFrame);
 });
 </script>
 
 <template>
-  <section class="screen" :class="{ 'has-art': !!backdrop }">
+  <section class="screen" :class="{ 'has-art': !!backdrop }" :style="artStageStyle">
     <!-- Backdrop: the cover, blown up and blurred. -->
+    <!-- Two identical layers, one over the other: the outgoing backdrop and,
+         while the engine crossfades, the incoming one fading in on top. They
+         share a wrapper class and img styles down to the last property, so
+         both rasterize their 64px blur the same way and the moment the top
+         one is dropped — fully opaque, over the same picture the base layer
+         has by then — nothing about the image changes. -->
     <div v-if="backdrop" class="screen__backdrop" aria-hidden="true">
-      <img :src="backdrop" alt="" draggable="false" />
+      <div class="screen__backdrop-layer">
+        <img :src="backdrop" alt="" draggable="false" />
+      </div>
+      <div
+        v-if="fadeBackdrop"
+        :key="fadeKey"
+        ref="backdropFadeEl"
+        class="screen__backdrop-layer screen__backdrop-fade"
+      >
+        <img :src="fadeBackdrop" alt="" draggable="false" />
+      </div>
     </div>
     <div class="screen__veil" aria-hidden="true" />
 
@@ -97,19 +402,49 @@ onBeforeUnmount(() => {
 
     <div class="screen__body">
       <div class="screen__art">
-        <!-- `full`: the cover is the subject here, and the CSS below scales
-             it well past `size` — up to 62vh — so a thumbnail sized for 380px
-             would be visibly soft on a large display. -->
-        <PlaylistArtwork
-          v-if="mix"
-          :artwork="mix.artwork"
-          :artwork-ids="mix.artworkIds"
-          :size="380"
-          :radius="12"
-          shadow
-          full
-        />
-        <Artwork v-else :artwork-id="track?.artworkId" :size="380" :radius="12" shadow full />
+        <div class="screen__art-stage">
+          <!-- `full`: the cover is the subject here, and the CSS below scales
+               it well past `size` — up to 62vh — so a thumbnail sized for 380px
+               would be visibly soft on a large display. -->
+          <PlaylistArtwork
+            v-if="baseArt.mix"
+            :artwork="baseArt.mix.artwork"
+            :artwork-ids="baseArt.mix.artworkIds"
+            :size="380"
+            :radius="12"
+            shadow
+            full
+          />
+          <Artwork v-else :artwork-id="baseArt.artworkId" :size="380" :radius="12" shadow full />
+          <!-- The incoming cover, layered on top and fading in while the
+               engine crossfades. Pinned in place, like the base layer: both
+               ends of the blend hold still and only the opacity moves. -->
+          <div
+            v-if="artFade"
+            :key="fadeKey"
+            ref="artFadeEl"
+            class="screen__art-fade"
+            aria-hidden="true"
+          >
+            <PlaylistArtwork
+              v-if="artFade.to.mix"
+              :artwork="artFade.to.mix.artwork"
+              :artwork-ids="artFade.to.mix.artworkIds"
+              :size="380"
+              :radius="12"
+              shadow
+              full
+            />
+            <Artwork
+              v-else
+              :artwork-id="artFade.to.artworkId"
+              :size="380"
+              :radius="12"
+              shadow
+              full
+            />
+          </div>
+        </div>
         <div class="screen__meta">
           <h1 class="clamp" :title="title">{{ title }}</h1>
           <p class="clamp" :title="subtitle">{{ subtitle }}</p>
@@ -124,6 +459,13 @@ onBeforeUnmount(() => {
           <h2>Playing Next</h2>
           <div v-if="queueReady && items.length" class="screen__queue-actions">
             <IconButton
+              v-if="current !== null"
+              icon="locateCurrent"
+              label="Jump to the playing song"
+              :size="16"
+              @click="queueListEl?.centreOnCurrent()"
+            />
+            <IconButton
               icon="addToPlaylist"
               label="Save queue as a playlist"
               :size="16"
@@ -132,13 +474,24 @@ onBeforeUnmount(() => {
             <button class="screen__clear" @click="clear">Clear</button>
           </div>
         </header>
-        <div v-if="queueReady && items.length === 0" class="screen__empty">Nothing queued.</div>
-        <div v-else-if="queueReady" class="screen__list scroll-area">
+        <div v-if="!queueReady" class="screen__skeleton" aria-hidden="true">
+          <div v-for="row in 5" :key="row" class="screen__skeleton-row">
+            <span class="screen__skeleton-art" />
+            <span class="screen__skeleton-lines">
+              <span class="screen__skeleton-bar screen__skeleton-bar--title" />
+              <span class="screen__skeleton-bar screen__skeleton-bar--sub" />
+            </span>
+          </div>
+        </div>
+        <div v-else-if="items.length === 0" class="screen__empty">Nothing queued.</div>
+        <div v-else class="screen__list scroll-area">
           <QueueList
+            ref="queueListEl"
             :items="items"
             :current-index="current"
             :playing="player.playing"
             :position-secs="player.position"
+            :follow-current="settings.preferences.queueFollowsCurrent"
             roomy
             @play="jump"
             @remove="remove"
@@ -192,13 +545,30 @@ onBeforeUnmount(() => {
   transform: translateZ(0);
 }
 
-.screen__backdrop img {
+/* Both backdrops — the one playing and the one fading in over it — are this
+   same box. The animation goes on the wrapper, never on the blurred img: a
+   self-animated img is promoted to its own compositor layer and rasterizes
+   its blur differently from a static one, which is visible the moment the
+   layer is dropped. `will-change` is declared for both, so neither is the
+   odd one out. */
+.screen__backdrop-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  will-change: opacity;
+}
+
+.screen__backdrop-layer img {
   width: 100%;
   height: 100%;
   object-fit: cover;
   /* Scaled past the edges so the blur has no visible border. */
   transform: scale(1.6);
   filter: blur(64px) saturate(180%);
+}
+
+.screen__backdrop-fade {
+  animation: screen-art-in var(--screen-fade) var(--ease) forwards;
 }
 
 /* Keeps text legible whatever the cover happens to look like. */
@@ -287,6 +657,35 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 22px;
   min-width: 0;
+}
+
+/*
+ * The artwork layers: the current cover, plus — while the engine crossfades
+ * into the next track — the incoming cover layered on top, fading in over
+ * `--screen-fade` (set on the section root so the backdrop layer shares it).
+ * The stage is positioned so the overlay covers exactly the artwork box, not
+ * the meta text beneath it.
+ */
+.screen__art-stage {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  width: 100%;
+}
+
+.screen__art-fade {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  animation: screen-art-in var(--screen-fade) var(--ease) forwards;
+}
+
+@keyframes screen-art-in {
+  from {
+    opacity: 0;
+  }
 }
 
 .screen__art :deep(.artwork),
@@ -406,6 +805,100 @@ onBeforeUnmount(() => {
   padding: 24px 0;
   font-size: 12.5px;
   opacity: 0.65;
+}
+
+/*
+ * Placeholder rows while the queue is deferred behind the curtain reveal.
+ * The shimmer is a transform sweep on a pseudo-element, so the compositor
+ * handles it; under reduced motion it is removed entirely and the rows sit
+ * as a static tint.
+ */
+.screen__skeleton {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 2px 6px;
+  overflow: hidden;
+}
+
+.screen__skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.screen__skeleton-art {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--bg-hover);
+}
+
+.screen__skeleton-lines {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.screen__skeleton-bar {
+  position: relative;
+  height: 11px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--bg-hover);
+}
+
+.screen__skeleton-bar--title {
+  width: 62%;
+}
+
+.screen__skeleton-bar--sub {
+  width: 40%;
+  height: 10px;
+}
+
+.screen__skeleton-art::after,
+.screen__skeleton-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, var(--bg-active), transparent);
+  animation: screen-shimmer 1.2s linear infinite;
+}
+
+@keyframes screen-shimmer {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .screen__skeleton-art::after,
+  .screen__skeleton-bar::after {
+    /* Overrides the duration-only neutralisation in theme.css with no
+       animation at all: an infinite loop at 0.01ms is a flicker. */
+    animation: none !important;
+  }
+}
+
+/* The queue fades in quickly once it is finally rendered. */
+.screen__list,
+.screen__empty {
+  animation: screen-reveal 0.18s var(--ease);
+}
+
+@keyframes screen-reveal {
+  from {
+    opacity: 0;
+  }
 }
 
 /*

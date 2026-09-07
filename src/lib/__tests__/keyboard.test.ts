@@ -94,16 +94,33 @@ describe("keyboard shortcuts", () => {
 
   it("arrow keys scrub and change volume within bounds", () => {
     press("ArrowRight");
-    expect(player.seek).toHaveBeenCalledWith(35);
+    expect(player.seek).toHaveBeenCalledWith(40);
 
     press("ArrowLeft");
-    expect(player.seek).toHaveBeenCalledWith(25);
+    expect(player.seek).toHaveBeenCalledWith(20);
 
     press("ArrowUp");
     expect(player.setVolume).toHaveBeenCalledWith(0.55);
 
     press("ArrowDown");
     expect(player.setVolume).toHaveBeenCalledWith(0.45);
+  });
+
+  it("reads the seek step on every press, like the bindings", () => {
+    let step = 30;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const off = installShortcuts(player as any, undefined, undefined, {
+      seekStep: () => step,
+    });
+
+    press("ArrowRight");
+    expect(player.seek).toHaveBeenLastCalledWith(60);
+
+    // Changing the preference in settings applies without reinstalling.
+    step = 7;
+    press("ArrowRight");
+    expect(player.seek).toHaveBeenLastCalledWith(37);
+    off();
   });
 
   it("does not seek past the end or before the start", () => {

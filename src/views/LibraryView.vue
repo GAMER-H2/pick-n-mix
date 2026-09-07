@@ -193,6 +193,24 @@ async function chooseFolder() {
 
 const { playFromList } = useCollectionPlayback();
 
+/** Shuffle everything: turn shuffle on, then hand the whole library to the player.
+ * The first song is a random pick — with shuffle on the rest are shuffled too,
+ * so starting at index 0 would always open with the library's first track. */
+async function shuffleLibrary() {
+  if (library.tracks.length === 0) return;
+  const start = Math.floor(Math.random() * library.tracks.length);
+  try {
+    await player.setShuffle(true);
+    await player.playTracks(library.tracks, start, {
+      kind: "library",
+      id: "library",
+      name: "Library",
+    });
+  } catch (error) {
+    ui.notify(`Could not shuffle the library: ${error}`, "error");
+  }
+}
+
 /**
  * Clicking the row that is already playing toggles it, rather than restarting
  * it from the beginning. Anything else starts the list from that song.
@@ -229,6 +247,7 @@ onMounted(() => {
     <template v-else>
       <header class="library__head">
         <div class="library__titles">
+          <p class="eyebrow">Your Music</p>
           <h1>Library</h1>
           <p>
             {{ library.tracks.length }} songs · {{ library.albums.length }} albums ·
@@ -238,6 +257,13 @@ onMounted(() => {
 
         <div class="library__tools">
           <SearchField v-model="query" :placeholder="searchPlaceholder" />
+          <IconButton
+            icon="shuffle"
+            label="Shuffle library"
+            :disabled="library.tracks.length === 0"
+            :size="17"
+            @click="shuffleLibrary"
+          />
           <SelectMenu
             :model-value="sortId"
             :options="sortOptions"
@@ -342,6 +368,11 @@ onMounted(() => {
   font-size: 28px;
   font-weight: 700;
   letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.library__titles .eyebrow {
+  margin-bottom: 4px;
 }
 
 .library__titles p {

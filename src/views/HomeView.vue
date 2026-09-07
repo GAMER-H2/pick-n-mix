@@ -17,6 +17,7 @@ import EmptyState from "@/components/ui/EmptyState.vue";
 import MediaCard from "@/components/ui/MediaCard.vue";
 import * as api from "@/lib/api";
 import { useHomeStore } from "@/stores/home";
+import { useLibraryStore } from "@/stores/library";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";
 import { useMenu } from "@/composables/useMenu";
@@ -24,11 +25,15 @@ import type { HomePick, MixSummary, PlaylistSummary, Track } from "@/lib/types";
 
 const router = useRouter();
 const home = useHomeStore();
+const library = useLibraryStore();
 const player = usePlayerStore();
 const ui = useUiStore();
 const { openMenu } = useMenu();
 
-onMounted(() => home.refresh());
+onMounted(() => {
+  home.refresh();
+  if (library.tracks.length === 0) library.refresh();
+});
 
 /** Nothing to show at all: no history, and no playlists to fall back on. */
 const isBare = computed(
@@ -41,6 +46,24 @@ function openMix(mix: MixSummary) {
 
 async function playMix(mix: MixSummary) {
   await api.playMix(mix.kind);
+}
+
+/** Shuffle everything: turn shuffle on, then hand the whole library to the player.
+ * The first song is a random pick — with shuffle on the rest are shuffled too,
+ * so starting at index 0 would always open with the library's first track. */
+async function shuffleLibrary() {
+  if (library.tracks.length === 0) return;
+  const start = Math.floor(Math.random() * library.tracks.length);
+  try {
+    await player.setShuffle(true);
+    await player.playTracks(library.tracks, start, {
+      kind: "library",
+      id: "library",
+      name: "Library",
+    });
+  } catch (error) {
+    ui.notify(`Could not shuffle the library: ${error}`, "error");
+  }
 }
 
 async function playPick(pick: HomePick) {
@@ -128,7 +151,18 @@ async function openPlaylistMenu(playlist: PlaylistSummary, event: MouseEvent) {
       <!-- Top picks -------------------------------------------------------->
       <section v-if="home.picks.length" class="shelf">
         <header class="shelf__head">
-          <h2>Top Picks</h2>
+          <div class="shelf__title">
+            <h2>Top Picks</h2>
+            <button
+              class="pill-button is-secondary"
+              :disabled="library.tracks.length === 0"
+              title="Shuffle your whole library"
+              @click="shuffleLibrary"
+            >
+              <PnmIcon name="shuffle" :size="14" />
+              <span>Shuffle Library</span>
+            </button>
+          </div>
           <button class="shelf__link" title="Build these again" @click="home.regenerate()">
             Refresh
           </button>
@@ -221,6 +255,20 @@ async function openPlaylistMenu(playlist: PlaylistSummary, event: MouseEvent) {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+/* Holds the heading and the shuffle action side by side, clear of the Refresh
+   link at the far edge of the row. */
+.shelf__title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.shelf__title .pill-button {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
 }
 
 .shelf__head h2 {

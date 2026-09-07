@@ -194,19 +194,43 @@ struct ActiveBed {
 pub struct AmbienceMixer {
     beds: Vec<ActiveBed>,
     sample_rate: f32,
+    /// Static loudness correction per bed id, computed lazily the first time
+    /// a bed is synced. Samples are immutable once decoded, so the RMS never
+    /// changes; cleared in `prepare` because that is where the bank is.
+    calibration: HashMap<String, f32>,
 }
+
+/// Length of the crossfade used to hide each bed's loop seam, in seconds.
+/// Long enough that the splice disappears into the texture, short enough
+/// that it never reaches anything recognisable in the recording.
+const LOOP_FADE_SECS: f32 = 0.75;
+
+/// Loudness every bed is calibrated to, in dB RMS. Measured from the
+/// packaged rain.mp3 with `ffmpeg astats` (first 30 s: ≈ −32.6 dB RMS over
+/// both channels). Beds differ wildly in level — fireplace and ocean are
+/// several dB quieter than rain or forest — so each bed's RMS is measured
+/// once and a static correction gain lifts or lowers it onto this
+/// reference, making one volume setting sound equally loud for all of them.
+pub const REFERENCE_RMS_DB: f32 = -32.5;
+
+/// Cap on the calibration correction in either direction. A near-silent
+/// custom bed would otherwise demand an enormous boost that mostly
+/// amplifies its noise floor, and a near-full-scale one an extreme cut.
+const MAX_CALIBRATION_DB: f32 = 12.0;
 
 impl AmbienceMixer {
     pub fn new() -> Self {
         AmbienceMixer {
             beds: Vec::new(),
             sample_rate: 48000.0,
+            calibration: HashMap::new(),
         }
     }
 
     pub fn prepare(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
         self.beds.clear();
+        self.calibration.clear();
     }
 
     /// Reconcile the sounding ambience beds with the requested list.
@@ -220,7 +244,22 @@ impl AmbienceMixer {
         }
 
         for filter in wanted.iter().filter(|f| f.enabled) {
-            let gain = db_to_gain(-20.0 * (1.0 - filter.volume.clamp(0.0, 1.0)) - 6.0);
+            let volume_gain = db_to_gain(-20.0 * (1.0 - filter.volume.clamp(0.0, 1.0)) - 6.0);
+            // The static loudness correction comes from the bed's own samples,
+            // whether it is already sounding (its own copy) or still only in
+            // the bank. Samples are immutable, so this is cached and free
+            // after the first block.
+            let known = self
+                .beds
+                .iter()
+                .find(|b| b.id == filter.id)
+                .map(|b| Arc::clone(&b.samples))
+                .or_else(|| bank.get(&filter.id).cloned());
+            let Some(samples) = known.filter(|s| !s.is_empty()) else {
+                continue; // Not decoded yet; it will join on a later block.
+            };
+            let calibration = self.calibration(&filter.id, &samples);
+            let gain = volume_gain * calibration;
             if let Some(bed) = self.beds.iter_mut().find(|b| b.id == filter.id) {
                 bed.retiring = false;
                 bed.gain.set_target(gain);
@@ -233,12 +272,6 @@ impl AmbienceMixer {
                         0.707,
                     );
                 }
-                continue;
-            }
-            let Some(samples) = bank.get(&filter.id) else {
-                continue; // Not decoded yet; it will join on a later block.
-            };
-            if samples.is_empty() {
                 continue;
             }
             let mut smoothed = Smoothed::new(0.0);
@@ -256,7 +289,7 @@ impl AmbienceMixer {
             }
             self.beds.push(ActiveBed {
                 id: filter.id.clone(),
-                samples: Arc::clone(samples),
+                samples,
                 pos: 0,
                 gain: smoothed,
                 tone,
@@ -282,6 +315,40 @@ impl AmbienceMixer {
         self.beds.is_empty()
     }
 
+    /// Whether any bed is sounding or still moving. `false` only once every
+    /// bed has faded to silence — the point at which ambience-alone playback
+    /// can let the worker go back to idle.
+    pub fn is_audible(&self) -> bool {
+        self.beds
+            .iter()
+            .any(|b| !b.gain.is_silent() || !b.gain.is_settled())
+    }
+
+    /// The static loudness correction for one bed, as a linear gain.
+    ///
+    /// Computed from the bed's RMS level relative to [`REFERENCE_RMS_DB`] —
+    /// the measured loudness of the packaged rain track — so all beds land at
+    /// the same perceived level for a given volume setting. Clamped to
+    /// [`MAX_CALIBRATION_DB`] in either direction, and cached per id because
+    /// the samples behind a bank entry never change once decoded.
+    fn calibration(&mut self, id: &str, samples: &[f32]) -> f32 {
+        if let Some(gain) = self.calibration.get(id) {
+            return *gain;
+        }
+        let mean_square = samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32;
+        // A bed with no measurable level gets no correction: there is nothing
+        // to match, and boosting it to the reference would be pure noise floor.
+        // 1e-10 mean square is −100 dBFS, far below any real bed.
+        let gain = if mean_square > 1e-10 {
+            let rms_db = 10.0 * mean_square.log10();
+            db_to_gain((REFERENCE_RMS_DB - rms_db).clamp(-MAX_CALIBRATION_DB, MAX_CALIBRATION_DB))
+        } else {
+            1.0
+        };
+        self.calibration.insert(id.to_owned(), gain);
+        gain
+    }
+
     pub fn process(&mut self, buf: &mut [Vec<f32>], frames: usize) {
         for bed in self.beds.iter_mut() {
             let len = bed.samples.len();
@@ -289,10 +356,24 @@ impl AmbienceMixer {
                 continue;
             }
             let total_frames = len / CHANNELS;
+            // Frames of crossfade at the loop seam. Clamped so a bed shorter
+            // than twice the window still loops (with a narrower blend)
+            // rather than breaking; a single-frame bed gets a hard wrap.
+            let fade = ((self.sample_rate * LOOP_FADE_SECS) as usize).min(total_frames / 2);
+            let seam_start = total_frames - fade;
             for i in 0..frames {
                 let g = bed.gain.next();
                 for ch in 0..CHANNELS {
-                    let s = bed.samples[bed.pos * CHANNELS + ch];
+                    let mut s = bed.samples[bed.pos * CHANNELS + ch];
+                    // Inside the seam the head of the loop is faded in under
+                    // the tail, so by the time the playhead wraps the head is
+                    // already at full gain and the splice makes no step.
+                    if fade > 0 && bed.pos >= seam_start {
+                        let head = bed.pos - seam_start;
+                        let head_sample = bed.samples[head * CHANNELS + ch];
+                        let head_gain = (head + 1) as f32 / fade as f32;
+                        s = s * (1.0 - head_gain) + head_sample * head_gain;
+                    }
                     buf[ch][i] += bed.tone[ch].process(s) * g;
                 }
                 bed.pos += 1;
@@ -539,5 +620,121 @@ mod tests {
         mixer.process(&mut buf, 64);
         // Every frame got contribution from the looping bed.
         assert!(buf[0][63].abs() > 0.0);
+    }
+
+    /// The loop wrap used to hard-cut the tail back to the head, which clicks
+    /// whenever the texture there differs. The seam must blend the head in
+    /// under the tail so consecutive output samples never step.
+    #[test]
+    fn the_loop_seam_crossfades_instead_of_clicking() {
+        let mut mixer = AmbienceMixer::new();
+        mixer.prepare(48000.0);
+        let mut bank = Bank::new();
+        // 4000 frames: quiet first half, loud second half. Without a seam
+        // crossfade the wrap at frame 4000 jumps straight from loud to quiet.
+        let mut samples = vec![0.0f32; 4000 * CHANNELS];
+        for frame in 2000..4000 {
+            for ch in 0..CHANNELS {
+                samples[frame * CHANNELS + ch] = 1.0;
+            }
+        }
+        bank.insert("rain".into(), Arc::new(samples));
+        let wanted = vec![Filter {
+            id: "rain".into(),
+            enabled: true,
+            volume: 1.0,
+            tone_hz: 20000.0,
+        }];
+        mixer.sync(&wanted, &bank);
+
+        // Walk up to two frames before the wrap, then listen across it. The
+        // 0.75 s window is clamped to half this short bed, so the whole tail
+        // is inside the seam and the blend moves at most 1/2000 per frame.
+        let mut buf = vec![vec![0.0f32; 3990]; CHANNELS];
+        mixer.process(&mut buf, 3990);
+        let mut seam = vec![vec![0.0f32; 14]; CHANNELS];
+        mixer.process(&mut seam, 14);
+
+        for ch in 0..CHANNELS {
+            for pair in seam[ch].windows(2) {
+                let jump = (pair[1] - pair[0]).abs();
+                assert!(
+                    jump < 0.01,
+                    "channel {ch} jumped {jump} across the loop seam"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_quieter_bed_gets_a_positive_loudness_correction() {
+        let mut mixer = AmbienceMixer::new();
+        mixer.prepare(48000.0);
+        // 0.0075 full scale is −42.5 dB RMS: 10 dB below the rain reference.
+        let quiet = vec![0.0075f32; 48000];
+        let gain = mixer.calibration("fireplace", &quiet);
+        assert!(gain > 1.0, "a quiet bed must be lifted, got {gain}");
+        assert!(
+            (gain - db_to_gain(10.0)).abs() < 1e-3,
+            "expected the exact 10 dB lift, got {gain}" // f32 log10 precision
+        );
+    }
+
+    #[test]
+    fn a_louder_bed_gets_a_negative_loudness_correction() {
+        let mut mixer = AmbienceMixer::new();
+        mixer.prepare(48000.0);
+        // 0.09 full scale is about −20.9 dB RMS: roughly 11.6 dB above the
+        // reference, so it must be pulled down rather than boosted.
+        let loud = vec![0.09f32; 48000];
+        let gain = mixer.calibration("forest", &loud);
+        assert!(gain < 1.0, "a loud bed must be lowered, got {gain}");
+        assert!(gain > db_to_gain(-MAX_CALIBRATION_DB) - 1e-4);
+    }
+
+    #[test]
+    fn the_loudness_correction_is_clamped_to_a_sane_range() {
+        let mut mixer = AmbienceMixer::new();
+        mixer.prepare(48000.0);
+        // −80 dB RMS would ask for a +47.5 dB lift; the cap holds it at +12.
+        let whisper = vec![0.0001f32; 48000];
+        let lifted = mixer.calibration("vinyl", &whisper);
+        assert!((lifted - db_to_gain(MAX_CALIBRATION_DB)).abs() < 1e-4);
+
+        // Near full scale would ask for more than a −12 dB cut.
+        let shout = vec![0.99f32; 48000];
+        let cut = mixer.calibration("ocean", &shout);
+        assert!((cut - db_to_gain(-MAX_CALIBRATION_DB)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn is_audible_tracks_fading_beds() {
+        let mut mixer = AmbienceMixer::new();
+        mixer.prepare(48000.0);
+        let mut bank = Bank::new();
+        bank.insert("rain".into(), Arc::new(vec![0.5f32; 48000 * CHANNELS]));
+        let wanted = vec![Filter {
+            id: "rain".into(),
+            enabled: true,
+            volume: 1.0,
+            tone_hz: 20000.0,
+        }];
+        mixer.sync(&wanted, &bank);
+        let mut buf = vec![vec![0.0f32; 64]; CHANNELS];
+        mixer.process(&mut buf, 64);
+        assert!(mixer.is_audible());
+
+        // Switched off, the bed fades out through the normal sync path and
+        // the mixer reaches a settled, silent state — the point at which
+        // ambience-alone playback may go back to idle.
+        mixer.sync(&[], &bank);
+        for _ in 0..2000 {
+            mixer.process(&mut buf, 64);
+        }
+        assert!(!mixer.is_audible());
+        // The worker syncs every block; one more sync drops the now-settled
+        // bed, matching what the engine does in practice.
+        mixer.sync(&[], &bank);
+        assert!(mixer.is_silent());
     }
 }

@@ -1,23 +1,9 @@
 Small Tasks:
 - Atmospheres shaders need more refinement (human task, all agents ignore)
-- Atmopsheres need better looping points
-- All atmospheres should be the volume of the rain track
-- Skeleton screen for the playing next widget in full-screen queue view that shimmers and quickly fades in the queue when it's ready
-- Button on homepage to shuffle whole library
-- Full context menu of playlist in sidebar
-- Continue title and subtitle style starting in settings to library and both queues
-- Settings in playback to set parameters for restarting and going previous track, how many seconds to move (sync keyboard shortcuts with buttons), atmospheres play without track playback
-- Clikcing on drop down should close it
-- Searching in playlists
-- macOS security fix
-- Fade in the art when crossover in enabled and have in time
 
-Max Notes:
+User feedback (from Max):
 - Re-order the advanced DJ effects (not just visually but also the effects chain order (layering))
-- BPM editing in master mixer
-- Effects appear in bottom in master mixer as a layout option (look at Abelton for inspiration on this layout and chain order with its levels preview before next level)
-- Customise what is in the mixer sidebar (general and master mix)
-- ProQ3 inspiration: solo the effected area of the EQ (the band) to preview it (hold down the button)
+- Effects appear in bottom in master mixer as a layout option (look at Abelton for inspiration on this layout and chain order with its levels preview before next level) (perhaps we go full DAW style and have effects selected from a menu and ordered in a chain in the bottom row for each audio block, then have presets the user can save to copy the chain to other blocks)
 
 Medium Tasks:
 - Duplicate song handling - (working but needs some refinement as there are a lot of true negatives)

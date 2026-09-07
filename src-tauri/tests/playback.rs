@@ -172,9 +172,15 @@ fn reaching_the_end_reports_the_track_as_finished() {
             }
             Ok(EngineEvent::Error { message }) => seen.push(message),
             // Crossfading is off by default (`length_secs: 0`) for every
-            // test in this file, so neither should ever fire here.
+            // test in this file, so none of these should ever fire here.
             Ok(EngineEvent::NeedNext { .. }) => seen.push("unexpected NeedNext".into()),
+            Ok(EngineEvent::CrossfadeStarted { .. }) => {
+                seen.push("unexpected CrossfadeStarted".into())
+            }
             Ok(EngineEvent::TrackAdvanced { .. }) => seen.push("unexpected TrackAdvanced".into()),
+            Ok(EngineEvent::CrossfadeCancelled) => {
+                seen.push("unexpected CrossfadeCancelled".into())
+            }
             Err(_) => {}
         }
     }
@@ -937,6 +943,117 @@ mod output_device {
                 .set_output_device(None)
                 .is_ok()),
             "the engine did not recover after a failed device switch"
+        );
+    }
+}
+
+mod ambience_without_playback {
+    use super::*;
+    use std::sync::Arc;
+
+    use pick_n_mix_lib::audio::params::Filter;
+
+    /// A constant, loud bed: DC passes the low-pass tone filter and lights up
+    /// the analyser, and being constant it can never be mistaken for the
+    /// fixture's 330 Hz tone.
+    fn constant_bed(engine: &AudioEngine, id: &str) {
+        let rate = engine.device_sample_rate() as usize;
+        engine.install_bed(id.to_string(), Arc::new(vec![0.9; rate * 2 * 2]));
+    }
+
+    fn bed_settings(id: &str) -> MixerSettings {
+        MixerSettings {
+            enabled: Some(true),
+            filters: Some(vec![Filter {
+                id: id.to_string(),
+                enabled: true,
+                volume: 1.0,
+                tone_hz: 20000.0,
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn beds_sounding(engine: &AudioEngine) -> bool {
+        engine.analyser_bins().iter().any(|bin| *bin > -60.0)
+    }
+
+    fn beds_silent(engine: &AudioEngine) -> bool {
+        engine.analyser_bins().iter().all(|bin| *bin <= -60.0)
+    }
+
+    /// The reported bug: pausing, then switching on ambience-alone with a bed,
+    /// must never play the paused track. The callback used to pop the pre-pause
+    /// music the ring still held the moment the beds turned its envelope back
+    /// on, so the listener heard a brief blip of the track first.
+    #[test]
+    fn beds_take_over_silently_from_a_paused_track() {
+        let Some((engine, _rx)) = engine() else {
+            return;
+        };
+        engine.set_analyser_enabled(true);
+        constant_bed(&engine, "rain");
+
+        engine
+            .load(fixture("amb-pause", 8.0), 0.0, 0.0)
+            .expect("loading");
+        engine.play();
+        assert!(
+            wait_for(Duration::from_secs(3), || {
+                engine.snapshot().position_secs > 0.3
+            }),
+            "playback never started"
+        );
+        engine.pause();
+        // Let the pre-pause output finish fading and the analyser settle to
+        // the floor, so the bed check below can only be satisfied by the bed.
+        assert!(
+            wait_for(Duration::from_secs(3), || beds_silent(&engine)),
+            "output never went quiet after pausing"
+        );
+        let at_pause = engine.snapshot().position_secs;
+
+        engine.set_ambience_alone(true);
+        engine.set_settings(MixerSettings::resolve(&[&bed_settings("rain")]));
+
+        // The bed must sound, all by itself, with no playback going.
+        assert!(
+            wait_for(Duration::from_secs(3), || beds_sounding(&engine)),
+            "beds never sounded while playback was paused"
+        );
+        // ...and the paused track must not have moved in the meantime.
+        let now = engine.snapshot().position_secs;
+        assert!(
+            (now - at_pause).abs() < 0.1,
+            "position moved during ambience-alone: {at_pause} then {now}"
+        );
+
+        // Resuming afterwards must work normally.
+        engine.play();
+        assert!(
+            wait_for(Duration::from_secs(3), || {
+                engine.snapshot().position_secs > at_pause + 0.5
+            }),
+            "playback never resumed after ambience-alone"
+        );
+
+        // Pausing again hands back to the beds; they must sound alone, and
+        // switching the feature off must then fade them out for good.
+        engine.pause();
+        assert!(
+            wait_for(Duration::from_secs(3), || beds_sounding(&engine)),
+            "beds never took over after the second pause"
+        );
+        let at_second_pause = engine.snapshot().position_secs;
+        engine.set_ambience_alone(false);
+        assert!(
+            wait_for(Duration::from_secs(3), || beds_silent(&engine)),
+            "beds never faded out after ambience-alone was switched off"
+        );
+        let later = engine.snapshot().position_secs;
+        assert!(
+            (later - at_second_pause).abs() < 0.1,
+            "position moved across the second pause: {at_second_pause} then {later}"
         );
     }
 }

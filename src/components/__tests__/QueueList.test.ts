@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mount } from "@vue/test-utils";
+import { flushPromises, mount } from "@vue/test-utils";
 import QueueList from "../media/QueueList.vue";
 import type { Track } from "@/lib/types";
 
@@ -119,6 +119,96 @@ describe("QueueList", () => {
     expect(wrapper.get(".row__subtitle").text()).toBe("0:Artist");
     expect(wrapper.get(".row").text()).toContain("FLAC:0");
     expect(wrapper.find(".row__duration").exists()).toBe(false);
+  });
+});
+
+/**
+ * Following the playing song.
+ *
+ * The list is the only thing that knows where its rows are, so both the
+ * automatic jump when the song changes and the header's own button go through
+ * it. happy-dom reports every box as zero-sized, so the rows and their
+ * scroller are given real ones here.
+ */
+describe("QueueList following the playing song", () => {
+  const ROW_HEIGHT = 50;
+  const VIEW_HEIGHT = 300;
+
+  async function mountInScroller(props: { currentIndex: number | null; followCurrent: boolean }) {
+    const scroller = document.createElement("div");
+    scroller.style.overflowY = "auto";
+    Object.defineProperty(scroller, "clientHeight", { value: VIEW_HEIGHT });
+    // happy-dom has no smooth scrolling; the list only needs somewhere for it
+    // to land.
+    scroller.scrollTo = ((options?: ScrollToOptions | number) => {
+      scroller.scrollTop = typeof options === "number" ? options : (options?.top ?? 0);
+    }) as HTMLElement["scrollTo"];
+    scroller.getBoundingClientRect = () =>
+      ({ top: 0, bottom: VIEW_HEIGHT, height: VIEW_HEIGHT }) as DOMRect;
+    document.body.appendChild(scroller);
+
+    const wrapper = mount(QueueList, {
+      props: {
+        items: Array.from({ length: 20 }, (_, i) => ({
+          kind: "track" as const,
+          track: track(`t${i}`, `Song ${i}`),
+        })),
+        ...props,
+      },
+      attachTo: scroller,
+      global: { stubs: { Artwork: true, PnmIcon: true } },
+    });
+
+    wrapper.element.querySelectorAll("[data-row]").forEach((row: Element, index: number) => {
+      (row as HTMLElement).getBoundingClientRect = () =>
+        ({
+          top: index * ROW_HEIGHT - scroller.scrollTop,
+          bottom: (index + 1) * ROW_HEIGHT - scroller.scrollTop,
+          height: ROW_HEIGHT,
+        }) as DOMRect;
+    });
+    // The list centres itself once on mount; let that settle against the
+    // boxes above before a test changes anything.
+    await flushPromises();
+    return { wrapper, scroller };
+  }
+
+  /** Where the list would put row `index` in the middle of the view. */
+  const centred = (index: number) => index * ROW_HEIGHT - VIEW_HEIGHT / 2 + ROW_HEIGHT / 2;
+
+  it("scrolls to the new song when it is off screen", async () => {
+    const { wrapper, scroller } = await mountInScroller({ currentIndex: 0, followCurrent: true });
+    expect(scroller.scrollTop).toBe(0);
+
+    await wrapper.setProps({ currentIndex: 12 });
+    await wrapper.vm.$nextTick();
+
+    expect(scroller.scrollTop).toBe(centred(12));
+    wrapper.unmount();
+  });
+
+  it("leaves the scroll alone when the new song is already in view", async () => {
+    const { wrapper, scroller } = await mountInScroller({ currentIndex: 0, followCurrent: true });
+
+    await wrapper.setProps({ currentIndex: 2 });
+    await wrapper.vm.$nextTick();
+
+    expect(scroller.scrollTop).toBe(0);
+    wrapper.unmount();
+  });
+
+  it("does not follow when the preference is off", async () => {
+    const { wrapper, scroller } = await mountInScroller({ currentIndex: 0, followCurrent: false });
+
+    await wrapper.setProps({ currentIndex: 12 });
+    await wrapper.vm.$nextTick();
+
+    expect(scroller.scrollTop).toBe(0);
+
+    // ...but the header's button still works: that is the point of having one.
+    wrapper.vm.centreOnCurrent();
+    expect(scroller.scrollTop).toBe(centred(12));
+    wrapper.unmount();
   });
 });
 
