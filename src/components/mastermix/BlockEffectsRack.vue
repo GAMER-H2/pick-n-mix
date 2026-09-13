@@ -22,17 +22,21 @@ import AppToggle from "../ui/AppToggle.vue";
 import EffectControls from "../mixer/EffectControls.vue";
 import EqModal from "../mixer/EqModal.vue";
 import FilterGrid from "../mixer/FilterGrid.vue";
+import MixerPresetSelect from "../mixer/PresetSelect.vue";
+import BlockEffectsMenu from "./BlockEffectsMenu.vue";
 import StereoLevelMeter from "./StereoLevelMeter.vue";
 import * as api from "@/lib/api";
 import {
   DEFAULT_CHAIN_ORDER,
   PINNED_DEVICES,
   SECTION_LABELS,
+  deviceDefault,
   hasEnableSwitch,
 } from "@/lib/mixer";
 import { useMasterMixStore } from "@/stores/masterMix";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
+import { useUiStore } from "@/stores/ui";
 import type { DeviceSection } from "@/lib/mixer";
 import type { ChainStage, Eq, MixerSettings, OutputLevelFrame } from "@/lib/types";
 
@@ -45,6 +49,7 @@ const props = defineProps<{
 const store = useMasterMixStore();
 const mixer = useMixerStore();
 const player = usePlayerStore();
+const ui = useUiStore();
 
 const FLOOR_DB = -60;
 const SILENCE: OutputLevelFrame = {
@@ -164,6 +169,11 @@ onBeforeUnmount(() => {
 
 // -- editing -----------------------------------------------------------------
 
+async function add(section: DeviceSection) {
+  await mixer.setSection(section, deviceDefault(section));
+  ui.notify(`${SECTION_LABELS[section]} added to ${props.blockName}`);
+}
+
 function onChange(patch: MixerSettings) {
   for (const [section, value] of Object.entries(patch)) {
     void mixer.setSection(section as DeviceSection, value as MixerSettings[DeviceSection]);
@@ -210,15 +220,24 @@ function movePinned(index: number, delta: number) {
 <template>
   <section class="rack" aria-label="Effects for the selected block">
     <header class="rack__head">
-      <p class="eyebrow">Effect Chain</p>
-      <h3 class="rack__title truncate">
-        <PnmIcon name="music" :size="11" />
-        <span>{{ blockName }}</span>
-      </h3>
+      <div class="rack__identity">
+        <p class="eyebrow">Effect Chain</p>
+        <h3 class="rack__title truncate">
+          <PnmIcon name="music" :size="11" />
+          <span>{{ blockName }}</span>
+        </h3>
+      </div>
       <span class="rack__note">Left to right is the order they are applied</span>
+      <div class="rack__actions">
+        <MixerPresetSelect master-mix :stretch="false" />
+        <BlockEffectsMenu :present="present" @add="add" />
+      </div>
     </header>
 
     <div class="rack__row scroll-area">
+      <p v-if="!present.length" class="rack__empty">
+        This block has no effects yet. Add one or choose a mixer preset.
+      </p>
       <template v-for="(stage, index) in chain" :key="stage">
         <StereoLevelMeter
           compact
@@ -368,9 +387,15 @@ function movePinned(index: number, delta: number) {
 
 .rack__head {
   display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 7px 14px 5px;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  padding: 7px 14px;
+  border-bottom: 0.5px solid var(--separator);
+}
+
+.rack__identity {
+  min-width: 0;
 }
 
 .rack__title {
@@ -386,6 +411,13 @@ function movePinned(index: number, delta: number) {
   margin-left: auto;
   font-size: 10.5px;
   color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.rack__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .rack__row {
@@ -393,9 +425,16 @@ function movePinned(index: number, delta: number) {
   align-items: stretch;
   gap: 8px;
   height: 196px;
-  padding: 0 14px 10px;
+  padding: 10px 14px;
   overflow-x: auto;
   overflow-y: hidden;
+}
+
+.rack__empty {
+  align-self: center;
+  margin: auto;
+  color: var(--text-tertiary);
+  font-size: 12px;
 }
 
 .rack__meter {

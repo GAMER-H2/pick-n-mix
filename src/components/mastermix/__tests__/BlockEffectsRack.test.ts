@@ -4,6 +4,7 @@ import { createPinia, setActivePinia } from "pinia";
 import BlockEffectsRack from "../BlockEffectsRack.vue";
 import { useMasterMixStore } from "@/stores/masterMix";
 import { useMixerStore } from "@/stores/mixer";
+import { useSettingsStore } from "@/stores/settings";
 import type { ChainLevelFrame, OutputLevelFrame } from "@/lib/types";
 
 const setChainMeterBlock = vi.fn((_blockId: string | null) => Promise.resolve());
@@ -19,6 +20,8 @@ vi.mock("@/lib/api", () => ({
   setEqSolo: () => Promise.resolve(),
   outputLevelFrame: () =>
     Promise.resolve({ levelsDb: [-60, -60], peaksDb: [-60, -60], floorDb: -60 }),
+  savePreset: vi.fn(),
+  deletePreset: vi.fn(),
 }));
 
 function level(db: number): OutputLevelFrame {
@@ -193,6 +196,73 @@ describe("BlockEffectsRack", () => {
 
     await wrapper.get("[aria-label='Expand EQ']").trigger("click");
     expect(wrapper.findComponent({ name: "EqModal" }).exists()).toBe(true);
+  });
+
+  it("adds a device from the title-bar menu and prevents adding it twice", async () => {
+    const mixer = useMixerStore();
+    mixer.targetLayer = {};
+    const wrapper = rack();
+
+    expect(wrapper.text()).toContain("This block has no effects yet");
+    await wrapper.get(".effects-menu__trigger").trigger("click");
+    const delay = wrapper
+      .findAll(".effects-menu__menu [role='menuitem']")
+      .find((item) => item.text() === "Delay");
+    await delay?.trigger("click");
+    await flushPromises();
+
+    expect(mixer.targetLayer.delay).toMatchObject({ enabled: true });
+    expect(wrapper.findAll(".rack__device-name").map((name) => name.text())).toEqual(["Delay"]);
+
+    await wrapper.get(".effects-menu__trigger").trigger("click");
+    const addedDelay = wrapper
+      .findAll(".effects-menu__menu [role='menuitem']")
+      .find((item) => item.text() === "Delay");
+    expect((addedDelay?.element as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("applies presets in the rack and can hide only its built-in choices", async () => {
+    const mixer = useMixerStore();
+    mixer.presets = [
+      {
+        id: "built-in",
+        name: "Built In Mix",
+        builtIn: true,
+        kind: "mixer",
+        settings: {
+                  delay: {
+                    enabled: true,
+                    timeMs: 300,
+                    feedback: 0.2,
+                    mix: 0.3,
+                    toneHz: 8000,
+                    spread: 0,
+                  },
+                },
+      },
+      {
+        id: "custom",
+        name: "My Mix",
+        builtIn: false,
+        kind: "mixer",
+        settings: { pitch: { semitones: 2, cents: 0 } },
+      },
+    ];
+    const wrapper = rack();
+
+    await wrapper.get(".preset__button").trigger("click");
+    expect(wrapper.text()).toContain("Built In Mix");
+    expect(wrapper.text()).toContain("My Mix");
+
+    await wrapper.findAll("[role='menuitem']").find((item) => item.text() === "My Mix")?.trigger("click");
+    await flushPromises();
+    expect(mixer.targetLayer.pitch).toEqual({ semitones: 2, cents: 0 });
+
+    useSettingsStore().preferences.hideBuiltInMasterMixerPresets = true;
+    await wrapper.vm.$nextTick();
+    await wrapper.get(".preset__button").trigger("click");
+    expect(wrapper.text()).not.toContain("Built In Mix");
+    expect(wrapper.text()).toContain("My Mix");
   });
 
   it("takes a device off the block when it is removed", async () => {

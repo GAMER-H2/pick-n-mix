@@ -1,8 +1,8 @@
 <script setup lang="ts">
 /**
- * The "Preset Select" control at the top of both mixer views: applies mixer
- * presets, saves the current settings as one, and deletes custom presets —
- * all rendered by the shared `ui/PresetSelect`.
+ * The mixer preset control used by the mixer panels and Master Mixer rack:
+ * applies presets, saves the current settings as one, and deletes custom
+ * presets — all rendered by the shared `ui/PresetSelect`.
  */
 import { computed, ref } from "vue";
 import PresetSelect from "../ui/PresetSelect.vue";
@@ -12,6 +12,14 @@ import { useMixerStore } from "@/stores/mixer";
 import { useSettingsStore } from "@/stores/settings";
 import { useUiStore } from "@/stores/ui";
 
+const props = withDefaults(
+  defineProps<{
+    masterMix?: boolean;
+    stretch?: boolean;
+  }>(),
+  { masterMix: false, stretch: true },
+);
+
 const mixer = useMixerStore();
 const settings = useSettingsStore();
 const ui = useUiStore();
@@ -20,7 +28,10 @@ const select = ref<InstanceType<typeof PresetSelect> | null>(null);
 const current = computed(() => mixer.targetLayer.preset as string | undefined);
 const visiblePresets = computed(() => mixer.presets.filter((preset) =>
   preset.kind === "mixer"
-  && (!preset.builtIn || !settings.preferences.hiddenBuiltInPresetIds.includes(preset.id)),
+  && (!preset.builtIn || (
+    !settings.preferences.hiddenBuiltInPresetIds.includes(preset.id)
+    && (!props.masterMix || !settings.preferences.hideBuiltInMasterMixerPresets)
+  )),
 ));
 
 const builtIns = computed<MenuItem[]>(() =>
@@ -67,7 +78,7 @@ async function remove(id: string) {
     save-placeholder="Preset name"
     save-action-label="Save current settings…"
     delete-label="Delete preset"
-    stretch
+    :stretch="props.stretch"
     @select="choose"
     @delete="remove"
     @save="save"

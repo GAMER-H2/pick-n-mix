@@ -481,6 +481,19 @@ describe("SettingsModal mixer sections", () => {
     return wrapper.findAll(".reorder-list li[data-row]").map((row) => row.get("strong").text());
   }
 
+  it("toggles built-in presets only for the Master Mixer", async () => {
+    const wrapper = await openMixerPane();
+    const settings = useSettingsStore();
+
+    await wrapper.get("[aria-label='Show built-in presets in the Master Mixer']").trigger("click");
+    await settle();
+
+    expect(settings.preferences.hideBuiltInMasterMixerPresets).toBe(true);
+    expect(setAppPreferences).toHaveBeenLastCalledWith(
+      expect.objectContaining({ hideBuiltInMasterMixerPresets: true }),
+    );
+  });
+
   it("hides a section from the sidebar without touching the pop-up's own list", async () => {
     const wrapper = await openMixerPane();
     const settings = useSettingsStore();

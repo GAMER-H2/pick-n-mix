@@ -4,6 +4,7 @@ import { useMixerStore } from "../mixer";
 import type { MixerSettings } from "@/lib/types";
 
 const mixerState = vi.fn();
+const savePreset = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   mixerState: (...args: unknown[]) => mixerState(...args),
@@ -12,7 +13,7 @@ vi.mock("@/lib/api", () => ({
   setPlaylistMixer: vi.fn(),
   setPlaylistEntryMixer: vi.fn(),
   mixerLayers: vi.fn(),
-  savePreset: vi.fn(),
+  savePreset: (...args: unknown[]) => savePreset(...args),
   deletePreset: vi.fn(),
 }));
 
@@ -22,6 +23,30 @@ function global(): MixerSettings {
     reverb: { enabled: true, size: 0.5, damping: 0.5, width: 1, mix: 0.4, predelayMs: 0 },
   };
 }
+
+describe("mixer preset persistence", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    savePreset.mockReset().mockResolvedValue([]);
+  });
+
+  it("saves the effective chain order even when the current layer inherits it", async () => {
+    const mixer = useMixerStore();
+    mixer.target = { kind: "playlist", id: "playlist", name: "Evening" };
+    mixer.underlyingLayers = [{ chainOrder: ["panning", "eq", "delay", "reverb", "lofi"] }];
+    mixer.targetLayer = { reverb: global().reverb };
+
+    await mixer.saveAsPreset("Ordered");
+
+    expect(savePreset).toHaveBeenCalledWith(
+      "Ordered",
+      expect.objectContaining({
+        chainOrder: ["panning", "eq", "delay", "reverb", "lofi"],
+      }),
+      "mixer",
+    );
+  });
+});
 
 describe("what a master mix inherits", () => {
   beforeEach(() => {

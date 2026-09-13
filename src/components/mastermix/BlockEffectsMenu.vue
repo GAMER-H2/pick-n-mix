@@ -1,17 +1,17 @@
 <script setup lang="ts">
 /**
- * The Master Mixer's "Effects" button: everything the app can put on a region,
- * in one menu.
+ * The Master Mixer rack's add-effect dropdown: everything the app can put on a
+ * region, grouped in one menu.
  *
- * The arrangement used to borrow the DJ sidebar for this, which meant leaving
- * the timeline to reach a region's reverb. A mix is a mini-DAW, so effects are
- * picked from a menu here and laid out as a chain along the bottom instead —
- * see `BlockEffectsRack`.
+ * A mix is a mini-DAW, so effects are picked from the rack title bar and laid
+ * out as devices along the bottom instead of sending the user to the DJ
+ * sidebar — see `BlockEffectsRack`.
  *
  * Effects already on the block are ticked and cannot be added twice: a second
  * reverb on one region would be a second set of controls for the same effect.
  */
-import { nextTick, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
+import PnmIcon from "../icons/PnmIcon.vue";
 import MenuSurface, { type MenuGroup } from "../ui/MenuSurface.vue";
 import { useDismiss } from "@/lib/dismiss";
 import { DEFAULT_CHAIN_ORDER, PINNED_DEVICES, SECTION_LABELS } from "@/lib/mixer";
@@ -23,8 +23,9 @@ const props = withDefaults(
     present: DeviceSection[];
     /** No single block is selected, so there is nothing to add an effect to. */
     disabled?: boolean;
+    label?: string;
   }>(),
-  { disabled: false },
+  { disabled: false, label: "+ Add Effect" },
 );
 
 const emit = defineEmits<{ add: [section: DeviceSection] }>();
@@ -53,10 +54,10 @@ function group(label: string, sections: DeviceSection[]): MenuGroup {
   };
 }
 
-const groups: MenuGroup[] = [
+const groups = computed<MenuGroup[]>(() => [
   group("Chain", DEFAULT_CHAIN_ORDER),
   group("Region", PINNED_DEVICES),
-];
+]);
 
 async function toggle() {
   if (props.disabled) return;
@@ -88,7 +89,8 @@ function onSelect(id: string) {
       "
       @click="toggle"
     >
-      Effects
+      <span>{{ props.label }}</span>
+      <PnmIcon name="chevronDown" :size="14" />
     </button>
 
     <Transition name="pop">
@@ -104,18 +106,23 @@ function onSelect(id: string) {
   position: relative;
 }
 
-/* Matches the modal's other header buttons; those styles are not scoped to
-   this component, so the trigger carries its own copy of the same tokens. */
 .effects-menu__trigger {
-  padding: 5px 14px;
-  border: 0.5px solid var(--separator-strong);
-  border-radius: 999px;
-  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 132px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--separator);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  font-size: 12.5px;
   color: var(--text);
 }
 
 .effects-menu__trigger:hover:not(:disabled) {
-  background: var(--bg-hover);
+  border-color: var(--separator-strong);
 }
 
 .effects-menu__trigger:disabled {

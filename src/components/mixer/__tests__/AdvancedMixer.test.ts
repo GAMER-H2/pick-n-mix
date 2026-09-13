@@ -121,6 +121,36 @@ describe("AdvancedMixer sidebar sections", () => {
  * The panel's order *is* the chain order, so what it draws has to be what the
  * engine will apply and moving a row has to be what changes it.
  */
+describe("AdvancedMixer effects-area explanations", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    setGlobalMixer.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("keeps each effects area explanation visually separate and collapsible", async () => {
+    const wrapper = mount(AdvancedMixer);
+    const explanations = wrapper.findAll(".effects-explanation");
+
+    expect(explanations).toHaveLength(2);
+    expect(explanations[0].text()).toContain("Signal Chain");
+    expect(explanations[0].text()).toContain("Top is applied first");
+    expect(explanations[0].text()).toContain("These run in the order they are listed.");
+    expect(explanations[1].text()).toContain("Outside the Chain");
+    expect(explanations[1].text()).toContain("Order is layout only");
+    expect(explanations[1].text()).toContain("None of these is a stage the signal passes through");
+    expect(wrapper.findAll(".header__title").map((title) => title.text())).not.toContain("Signal Chain");
+    expect(wrapper.findAll(".header__title").map((title) => title.text())).not.toContain("Outside the Chain");
+
+    const toggle = explanations[0].get("button");
+    expect(toggle.attributes("aria-expanded")).toBe("true");
+    await toggle.trigger("click");
+
+    expect(toggle.attributes("aria-expanded")).toBe("false");
+    expect(explanations[0].text()).toBe("Signal ChainTop is applied first");
+    expect(explanations[0].text()).not.toContain("These run in the order they are listed.");
+  });
+});
+
 describe("AdvancedMixer chain order", () => {
   beforeEach(() => {
     setActivePinia(createPinia());

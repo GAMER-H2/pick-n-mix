@@ -112,7 +112,7 @@ defineExpose({ closeSaveRow });
               :key="item.id"
               class="preset__item"
               role="menuitem"
-              @click="emit('select', item.id)"
+              @click="onSelect(item.id)"
             >
               <span class="truncate">{{ item.label }}</span>
               <span class="preset__actions">

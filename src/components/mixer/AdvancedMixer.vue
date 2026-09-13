@@ -15,6 +15,7 @@ import PresetSelect from "./PresetSelect.vue";
 import FilterGrid from "./FilterGrid.vue";
 import SectionHeader from "./SectionHeader.vue";
 import EffectControls from "./EffectControls.vue";
+import EffectsAreaExplanation from "./EffectsAreaExplanation.vue";
 import CrossfadeGraph from "./CrossfadeGraph.vue";
 import { defaultBands, SECTION_LABELS } from "@/lib/mixer";
 import { useDragReorder } from "@/lib/dragReorder";
@@ -289,20 +290,17 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
 
       <!-- The chain, in the order it is applied ---------------------------->
       <div v-if="chainStages.length" class="panel__chain">
-        <SectionHeader
+        <EffectsAreaExplanation
           v-if="canReorder"
           :title="SECTION_LABELS.chainOrder"
+          note="Top is applied first"
           :overridden="overridden('chainOrder')"
           :can-override="canOverride"
           @clear="clearSection('chainOrder')"
         >
-          <div class="panel__spacer" />
-          <span class="panel__global-note">Top is applied first</span>
-        </SectionHeader>
-        <p v-if="canReorder" class="panel__hint panel__hint--lead">
           These run in the order they are listed. Drag one by its handle, or focus a
           handle and use the arrow keys, to change what the signal meets first.
-        </p>
+        </EffectsAreaExplanation>
 
         <ul ref="chainListEl" class="panel__chain-list">
           <template v-for="(stage, index) in chainStages" :key="stage">
@@ -395,21 +393,18 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
 
       <!-- Everything that is not a stage of the chain ---------------------->
       <div v-if="layoutSections.length" class="panel__chain panel__layout">
-        <SectionHeader
+        <EffectsAreaExplanation
           :title="SECTION_LABELS.layoutOrder"
+          note="Order is layout only"
           :overridden="overridden('layoutOrder')"
           :can-override="canOverride"
           @clear="clearSection('layoutOrder')"
         >
-          <div class="panel__spacer" />
-          <span class="panel__global-note">Order is layout only</span>
-        </SectionHeader>
-        <p class="panel__hint panel__hint--lead">
           None of these is a stage the signal passes through — varispeed happens as
           the file is read, the gain ride comes after the effects, a crossfade
           belongs to the join between two songs, and a bed is laid over the top. Move
           them to suit how you work; the sound does not change.
-        </p>
+        </EffectsAreaExplanation>
 
         <ul ref="layoutListEl" class="panel__chain-list panel__layout-list">
           <template v-for="(section, index) in layoutSections" :key="section">
@@ -676,9 +671,6 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   cursor: grabbing;
 }
 
-.panel__hint--lead {
-  margin: -2px 0 12px;
-}
 
 .panel__spacer {
   flex: 1;

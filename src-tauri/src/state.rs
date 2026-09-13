@@ -197,6 +197,7 @@ pub struct AppPreferences {
     pub archive_min_plays: u32,
     pub discover_max_plays: u32,
     pub hidden_built_in_preset_ids: Vec<String>,
+    pub hide_built_in_master_mixer_presets: bool,
     pub hidden_built_in_filter_ids: Vec<String>,
     /// Rebound keyboard shortcuts, by action id. An action that is absent uses
     /// the default binding the frontend holds; the backend only stores this.
@@ -229,6 +230,7 @@ impl Default for AppPreferences {
             archive_min_plays: 3,
             discover_max_plays: 3,
             hidden_built_in_preset_ids: Vec::new(),
+            hide_built_in_master_mixer_presets: false,
             hidden_built_in_filter_ids: Vec::new(),
             shortcuts: BTreeMap::new(),
             playlist_order: Vec::new(),
@@ -652,6 +654,7 @@ mod tests {
         assert_eq!(json["ambienceWithoutPlayback"], false);
         assert_eq!(json["discoverMaxPlays"], 3);
         assert_eq!(json["hiddenBuiltInPresetIds"], serde_json::json!([]));
+        assert_eq!(json["hideBuiltInMasterMixerPresets"], false);
         assert_eq!(json["hiddenBuiltInFilterIds"], serde_json::json!([]));
     }
 
@@ -756,6 +759,7 @@ mod tests {
         assert_eq!(preferences.fade_mode, "off");
         assert_eq!(preferences.mix_length, 50);
         assert!(preferences.hidden_built_in_preset_ids.is_empty());
+        assert!(!preferences.hide_built_in_master_mixer_presets);
         assert!(preferences.hidden_built_in_filter_ids.is_empty());
     }
 

@@ -48,6 +48,8 @@ export interface AppPreferences {
   archiveMinPlays: number;
   discoverMaxPlays: number;
   hiddenBuiltInPresetIds: string[];
+  /** Hide the built-in preset group only in the Master Mixer effects rack. */
+  hideBuiltInMasterMixerPresets: boolean;
   hiddenBuiltInFilterIds: string[];
   /**
    * Rebound keyboard shortcuts, by action id. An action with no entry uses the

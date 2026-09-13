@@ -19,7 +19,6 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import AppSlider from "../ui/AppSlider.vue";
-import BlockEffectsMenu from "./BlockEffectsMenu.vue";
 import BlockEffectsRack from "./BlockEffectsRack.vue";
 import MixBlockView from "./MixBlockView.vue";
 import StereoLevelMeter from "./StereoLevelMeter.vue";
@@ -62,13 +61,7 @@ import {
   updateLane,
 } from "@/lib/masterMix";
 import { formatDuration } from "@/lib/format";
-import {
-  RACK_DEVICES,
-  SECTION_LABELS,
-  deviceDefault,
-  pitchRatio,
-  resolve,
-} from "@/lib/mixer";
+import { pitchRatio, resolve } from "@/lib/mixer";
 import { useDismiss } from "@/lib/dismiss";
 import { visibleBounds } from "@/lib/frame";
 import { useMasterMixStore, type Tool } from "@/stores/masterMix";
@@ -77,7 +70,6 @@ import { usePlayerStore } from "@/stores/player";
 import { usePlaylistStore } from "@/stores/playlists";
 import { useUiStore } from "@/stores/ui";
 import * as api from "@/lib/api";
-import type { DeviceSection } from "@/lib/mixer";
 import type { MasterMix, MixBlock } from "@/lib/types";
 
 const store = useMasterMixStore();
@@ -94,6 +86,8 @@ const TAIL_SECS = 60;
 
 const scroller = ref<HTMLElement | null>(null);
 const dialog = ref<HTMLElement | null>(null);
+/** The header button owns rack visibility; selection only changes its target. */
+const effectsOpen = ref(false);
 
 const tools: { id: Tool; icon: "automation" | "blade" | "pointer"; label: string; hint: string }[] = [
   {
@@ -1069,14 +1063,6 @@ const blockMixerBound = computed(
     mixer.target.blockId === selectedBlock.value.id,
 );
 
-/** The effects the selected block has, which is what the rack draws. */
-const blockDevices = computed<DeviceSection[]>(() =>
-  blockMixerBound.value
-    ? mixer.overriddenSections.filter((section): section is DeviceSection =>
-        (RACK_DEVICES as string[]).includes(section),
-      )
-    : [],
-);
 
 /** Point the mixer at the one selected region, or back at the global layer. */
 async function bindMixerToSelection() {
@@ -1106,23 +1092,6 @@ async function bindMixerToSelection() {
   );
 }
 
-/**
- * Add an effect to the selected block.
- *
- * Written into the block's own layer switched on, which is both what makes it
- * appear in the rack — a device *is* a section this layer sets — and what lets
- * it be heard without a second trip to a toggle.
- */
-async function addBlockDevice(section: DeviceSection) {
-  const block = selectedBlock.value;
-  if (!block) {
-    ui.notify("Select a block first");
-    return;
-  }
-  await bindMixerToSelection();
-  await mixer.setSection(section, deviceDefault(section));
-  ui.notify(`${SECTION_LABELS[section]} added to ${blockName(block)}`);
-}
 
 async function importPaths(paths: string[], startSecs: number, laneIndex: number) {
   if (!store.playlistId || paths.length === 0) return;
@@ -1423,11 +1392,17 @@ const summary = computed(() => {
         >
           Duplicate
         </button>
-        <BlockEffectsMenu
-          :present="blockDevices"
+        <button
+          class="mm__mixer-button"
+          :class="{ 'is-active': effectsOpen }"
+          type="button"
           :disabled="!selectedBlock"
-          @add="addBlockDevice"
-        />
+          :aria-pressed="effectsOpen"
+          title="Show or hide effects for the selected block"
+          @click="effectsOpen = !effectsOpen"
+        >
+          Effects
+        </button>
 
         <button class="icon-button" type="button" aria-label="Close master mixer" @click="close">
           <PnmIcon name="close" :size="17" />
@@ -1813,7 +1788,7 @@ const summary = computed(() => {
       </div>
 
       <BlockEffectsRack
-        v-if="selectedBlock && blockMixerBound && blockDevices.length"
+        v-if="effectsOpen && selectedBlock && blockMixerBound"
         :block-id="selectedBlock.id"
         :block-name="blockName(selectedBlock)"
       />
@@ -1990,6 +1965,12 @@ const summary = computed(() => {
 .mm__mixer-button:hover:not(:disabled),
 .mm__duplicate-button:hover:not(:disabled) {
   background: var(--bg-hover);
+}
+
+.mm__mixer-button.is-active {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+  color: var(--accent);
 }
 
 .mm__mixer-button:disabled,

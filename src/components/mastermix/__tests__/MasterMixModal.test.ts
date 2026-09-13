@@ -591,11 +591,8 @@ describe("MasterMixModal", () => {
     }
   });
 
-  /**
-   * Selecting a region is what opens its effects now: the arrangement is a
-   * mini-DAW, so the rack along the bottom edits whatever is selected rather
-   * than a sidebar being opened for it.
-   */
+  /** A selected region points the shared mixer at that block; the Effects
+   * button independently decides whether its rack is visible. */
   it("points the mixer at the one selected block, and back at global when it is deselected", async () => {
     const { wrapper, store } = await open();
     const mixer = useMixerStore();
@@ -616,10 +613,10 @@ describe("MasterMixModal", () => {
     expect(mixer.target.kind).toBe("global");
   });
 
-  it("adds an effect from the menu and racks it, writing to only that block", async () => {
+  it("toggles the selected block's rack and adds effects from its title bar", async () => {
     const { wrapper, store } = await open();
-    const trigger = wrapper.get(".effects-menu__trigger");
-    expect((trigger.element as HTMLButtonElement).disabled).toBe(true);
+    const effects = wrapper.get(".mm__mixer-button");
+    expect((effects.element as HTMLButtonElement).disabled).toBe(true);
     expect(wrapper.find(".rack").exists()).toBe(false);
 
     await wrapper.findAll(".block")[0].trigger("pointerdown", {
@@ -629,12 +626,19 @@ describe("MasterMixModal", () => {
     });
     await flushPromises();
 
-    // Selected but with no effects yet: the rack has nothing to show.
+    expect((effects.element as HTMLButtonElement).disabled).toBe(false);
     expect(wrapper.find(".rack").exists()).toBe(false);
-
-    await trigger.trigger("click");
+    await effects.trigger("click");
     await flushPromises();
-    const reverb = wrapper
+
+    const rack = wrapper.get(".rack");
+    expect(effects.attributes("aria-pressed")).toBe("true");
+    expect(rack.text()).toContain("This block has no effects yet");
+    expect(rack.text()).toContain("Preset Select");
+    expect(rack.text()).toContain("+ Add Effect");
+
+    await rack.get(".effects-menu__trigger").trigger("click");
+    const reverb = rack
       .findAll(".effects-menu__menu [role='menuitem']")
       .find((item) => item.text() === "Reverb");
     await reverb?.trigger("click");
@@ -643,17 +647,18 @@ describe("MasterMixModal", () => {
     // Added switched on, so it does something without a second trip to a toggle.
     expect(locate(store.mix, "a")?.block.mixer?.reverb).toMatchObject({ enabled: true });
     expect(locate(store.mix, "b")?.block.mixer).toBeNull();
-
-    const rack = wrapper.get(".rack");
     expect(rack.text()).toContain("Reverb");
-    // One meter either side of the only device in the chain.
     expect(rack.findAll(".level-meter.is-compact")).toHaveLength(2);
     expect(setChainMeterBlock).toHaveBeenCalledWith("a");
 
-    // Taking it off again leaves the block with no override at all.
+    // Removing the last device leaves the open rack ready for another choice.
     await rack.get("[aria-label='Remove Reverb from this block']").trigger("click");
     await flushPromises();
     expect(locate(store.mix, "a")?.block.mixer).toBeNull();
+    expect(wrapper.get(".rack").text()).toContain("This block has no effects yet");
+
+    await effects.trigger("click");
+    expect(effects.attributes("aria-pressed")).toBe("false");
     expect(wrapper.find(".rack").exists()).toBe(false);
   });
 

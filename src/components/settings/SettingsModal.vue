@@ -998,6 +998,23 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 
             <div class="section-heading filters-heading">
               <div>
+                <h4>Master Mixer presets</h4>
+                <p>Choose whether the effects rack includes the presets supplied with the app.</p>
+              </div>
+            </div>
+            <FormRow
+              label="Built-in presets"
+              hint="Custom presets remain available in the Master Mixer."
+            >
+              <AppToggle
+                :model-value="!settings.preferences.hideBuiltInMasterMixerPresets"
+                label="Show built-in presets in the Master Mixer"
+                @update:model-value="updatePreference({ hideBuiltInMasterMixerPresets: !$event })"
+              />
+            </FormRow>
+
+            <div class="section-heading filters-heading">
+              <div>
                 <h4>Mixer presets</h4>
                 <p>Save the current {{ mixer.targetLabel.toLowerCase() }} mixer layer for reuse.</p>
               </div>

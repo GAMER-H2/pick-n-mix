@@ -262,7 +262,11 @@ export const useMixerStore = defineStore("mixer", () => {
   }
 
   async function saveAsPreset(name: string) {
-    presets.value = await api.savePreset(name, clone(targetLayer.value), "mixer");
+    const settings = clone(targetLayer.value);
+    // Presets must reproduce the heard chain rather than inherit whatever order
+    // happens to be underneath when they are applied somewhere else.
+    settings.chainOrder = [...effective.value.chainOrder];
+    presets.value = await api.savePreset(name, settings, "mixer");
   }
 
   async function saveEqPreset(name: string, eq: Eq) {

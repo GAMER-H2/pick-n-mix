@@ -12,7 +12,7 @@ use crate::audio::{
     crossfade::{CrossfadeCurve, CrossfadeSettings},
     params::{
         default_bands, BandKind, Delay, Eq, EqBand, Lofi, MixerSettings, Normalisation, Panning,
-        Pitch, Reverb,
+        Pitch, Reverb, DEFAULT_CHAIN_ORDER,
     },
 };
 
@@ -95,8 +95,15 @@ fn shelved_eq(low_db: f32, mid_db: f32, high_db: f32) -> Eq {
     }
 }
 
+fn default_chain_order_ids() -> Vec<String> {
+    DEFAULT_CHAIN_ORDER
+        .iter()
+        .map(|stage| stage.id().to_string())
+        .collect()
+}
+
 pub fn built_ins() -> Vec<Preset> {
-    vec![
+    let mut presets = vec![
         Preset {
             id: "flat".into(),
             name: "Flat".into(),
@@ -347,7 +354,12 @@ pub fn built_ins() -> Vec<Preset> {
                 ..Default::default()
             },
         },
-    ]
+    ];
+    let chain_order = default_chain_order_ids();
+    for preset in &mut presets {
+        preset.settings.chain_order = Some(chain_order.clone());
+    }
+    presets
 }
 
 /// User presets on disk, plus the built-ins, built-ins first.
@@ -488,6 +500,10 @@ mod tests {
         assert!(all.len() >= 8);
         assert!(all.iter().all(|p| p.built_in));
         assert!(all.iter().all(|p| p.kind == PresetKind::Mixer));
+        let default_chain_order = default_chain_order_ids();
+        assert!(all
+            .iter()
+            .all(|p| p.settings.chain_order.as_ref() == Some(&default_chain_order)));
         assert!(all.iter().any(|p| p.name == "Lo-Fi Study"));
     }
 
@@ -542,8 +558,16 @@ mod tests {
                 fade_in_shape: 0.75,
             },
         };
+        let custom_chain_order = vec![
+            "panning".to_string(),
+            "lofi".to_string(),
+            "reverb".to_string(),
+            "delay".to_string(),
+            "eq".to_string(),
+        ];
         let settings = MixerSettings {
             preset: Some("runtime display value".into()),
+            chain_order: Some(custom_chain_order.clone()),
             reverb: Some(Reverb {
                 enabled: true,
                 mix: 0.66,
@@ -562,6 +586,7 @@ mod tests {
         let mine = all.iter().find(|p| p.name == "My Mix").unwrap();
         assert!(!mine.built_in);
         assert_eq!(mine.settings.preset, None);
+        assert_eq!(mine.settings.chain_order, Some(custom_chain_order));
         assert_eq!(mine.settings.reverb.as_ref().unwrap().mix, 0.66);
         assert_eq!(mine.settings.crossfade, Some(crossfade));
         assert_eq!(mine.settings.panning.as_ref().unwrap().position, 0.35);

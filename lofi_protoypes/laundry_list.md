@@ -2,6 +2,9 @@ Small Tasks:
 - Atmospheres shaders need more refinement (human task, all agents ignore)
 - Maybe fix the slight clipping of leaving atmospheres to play and having the track slightly clip in the first time that's enabled (Opus only, other agents ignore)
 - Albumn art getting squished in full-screen queue view (should shrink like it did before the crossfade fade was added)
+- Very good, some tweaks:
+  - The dropdowns are cut off by the master mixer modal not extending the entire window. Have the drop downs allow to draw over the negative space as well and allow the effects dropdown to scroll in the first place
+  - If the effects button is clicked and no audio block is selected, it still appears but says to select an audio block to start adding and editing effects in greyed out text right in the middle of the effects block
 
 User feedback (from Max):
 - Still to do: presets the user can save to copy a whole chain to other blocks

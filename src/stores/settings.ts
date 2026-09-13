@@ -24,6 +24,7 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   archiveMinPlays: 3,
   discoverMaxPlays: 3,
   hiddenBuiltInPresetIds: [],
+  hideBuiltInMasterMixerPresets: false,
   hiddenBuiltInFilterIds: [],
   shortcuts: {},
   playlistOrder: [],
