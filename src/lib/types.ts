@@ -2,6 +2,7 @@
 
 export type ThemePreference = "system" | "light" | "dark";
 export type FadeMode = "off" | "play" | "pause" | "both";
+export type WindowCornerPreference = "auto" | "square" | "rounded";
 
 /** Durable visual, playback, and recommendation preferences. */
 export interface AppPreferences {
@@ -20,6 +21,8 @@ export interface AppPreferences {
   ambienceWithoutPlayback: boolean;
   /** Crossfade the full-screen artwork and backdrop between tracks. */
   crossfadeArt: boolean;
+  /** Corner handling where the app draws its own window frame. */
+  windowCorners: WindowCornerPreference;
   /**
    * Scroll the queue to the song that has just started playing, when it is
    * not already on screen.

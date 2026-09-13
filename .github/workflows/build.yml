@@ -8,11 +8,6 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      add_to_release:
-        description: Add the resulting installers to a draft GitHub Release
-        required: true
-        default: false
-        type: boolean
       release_version:
         description: Release version used for the tag and filenames
         required: true
@@ -179,13 +174,18 @@ jobs:
 
   release:
     name: Add installers to draft release
-    if: github.event_name == 'workflow_dispatch' && inputs.add_to_release
+    # Pull requests prove that every platform builds, but must not publish.
+    # Successful main/master pushes and manual runs always prepare the draft.
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-22.04
     permissions:
       contents: write
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Download application bundles
         uses: actions/download-artifact@v4
         with:
@@ -193,18 +193,27 @@ jobs:
           path: downloaded-bundles
 
       - name: Prepare release files
+        id: prepare_release
         env:
-          RELEASE_VERSION: ${{ inputs.release_version }}
+          # Dispatches use the requested version. Push events have no inputs,
+          # so they use the application version committed in package.json.
+          RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.release_version || '' }}
         run: |
           python3 - <<'PY'
+          import json
           import os
           import re
           import shutil
           from pathlib import Path
 
           version = os.environ["RELEASE_VERSION"]
+          if not version:
+              version = json.loads(Path("package.json").read_text())["version"]
           if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
               raise SystemExit(f"Invalid release version: {version!r}")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              print(f"version={version}", file=output)
 
           source_dir = Path("downloaded-bundles")
           output_dir = Path("release-files")
@@ -230,8 +239,8 @@ jobs:
       - name: Add files to draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ inputs.release_version }}
-          name: Pick n Mix ${{ inputs.release_version }}
+          tag_name: v${{ steps.prepare_release.outputs.version }}
+          name: Pick n Mix ${{ steps.prepare_release.outputs.version }}
           draft: true
           fail_on_unmatched_files: true
           files: release-files/*

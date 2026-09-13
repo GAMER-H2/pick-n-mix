@@ -87,6 +87,24 @@ impl PlanBlock {
             &[]
         }
     }
+
+    /// Whether `other` describes the same *reading* of the same file, and so
+    /// differs only in ways a block already sounding can adopt.
+    ///
+    /// A decoder is opened against a path, a point in that file and a
+    /// resampling ratio, and keeps reading from where it got to. Change any of
+    /// those and the voice in flight is reading the wrong thing, so the mix
+    /// has to be rebuilt. Everything else — the effect chain, the level, the
+    /// envelope — is re-read from the plan on every buffer, so it can simply
+    /// be swapped underneath.
+    fn is_live_compatible(&self, other: &PlanBlock) -> bool {
+        self.path == other.path
+            && self.block.id == other.block.id
+            && self.block.start_secs == other.block.start_secs
+            && self.block.offset_secs == other.block.offset_secs
+            && self.block.duration_secs == other.block.duration_secs
+            && self.speed() == other.speed()
+    }
 }
 
 /// A whole master mix, ready to play.
@@ -114,6 +132,21 @@ impl Plan {
 
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+
+    /// Whether `other` can replace this plan while it is playing.
+    ///
+    /// Blocks are compared position by position: the plan is sorted by start
+    /// time, and the voices that are sounding address their blocks by index,
+    /// so a plan whose blocks line up one for one is one those voices still
+    /// describe correctly.
+    pub fn is_live_compatible(&self, other: &Plan) -> bool {
+        self.blocks.len() == other.blocks.len()
+            && self
+                .blocks
+                .iter()
+                .zip(other.blocks.iter())
+                .all(|(a, b)| a.is_live_compatible(b))
     }
 }
 
@@ -251,6 +284,26 @@ impl TimelineSource {
         if !Arc::ptr_eq(&self.bank, &bank) {
             self.bank = bank;
         }
+    }
+
+    /// Adopt a re-resolved plan without interrupting what is playing.
+    ///
+    /// This is what makes a knob in the Master Mixer's rack behave like the
+    /// one downstairs. `render_active` re-reads every block's settings from
+    /// the plan on each buffer, so swapping the plan is heard on the next one
+    /// — no file is reopened, no decoder is thrown away and nothing is
+    /// re-seeked, which is the difference between an edit landing instantly
+    /// and landing after a gap.
+    ///
+    /// Returns `false`, having changed nothing, when the new plan is not one
+    /// that can be adopted mid-flight — a block moved, trimmed, repitched,
+    /// added or removed. The caller rebuilds in that case.
+    pub fn try_update_plan(&mut self, plan: &Arc<Plan>) -> bool {
+        if !self.plan.is_live_compatible(plan) {
+            return false;
+        }
+        self.plan = Arc::clone(plan);
+        true
     }
 
     /// Beds asked for since this was last called, so they can be decoded.
@@ -717,9 +770,17 @@ mod tests {
     use crate::master_mix::BlockSource;
 
     fn plan_block(start: f64, duration: f64) -> PlanBlock {
+        named_block("blk-test", start, duration)
+    }
+
+    /// The same, with an id of your choosing. A block's id is what the live
+    /// path matches plans up by, so a test about it cannot use the generated
+    /// one — two calls to [`plan_block`] would describe two different blocks.
+    fn named_block(id: &str, start: f64, duration: f64) -> PlanBlock {
         PlanBlock {
             path: PathBuf::from("/nowhere.flac"),
             block: Block {
+                id: id.to_string(),
                 source: BlockSource::Entry { index: 0 },
                 start_secs: start,
                 duration_secs: duration,
@@ -729,6 +790,94 @@ mod tests {
             settings: Arc::new(Resolved::default()),
             track_gain_db: 0.0,
         }
+    }
+
+    /// The whole point of the live path: a knob in the rack must be heard
+    /// without the mix being rebuilt around it.
+    #[test]
+    fn a_settings_only_edit_is_adopted_by_a_running_timeline() {
+        use crate::audio::params::Reverb;
+
+        let mut source = TimelineSource::new(Plan::new(vec![plan_block(0.0, 10.0)]), 48_000);
+
+        let mut edited = plan_block(0.0, 10.0);
+        edited.settings = Arc::new(Resolved {
+            reverb: Reverb {
+                mix: 0.7,
+                ..Reverb::default()
+            },
+            ..Resolved::default()
+        });
+        let next = Arc::new(Plan::new(vec![edited]));
+
+        assert!(source.try_update_plan(&next));
+        assert_eq!(source.plan.blocks[0].settings.reverb.mix, 0.7);
+    }
+
+    /// Lane level and the volume envelope are read afresh every buffer too, so
+    /// they ride along on the same path rather than costing a rebuild.
+    #[test]
+    fn a_level_edit_is_adopted_by_a_running_timeline() {
+        let mut source = TimelineSource::new(Plan::new(vec![plan_block(0.0, 10.0)]), 48_000);
+
+        let mut edited = plan_block(0.0, 10.0);
+        edited.lane_gain = 0.25;
+        edited.block.gain_db = -6.0;
+
+        assert!(source.try_update_plan(&Arc::new(Plan::new(vec![edited]))));
+        assert_eq!(source.plan.blocks[0].lane_gain, 0.25);
+    }
+
+    /// Everything a decoder was opened against has to go back through a
+    /// rebuild, or the voices already sounding would be reading the wrong part
+    /// of the wrong file.
+    #[test]
+    fn moving_trimming_or_repitching_a_block_is_refused_by_the_live_path() {
+        use crate::audio::params::Pitch;
+
+        let original = || Plan::new(vec![plan_block(0.0, 10.0)]);
+
+        let mut moved = plan_block(0.0, 10.0);
+        moved.block.start_secs = 4.0;
+
+        let mut trimmed = plan_block(0.0, 10.0);
+        trimmed.block.offset_secs = 3.0;
+
+        let mut shortened = plan_block(0.0, 10.0);
+        shortened.block.duration_secs = 6.0;
+
+        let mut repitched = plan_block(0.0, 10.0);
+        repitched.settings = Arc::new(Resolved {
+            pitch: Pitch {
+                semitones: 12.0,
+                cents: 0.0,
+            },
+            ..Resolved::default()
+        });
+
+        let mut elsewhere = plan_block(0.0, 10.0);
+        elsewhere.path = PathBuf::from("/somewhere-else.flac");
+
+        for candidate in [moved, trimmed, shortened, repitched, elsewhere] {
+            let mut source = TimelineSource::new(original(), 48_000);
+            let before = Arc::clone(&source.plan);
+            assert!(!source.try_update_plan(&Arc::new(Plan::new(vec![candidate]))));
+            assert!(
+                Arc::ptr_eq(&source.plan, &before),
+                "a refusal changes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn adding_or_removing_a_block_is_refused_by_the_live_path() {
+        let mut source = TimelineSource::new(Plan::new(vec![plan_block(0.0, 10.0)]), 48_000);
+
+        let added = Plan::new(vec![plan_block(0.0, 10.0), named_block("blk-b", 20.0, 5.0)]);
+        assert!(!source.try_update_plan(&Arc::new(added)));
+
+        let removed = Plan::new(vec![]);
+        assert!(!source.try_update_plan(&Arc::new(removed)));
     }
 
     #[test]
@@ -820,7 +969,10 @@ mod tests {
             },
             ..Resolved::default()
         });
-        assert!((block.speed() - 2.0).abs() < 1e-9, "an octave up is double speed");
+        assert!(
+            (block.speed() - 2.0).abs() < 1e-9,
+            "an octave up is double speed"
+        );
 
         // Four timeline seconds in, at double speed, is eight source seconds.
         let into_block = 4.0;

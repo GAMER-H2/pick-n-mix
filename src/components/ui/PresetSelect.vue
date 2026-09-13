@@ -9,10 +9,11 @@
  * Presentational by design: stores stay in the feature wrappers, which map
  * their state onto the props and handle `select` / `delete` / `save`.
  */
-import { nextTick, ref } from "vue";
+import { nextTick, onBeforeUnmount, ref } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import MenuSurface, { type MenuGroup, type MenuItem } from "./MenuSurface.vue";
 import { useDismiss } from "@/lib/dismiss";
+import { visibleBounds } from "@/lib/frame";
 
 const props = withDefaults(
   defineProps<{
@@ -30,8 +31,10 @@ const props = withDefaults(
     deleteLabel?: string;
     /** Fill the parent's width (the mixer panels) instead of hugging content. */
     stretch?: boolean;
+    /** Escape clipping surfaces and position against the visible window. */
+    floating?: boolean;
   }>(),
-  { deleteLabel: "Delete preset", stretch: false },
+  { deleteLabel: "Delete preset", stretch: false, floating: false },
 );
 
 const emit = defineEmits<{
@@ -43,23 +46,67 @@ const emit = defineEmits<{
 const open = ref(false);
 const naming = ref(false);
 const draftName = ref("");
+const rootEl = ref<HTMLElement | null>(null);
 const menuEl = ref<HTMLElement | null>(null);
 const buttonEl = ref<HTMLElement | null>(null);
+const menuStyle = ref<Record<string, string>>({});
+
+const GAP = 5;
+const MIN_ROOM = 160;
+const MAX_HEIGHT = 360;
 
 // The trigger is ignored so its own click still toggles: without this the
 // dismiss runs on pointerdown, closes the menu, and the click handler then
 // reopens it — so clicking the button could never close the menu.
 useDismiss(
   () => open.value,
-  () => (open.value = false),
+  () => {
+    open.value = false;
+    stopTracking();
+  },
   menuEl,
-  { ignore: [buttonEl] },
+  { ignore: [rootEl] },
 );
+
+function place() {
+  if (!props.floating) return;
+  const trigger = buttonEl.value?.getBoundingClientRect();
+  if (!trigger) return;
+  const frame = visibleBounds();
+  const below = frame.bottom - trigger.bottom - GAP;
+  const above = trigger.top - frame.top - GAP;
+  const flip = below < MIN_ROOM && above > below;
+  const room = Math.max(flip ? above : below, 0);
+
+  menuStyle.value = {
+    right: `${Math.max(frame.left, window.innerWidth - trigger.right)}px`,
+    width: `${Math.max(230, trigger.width)}px`,
+    maxWidth: `${frame.width - 16}px`,
+    maxHeight: `${Math.min(MAX_HEIGHT, room)}px`,
+    transformOrigin: flip ? "bottom right" : "top right",
+    ...(flip
+      ? { bottom: `${window.innerHeight - trigger.top + GAP}px` }
+      : { top: `${trigger.bottom + GAP}px` }),
+  };
+}
+
+function stopTracking() {
+  window.removeEventListener("scroll", place, true);
+  window.removeEventListener("resize", place);
+}
 
 async function toggle() {
   open.value = !open.value;
-  if (!open.value) return;
+  if (!open.value) {
+    stopTracking();
+    return;
+  }
   naming.value = false;
+  place();
+  if (props.floating) {
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+  }
   // Focus the current entry so the arrow keys have somewhere to start.
   await nextTick();
   menuEl.value?.querySelector<HTMLElement>("[aria-checked='true']")?.focus();
@@ -67,6 +114,7 @@ async function toggle() {
 
 function onSelect(id: string) {
   open.value = false;
+  stopTracking();
   emit("select", id);
 }
 
@@ -85,11 +133,13 @@ function closeSaveRow() {
   draftName.value = "";
 }
 
+onBeforeUnmount(stopTracking);
+
 defineExpose({ closeSaveRow });
 </script>
 
 <template>
-  <div class="preset" :class="{ 'preset--stretch': props.stretch }">
+  <div ref="rootEl" class="preset" :class="{ 'preset--stretch': props.stretch }">
     <button
       ref="buttonEl"
       class="preset__button"
@@ -101,10 +151,17 @@ defineExpose({ closeSaveRow });
       <PnmIcon name="chevronDown" :size="14" />
     </button>
 
-    <Transition name="pop">
-      <div v-if="open" ref="menuEl" class="preset__menu">
-        <MenuSurface :groups="groups" @select="onSelect">
-          <template v-if="custom.length">
+    <Teleport to="body" :disabled="!props.floating">
+      <Transition name="pop">
+        <div
+          v-if="open"
+          ref="menuEl"
+          class="preset__menu"
+          :class="{ 'is-floating': props.floating }"
+          :style="props.floating ? menuStyle : undefined"
+        >
+          <MenuSurface :groups="groups" @select="onSelect">
+            <template v-if="custom.length">
             <div class="preset__separator" />
             <div class="preset__group">Yours</div>
             <button
@@ -122,10 +179,10 @@ defineExpose({ closeSaveRow });
                 </span>
               </span>
             </button>
-          </template>
+            </template>
 
-          <div class="preset__separator" />
-          <div v-if="naming" class="preset__save">
+            <div class="preset__separator" />
+            <div v-if="naming" class="preset__save">
             <input
               v-model="draftName"
               class="text-field"
@@ -136,14 +193,15 @@ defineExpose({ closeSaveRow });
               @keydown.esc="naming = false"
             />
             <button class="pill-button" @click="save">Save</button>
-          </div>
-          <button v-else class="preset__item" role="menuitem" @click="naming = true">
-            <PnmIcon name="plus" :size="14" />
-            <span>{{ saveActionLabel }}</span>
-          </button>
-        </MenuSurface>
-      </div>
-    </Transition>
+            </div>
+            <button v-else class="preset__item" role="menuitem" @click="naming = true">
+              <PnmIcon name="plus" :size="14" />
+              <span>{{ saveActionLabel }}</span>
+            </button>
+          </MenuSurface>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -187,6 +245,10 @@ defineExpose({ closeSaveRow });
   width: 230px;
   max-height: min(360px, 70vh);
   overflow-y: auto;
+}
+
+.preset__menu.is-floating {
+  position: fixed;
 }
 
 .preset--stretch .preset__menu {

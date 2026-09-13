@@ -112,6 +112,11 @@ html.is-mac-overlay {
   --separator: rgba(0, 0, 0, 0.09);
   --separator-strong: rgba(0, 0, 0, 0.16);
   --control-track: rgba(0, 0, 0, 0.12);
+  /* Laid over a level meter's gradient where the signal is not reaching, so
+     the rest of the scale still reads as the colour it will turn. Not quite
+     opaque: enough of the gradient shows through to see where the loud end is
+     without it being mistakable for a level. */
+  --meter-unlit: rgba(255, 255, 255, 0.78);
   --art-placeholder: linear-gradient(160deg, #e9e9ee, #d8d8e0);
 
   /* Edge of a window that draws its own frame. Dark against a light desktop. */
@@ -136,6 +141,7 @@ html.is-mac-overlay {
   --separator: rgba(255, 255, 255, 0.1);
   --separator-strong: rgba(255, 255, 255, 0.18);
   --control-track: rgba(255, 255, 255, 0.16);
+  --meter-unlit: rgba(22, 22, 24, 0.68);
   --art-placeholder: linear-gradient(160deg, #2c2c31, #1e1e22);
 
   /* A dark hairline would vanish into a dark desktop, so the edge is picked

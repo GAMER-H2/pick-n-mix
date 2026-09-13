@@ -3,11 +3,12 @@
 //! Every command returns `Result<T, String>` because `anyhow::Error` is not
 //! serialisable; `err` turns any error into a message safe to show the user.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context as _};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::audio::ambience::{self, FilterInfo};
 use crate::audio::crossfade::CrossfadeSettings;
@@ -682,14 +683,6 @@ pub fn set_output_meter_enabled(state: State<'_, AppState>, enabled: bool) -> Cm
     Ok(())
 }
 
-/// Latest post-limiter, pre-player-volume stereo levels in dBFS.
-#[tauri::command]
-pub fn output_level_frame(
-    state: State<'_, AppState>,
-) -> Cmd<crate::audio::meter::OutputLevelFrame> {
-    Ok(*state.engine.output_level_frame())
-}
-
 /// Meter one master-mix block's effect chain, or `None` to stop.
 ///
 /// The rack in the Master Mixer asks for whichever block is selected. Only one
@@ -701,12 +694,27 @@ pub fn set_chain_meter_block(state: State<'_, AppState>, block_id: Option<String
     Ok(())
 }
 
-/// Levels at every point in the metered block's chain: in, then after each
-/// effect. Empty until the mix is auditioned, since nothing has passed through
-/// the chain to measure.
+/// Every meter on screen, in one reply.
+///
+/// The Master Mixer draws the master bus and, when a block is selected, the
+/// taps either side of each of its effects. Asking for them separately put two
+/// IPC round trips inside every animation frame, which is what kept the meters
+/// from moving at the refresh rate; one call fills every bar on the screen.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeterFrames {
+    pub output: crate::audio::meter::OutputLevelFrame,
+    /// The selected block's chain taps. `None` when the caller has no rack
+    /// open to draw them in.
+    pub chain: Option<crate::audio::meter::ChainLevelFrame>,
+}
+
 #[tauri::command]
-pub fn chain_level_frame(state: State<'_, AppState>) -> Cmd<crate::audio::meter::ChainLevelFrame> {
-    Ok(state.chain_meter.frame())
+pub fn meter_frames(state: State<'_, AppState>, chain: bool) -> Cmd<MeterFrames> {
+    Ok(MeterFrames {
+        output: *state.engine.output_level_frame(),
+        chain: chain.then(|| state.chain_meter.frame()),
+    })
 }
 
 /// Audition one EQ band's own frequency range on its own.
@@ -876,6 +884,14 @@ pub fn set_app_preferences(
     state
         .engine
         .set_ambience_alone(preferences.ambience_without_playback);
+    if preferences.window_corners != previous.window_corners {
+        if let Some(window) = app.get_webview_window("main") {
+            crate::window_frame::set_corners(
+                &window,
+                crate::window_frame::Corners::from_id(&preferences.window_corners),
+            );
+        }
+    }
     if preferences.output_device != previous.output_device {
         apply_output_device(&app, &state, &preferences.output_device)?;
     }
@@ -2503,6 +2519,10 @@ pub fn begin_master_mix_session(app: AppHandle, state: State<'_, AppState>) -> C
     if snapshot.playing {
         state.engine.pause();
     }
+    // The queue is paused for as long as the editor is open, so the ambience
+    // beds go quiet with it rather than playing over a silent editor: the
+    // arrangement being auditioned brings its own atmospheres, per block.
+    state.engine.set_ambience_suspended(true);
     let token = state.next_master_mix_session_token();
     *slot = Some(MasterMixSession {
         token: token.clone(),
@@ -2524,6 +2544,9 @@ pub fn end_master_mix_session(
     }
     let session = slot.take().expect("session checked above");
 
+    // The editor no longer owns the transport, so the listener's own ambience
+    // preference applies again.
+    state.engine.set_ambience_suspended(false);
     state.engine.cancel_next();
     state.master_mix_playback.lock().take();
     match session.original {
@@ -2638,6 +2661,50 @@ pub fn play_master_mix(
     state.engine.play();
     let _ = app.emit("playing-changed", true);
     Ok(duration)
+}
+
+/// Apply an edit to the mix already being auditioned, without rebuilding it.
+///
+/// This is the fast path behind every knob in the Master Mixer's rack. The
+/// plan a timeline plays is re-read on every audio buffer, so a change to a
+/// block's effects, level or envelope can be swapped straight in and heard on
+/// the next one — no file reopened, no seek, no gap.
+///
+/// Returns whether it landed. `false` means the edit moved, trimmed, repitched,
+/// added or removed a block, which the voices already sounding cannot adopt;
+/// the caller falls back to [`play_master_mix`].
+#[tauri::command]
+pub fn update_master_mix(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    mix: crate::master_mix::MasterMix,
+    token: String,
+) -> Cmd<bool> {
+    let session = state.master_mix_session.lock();
+    if !session
+        .as_ref()
+        .is_some_and(|session| session.token == token)
+    {
+        return Ok(false);
+    }
+    // Only the audition this token owns may be edited under the user's feet.
+    if !matches!(
+        state.master_mix_playback.lock().as_ref(),
+        Some(MasterMixPlayback::Audition { token: active, playlist_id: active_id, .. })
+            if active == &token && active_id == &playlist_id
+    ) {
+        return Ok(false);
+    }
+    let Some((path, p)) = find_playlist(&state, &playlist_id) else {
+        return Err("playlist not found".into());
+    };
+    let mut mix = mix;
+    mix.normalise(p.tracks.len());
+    let plan = build_plan(&state, &p, &mix, &path).map_err(err)?;
+    if plan.is_empty() {
+        return Ok(false);
+    }
+    Ok(state.engine.update_timeline(std::sync::Arc::new(plan)))
 }
 
 /// Pause or resume the loaded timeline without clearing its decoder and DSP state.
@@ -3304,6 +3371,11 @@ fn build_plan(
     let playlist_layer = p.mixer.clone().unwrap_or_default();
     let assets = Playlist::assets_dir(playlist_path);
 
+    // Looking a song's file up goes to the database twice. The same song can
+    // be on the timeline many times over — that is what an arrangement is for
+    // — and a plan is rebuilt for every edit that cannot be applied live, so
+    // the lookups are remembered for the length of this build.
+    let mut files: HashMap<String, Option<(PathBuf, f32)>> = HashMap::new();
     let mut blocks = Vec::new();
     for lane in mix.lanes.iter() {
         let lane_gain = if mix.lane_audible(lane) {
@@ -3320,14 +3392,25 @@ fn build_plan(
                     let Some(track) = item.track.as_ref() else {
                         continue;
                     };
-                    let Some(file) = state.playback_files(&track.id)?.into_iter().next() else {
+                    let found = match files.get(&track.id) {
+                        Some(found) => found.clone(),
+                        None => {
+                            let found =
+                                state
+                                    .playback_files(&track.id)?
+                                    .into_iter()
+                                    .next()
+                                    .map(|file| {
+                                        (PathBuf::from(file.location), file.gain_db.unwrap_or(0.0))
+                                    });
+                            files.insert(track.id.clone(), found.clone());
+                            found
+                        }
+                    };
+                    let Some((path, gain_db)) = found else {
                         continue;
                     };
-                    (
-                        PathBuf::from(file.location),
-                        item.entry.mixer.clone().unwrap_or_default(),
-                        file.gain_db.unwrap_or(0.0),
-                    )
+                    (path, item.entry.mixer.clone().unwrap_or_default(), gain_db)
                 }
                 BlockSource::Asset { file } => {
                     let path = assets.join(file);

@@ -12,6 +12,7 @@ const entryWaveform = vi.fn();
 const beginMasterMixSession = vi.fn();
 const endMasterMixSession = vi.fn();
 const playMasterMix = vi.fn();
+const updateMasterMix = vi.fn();
 const setMasterMixPlaying = vi.fn();
 const stopMasterMix = vi.fn();
 
@@ -24,6 +25,7 @@ vi.mock("@/lib/api", () => ({
   beginMasterMixSession: (...args: unknown[]) => beginMasterMixSession(...args),
   endMasterMixSession: (...args: unknown[]) => endMasterMixSession(...args),
   playMasterMix: (...args: unknown[]) => playMasterMix(...args),
+  updateMasterMix: (...args: unknown[]) => updateMasterMix(...args),
   setMasterMixPlaying: (...args: unknown[]) => setMasterMixPlaying(...args),
   stopMasterMix: (...args: unknown[]) => stopMasterMix(...args),
   assetWaveform: vi.fn(),
@@ -61,6 +63,11 @@ function mix(): MasterMix {
       },
     ],
   };
+}
+
+/** A reverb that is on, which is as much as these tests need of one. */
+function reverb() {
+  return { enabled: true, size: 0.6, damping: 0.5, width: 1, mix: 0.4, predelayMs: 0 };
 }
 
 function view(overrides: Partial<MasterMixView> = {}): MasterMixView {
@@ -106,6 +113,7 @@ describe("master mix store", () => {
     beginMasterMixSession.mockResolvedValue("session-1");
     endMasterMixSession.mockResolvedValue(true);
     playMasterMix.mockResolvedValue(100);
+    updateMasterMix.mockResolvedValue(true);
     setMasterMixPlaying.mockImplementation(async (playing: boolean) => playing);
     stopMasterMix.mockResolvedValue(undefined);
   });
@@ -425,6 +433,101 @@ describe("master mix store", () => {
     // But the speed is now known, so the next change does resize it.
     store.setBlockMixer("a", {}, 1);
     expect(locate(store.mix, "a")!.block.durationSecs).toBe(200);
+  });
+
+  /**
+   * The reason the rack felt slower than the mixer downstairs: every knob used
+   * to rebuild the whole arrangement, which reopens each sounding file and
+   * re-seeks it. An effect change is not a change to what is being read, so it
+   * goes to the running mix instead and is heard on the next audio buffer.
+   */
+  it("pushes an effect change into the running mix rather than rebuilding it", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(30);
+    playMasterMix.mockClear();
+
+    store.setBlockMixer("a", { reverb: reverb() });
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(updateMasterMix).toHaveBeenCalledWith("pl_1", store.mix, "session-1");
+    expect(playMasterMix).not.toHaveBeenCalled();
+  });
+
+  it("rebuilds for a change the running mix cannot take", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(30);
+    playMasterMix.mockClear();
+
+    // Moving a block changes where every voice is reading from, so there is
+    // nothing to hand the engine but a new arrangement.
+    store.commit(moveBlock(store.mix, "a", 40));
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(updateMasterMix).not.toHaveBeenCalled();
+    expect(playMasterMix).toHaveBeenCalledTimes(1);
+  });
+
+  /** The engine has the final say; a refusal must still be heard. */
+  it("falls back to a rebuild when the engine will not take the edit", async () => {
+    updateMasterMix.mockResolvedValue(false);
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    await store.play(30);
+    playMasterMix.mockClear();
+
+    store.setBlockMixer("a", { reverb: reverb() });
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(updateMasterMix).toHaveBeenCalledTimes(1);
+    expect(playMasterMix).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not ask the engine for anything while nothing is being auditioned", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+
+    store.setBlockMixer("a", { reverb: reverb() });
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(updateMasterMix).not.toHaveBeenCalled();
+    expect(playMasterMix).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A write comes back with its revision advanced, so the arrangement is never
+   * identical to the one that was sent. Adopting it wholesale handed every
+   * region on the timeline a new object — and its waveform a new canvas —
+   * after every edit, which is a redraw of the whole thing for nothing.
+   */
+  it("keeps the regions it already had when a save changes nothing", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+    store.setBlockMixer("a", { reverb: reverb() });
+    // The edit itself replaces the lane it touched; what must not happen is
+    // the save replacing them all again once it comes back.
+    const settled = store.mix.lanes;
+    const entriesBefore = store.entries;
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(setMasterMix).toHaveBeenCalled();
+    expect(store.mix.lanes).toBe(settled);
+    expect(store.entries).toBe(entriesBefore);
+  });
+
+  it("takes the arrangement the backend settled on when it differs", async () => {
+    const store = useMasterMixStore();
+    await store.openFor("pl_1");
+
+    // The backend clamps a block back inside the timeline, say.
+    setMasterMix.mockImplementation(async () =>
+      view({ mix: moveBlock(mix(), "a", 12) }),
+    );
+    store.commit(moveBlock(store.mix, "a", -5));
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(locate(store.mix, "a")!.block.startSecs).toBe(12);
   });
 
   it("writes a block mixer with no speed at all without touching its length", async () => {

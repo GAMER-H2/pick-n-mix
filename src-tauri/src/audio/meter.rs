@@ -240,7 +240,13 @@ impl ChainMeters {
     /// Feed the signal at tap `index`. Returns true when the whole set is due
     /// to be published, which the first tap decides for all of them so the
     /// stages of one frame are always from the same block of audio.
-    pub fn push(&mut self, index: usize, mix: &[Vec<f32>], frames: usize, sample_rate: f32) -> bool {
+    pub fn push(
+        &mut self,
+        index: usize,
+        mix: &[Vec<f32>],
+        frames: usize,
+        sample_rate: f32,
+    ) -> bool {
         while self.stages.len() <= index {
             self.stages.push(OutputMeter::new());
         }

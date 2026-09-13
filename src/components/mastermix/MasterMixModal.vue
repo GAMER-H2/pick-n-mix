@@ -19,6 +19,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import AppSlider from "../ui/AppSlider.vue";
+import WindowDragRegion from "../ui/WindowDragRegion.vue";
 import BlockEffectsRack from "./BlockEffectsRack.vue";
 import MixBlockView from "./MixBlockView.vue";
 import StereoLevelMeter from "./StereoLevelMeter.vue";
@@ -267,10 +268,15 @@ function hueFor(laneIndex: number): number {
   return Number.isFinite(saved) ? ((saved % 360) + 360) % 360 : (laneIndex * 47 + 18) % 360;
 }
 
+/** The playlist's songs by their index in it, so drawing a lane of regions is
+ *  not a linear search apiece. */
+const entryByIndex = computed(
+  () => new Map(store.entries.map((entry) => [entry.index, entry])),
+);
+
 function entryFor(block: MixBlock) {
   if (block.source.kind !== "entry") return null;
-  const index = block.source.index;
-  return store.entries.find((e) => e.index === index) ?? null;
+  return entryByIndex.value.get(block.source.index) ?? null;
 }
 
 /**
@@ -284,10 +290,25 @@ function entryFor(block: MixBlock) {
  * edit it — so a per-song pitch override set from the playlist would draw as
  * though it were absent while still being heard. The global layer is left out
  * because a mix ignores it outright; see `build_plan` in `commands.rs`.
+ *
+ * Resolved once per block per edit rather than once per block per draw:
+ * settling a cascade builds a dozen objects, and the timeline asks for one for
+ * every region on it.
  */
+const speedByBlock = computed(() => {
+  const playlistLayer = playlists.open?.mixer ?? {};
+  const speeds = new Map<string, number>();
+  for (const lane of mix.value.lanes) {
+    for (const block of lane.blocks) {
+      const resolved = resolve([playlistLayer, block.mixer ?? {}]);
+      speeds.set(block.id, resolved.enabled ? pitchRatio(resolved.pitch) : 1);
+    }
+  }
+  return speeds;
+});
+
 function speedFor(block: MixBlock): number {
-  const resolved = resolve([playlists.open?.mixer ?? {}, block.mixer ?? {}]);
-  return resolved.enabled ? pitchRatio(resolved.pitch) : 1;
+  return speedByBlock.value.get(block.id) ?? 1;
 }
 
 function waveformFor(block: MixBlock) {
@@ -751,39 +772,107 @@ const scrubbing = ref(false);
  * re-anchors it. The audio stays the authority; only the frames in between
  * are invented.
  */
-const renderPlayhead = ref(0);
+let renderPlayhead = 0;
 /**
- * The scroller's current horizontal offset, kept in a ref so the playhead and
- * snapline can clip themselves against the track-information column: the
- * sticky lane heads hide the line over their own rows, but the add-lane area
- * is transparent and the lane borders are hairlines, so without a clip the
- * line still shows through both once it has scrolled under the header zone.
+ * The scroller's current horizontal offset, so the playhead and snapline can
+ * clip themselves against the track-information column: the sticky lane heads
+ * hide the line over their own rows, but the add-lane area is transparent and
+ * the lane borders are hairlines, so without a clip the line still shows
+ * through both once it has scrolled under the header zone.
  */
-const scrollLeft = ref(0);
+let scrollLeft = 0;
 let anchorSecs = 0;
 let anchorAt = 0;
 let frame = 0;
 
+/**
+ * The two moving lines, and the readout above them, written straight to the
+ * DOM.
+ *
+ * These are the only things on this screen that move every frame, and the
+ * arrangement around them — hundreds of ruler marks, every lane header, every
+ * region — is not. Driving them through a reactive ref made the whole editor's
+ * render function the thing that ran sixty times a second, which is what made
+ * the timeline feel heavy while the mix was simply playing. Painting them by
+ * hand costs three property writes instead.
+ */
+const timecodeEl = ref<HTMLElement | null>(null);
+const playheadHeadEl = ref<HTMLElement | null>(null);
+const playheadEl = ref<HTMLElement | null>(null);
+const snaplineEl = ref<HTMLElement | null>(null);
+/** The last thing painted, so a still frame writes nothing at all. */
+let painted = { playhead: NaN, snap: NaN, pps: NaN, scroll: NaN };
+
+/**
+ * Whether there is a snapline at all — as opposed to where it is, which the
+ * frame loop places. Keeps a moving snapline out of the render function.
+ *
+ * `v-show` rather than `v-if` so the element the frame loop is positioning
+ * outlives being hidden: one built fresh each time would show at the start of
+ * the timeline for the frame before it was placed.
+ */
+const snapLineVisible = computed(() => snapLine.value !== null);
+
 function onBodyScroll(event: Event) {
-  scrollLeft.value = (event.target as HTMLElement).scrollLeft;
+  scrollLeft = (event.target as HTMLElement).scrollLeft;
 }
 
 function anchorPlayhead() {
   anchorSecs = store.playhead;
   anchorAt = performance.now();
-  renderPlayhead.value = anchorSecs;
+  renderPlayhead = anchorSecs;
 }
 
 /** Re-anchor on every position the store accepts, wherever it came from. */
 watch(() => store.playhead, anchorPlayhead);
 watch(() => store.previewing && !store.previewPaused, anchorPlayhead);
 
+/**
+ * Place a vertical line at `secs`.
+ *
+ * `translateX` rather than `left` so moving it is a compositor transform
+ * rather than a layout of everything beside it.
+ */
+function placeLine(element: HTMLElement | null, secs: number) {
+  if (!element) return;
+  element.style.transform = `translateX(${secs * pps.value}px)`;
+  element.style.clipPath = headClip(secs) ?? "";
+}
+
+function paint() {
+  const snap = snapLine.value ?? NaN;
+  if (
+    renderPlayhead === painted.playhead &&
+    pps.value === painted.pps &&
+    scrollLeft === painted.scroll &&
+    (snap === painted.snap || (Number.isNaN(snap) && Number.isNaN(painted.snap)))
+  ) {
+    return;
+  }
+  painted = { playhead: renderPlayhead, snap, pps: pps.value, scroll: scrollLeft };
+
+  if (timecodeEl.value) timecodeEl.value.textContent = timecode(renderPlayhead);
+  if (playheadHeadEl.value) {
+    // In the ruler, which never scrolls under the header column, so this one
+    // is placed but not clipped.
+    playheadHeadEl.value.style.transform = `translateX(${renderPlayhead * pps.value}px)`;
+  }
+  placeLine(playheadEl.value, renderPlayhead);
+  if (!Number.isNaN(snap)) placeLine(snaplineEl.value, snap);
+}
+
+/** A snapline answers the pointer, so it is placed the moment it moves rather
+ *  than on the next frame — the pointer is already there. */
+watch(snapLine, () => paint(), { flush: "sync" });
+
 function onFrame() {
   frame = requestAnimationFrame(onFrame);
-  if (!store.previewing || store.previewPaused || scrubbing.value) return;
-  const elapsed = (performance.now() - anchorAt) / 1000;
-  renderPlayhead.value = Math.min(anchorSecs + elapsed, Math.max(store.duration, 0));
-  if (store.followPlayhead) keepPlayheadVisible();
+  if (store.previewing && !store.previewPaused && !scrubbing.value) {
+    const elapsed = (performance.now() - anchorAt) / 1000;
+    renderPlayhead = Math.min(anchorSecs + elapsed, Math.max(store.duration, 0));
+    if (store.followPlayhead) keepPlayheadVisible();
+  }
+  paint();
 }
 
 /**
@@ -798,7 +887,7 @@ function keepPlayheadVisible() {
   if (!element) return;
   const visible = element.clientWidth - HEADER_WIDTH;
   if (visible <= 0) return;
-  const x = renderPlayhead.value * pps.value;
+  const x = renderPlayhead * pps.value;
   const from = element.scrollLeft;
   if (x >= from && x <= from + visible - 24) return;
   element.scrollLeft = Math.max(0, x - visible * 0.25);
@@ -811,7 +900,7 @@ function keepPlayheadVisible() {
  * grid's own coordinates, exactly where the sticky headers start.
  */
 function headClip(secs: number): string | undefined {
-  const hiddenPx = scrollLeft.value - secs * pps.value;
+  const hiddenPx = scrollLeft - secs * pps.value;
   return hiddenPx > 0 ? `inset(0 0 0 ${hiddenPx}px)` : undefined;
 }
 
@@ -1289,7 +1378,7 @@ function zoomTime(factor: number) {
   const element = scroller.value;
   const visible = element ? element.clientWidth - HEADER_WIDTH : 0;
   const from = element?.scrollLeft ?? 0;
-  const held = renderPlayhead.value;
+  const held = renderPlayhead;
   // A playhead that is not on screen is no use as an anchor; hold the middle
   // of what the user is actually looking at instead.
   const onScreen = held * pps.value >= from && held * pps.value <= from + visible;
@@ -1351,6 +1440,7 @@ const summary = computed(() => {
 
 <template>
   <div class="mm-scrim" :class="{ 'is-drop': dropping }" @pointerdown.self="close">
+    <WindowDragRegion />
     <div class="mm__workspace">
     <section
       ref="dialog"
@@ -1396,7 +1486,6 @@ const summary = computed(() => {
           class="mm__mixer-button"
           :class="{ 'is-active': effectsOpen }"
           type="button"
-          :disabled="!selectedBlock"
           :aria-pressed="effectsOpen"
           title="Show or hide effects for the selected block"
           @click="effectsOpen = !effectsOpen"
@@ -1431,7 +1520,7 @@ const summary = computed(() => {
         <button class="icon-button" type="button" aria-label="Stop" :disabled="!store.previewing" @click="stop">
           <PnmIcon name="stop" :size="15" />
         </button>
-        <span class="mm__timecode">{{ timecode(renderPlayhead) }}</span>
+        <span ref="timecodeEl" class="mm__timecode">{{ timecode(renderPlayhead) }}</span>
 
         <span class="mm__divider" />
 
@@ -1606,8 +1695,8 @@ const summary = computed(() => {
                 >{{ tick.label }}</span
               >
               <span
+                ref="playheadHeadEl"
                 class="mm__playhead-head"
-                :style="{ left: `${renderPlayhead * pps}px` }"
                 aria-hidden="true"
               />
             </div>
@@ -1768,16 +1857,18 @@ const summary = computed(() => {
           />
 
           <div
-            v-if="snapLine !== null"
+            v-show="snapLineVisible"
+            ref="snaplineEl"
             class="mm__snapline"
             :class="{ 'is-locked': snapLocked }"
-            :style="{ left: `${HEADER_WIDTH + snapLine * pps}px`, clipPath: headClip(snapLine) }"
+            :style="{ left: `${HEADER_WIDTH}px` }"
             aria-hidden="true"
           />
 
           <div
+            ref="playheadEl"
             class="mm__playhead"
-            :style="{ left: `${HEADER_WIDTH + renderPlayhead * pps}px`, clipPath: headClip(renderPlayhead) }"
+            :style="{ left: `${HEADER_WIDTH}px` }"
             aria-hidden="true"
  />
         </div>
@@ -1787,8 +1878,15 @@ const summary = computed(() => {
         <StereoLevelMeter class="mm__level-meter" />
       </div>
 
+      <section
+        v-if="effectsOpen && !selectedBlock"
+        class="mm__effects-empty"
+        aria-label="Effects"
+      >
+        <p>Select an audio block to start adding and editing effects.</p>
+      </section>
       <BlockEffectsRack
-        v-if="effectsOpen && selectedBlock && blockMixerBound"
+        v-else-if="effectsOpen && selectedBlock && blockMixerBound"
         :block-id="selectedBlock.id"
         :block-name="blockName(selectedBlock)"
       />
@@ -1864,6 +1962,9 @@ const summary = computed(() => {
 
 .mm__workspace {
   position: relative;
+  /* Over the scrim's drag strip: the mixer fills nearly the whole window and
+     reaches into the title bar, and its own header must keep its clicks. */
+  z-index: 1;
   display: flex;
   width: 100%;
   height: 100%;
@@ -1977,6 +2078,21 @@ const summary = computed(() => {
 .mm__duplicate-button:disabled {
   opacity: 0.42;
   cursor: default;
+}
+
+.mm__effects-empty {
+  display: grid;
+  place-items: center;
+  flex: none;
+  height: 244px;
+  border-top: 0.5px solid var(--separator);
+  background: var(--bg-sidebar);
+}
+
+.mm__effects-empty p {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
 }
 
 .mm__transport {

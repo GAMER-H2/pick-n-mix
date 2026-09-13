@@ -25,7 +25,14 @@ import {
   type ShortcutAction,
 } from "@/lib/shortcuts";
 import * as api from "@/lib/api";
-import type { AppPreferences, FadeMode, FilterInfo, Preset, ThemePreference } from "@/lib/types";
+import type {
+  AppPreferences,
+  FadeMode,
+  FilterInfo,
+  Preset,
+  ThemePreference,
+  WindowCornerPreference,
+} from "@/lib/types";
 import { useHomeStore } from "@/stores/home";
 import { useLibraryStore } from "@/stores/library";
 import { useMixerStore } from "@/stores/mixer";
@@ -124,6 +131,11 @@ const fadeModeOptions = [
   { id: "pause", label: "Pausing playback" },
   { id: "both", label: "Starting and pausing" },
 ];
+const windowCornerOptions = [
+  { id: "auto", label: "Automatic" },
+  { id: "square", label: "Always square" },
+  { id: "rounded", label: "Compositor only" },
+];
 const mixPresets = computed(() =>
   mixer.presets.filter((preset) => preset.kind === "mixer"),
 );
@@ -150,6 +162,12 @@ function presetHidden(preset: Preset): boolean {
 
 function filterHidden(filter: FilterInfo): boolean {
   return filter.builtIn && settings.preferences.hiddenBuiltInFilterIds.includes(filter.id);
+}
+
+function updateWindowCorners(value: string) {
+  if (value === "auto" || value === "square" || value === "rounded") {
+    updatePreference({ windowCorners: value satisfies WindowCornerPreference });
+  }
 }
 
 /*
@@ -651,6 +669,26 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
 
             <div class="section-heading">
               <div>
+                <h4>Window frame</h4>
+                <p>Corner handling when the app draws its own frame.</p>
+              </div>
+            </div>
+            <div class="field">
+              <SelectMenu
+                :model-value="settings.preferences.windowCorners"
+                :options="windowCornerOptions"
+                label="Window corners"
+                @update:model-value="updateWindowCorners"
+              />
+              <small>
+                Automatic detects known snapped states and full-height or full-width custom KDE
+                tiles. Use Always square for layouts Wayland cannot identify, or Compositor only
+                if a large floating window is detected as tiled.
+              </small>
+            </div>
+
+            <div class="section-heading">
+              <div>
                 <h4>Motion</h4>
                 <p>How the queue and the full-screen player move as songs change.</p>
               </div>
@@ -996,22 +1034,6 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
               />
             </ul>
 
-            <div class="section-heading filters-heading">
-              <div>
-                <h4>Master Mixer presets</h4>
-                <p>Choose whether the effects rack includes the presets supplied with the app.</p>
-              </div>
-            </div>
-            <FormRow
-              label="Built-in presets"
-              hint="Custom presets remain available in the Master Mixer."
-            >
-              <AppToggle
-                :model-value="!settings.preferences.hideBuiltInMasterMixerPresets"
-                label="Show built-in presets in the Master Mixer"
-                @update:model-value="updatePreference({ hideBuiltInMasterMixerPresets: !$event })"
-              />
-            </FormRow>
 
             <div class="section-heading filters-heading">
               <div>
@@ -1044,6 +1066,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown, true));
                 >Delete</button>
               </li>
             </ul>
+            <div class="setting-row">
+              <div>
+                <h4>Show built-in presets in the Master Mixer</h4>
+                <p>Custom presets remain available in the effects rack.</p>
+              </div>
+              <AppToggle
+                :model-value="!settings.preferences.hideBuiltInMasterMixerPresets"
+                label="Show built-in presets in the Master Mixer"
+                @update:model-value="updatePreference({ hideBuiltInMasterMixerPresets: !$event })"
+              />
+            </div>
 
             <div class="section-heading filters-heading">
               <div>

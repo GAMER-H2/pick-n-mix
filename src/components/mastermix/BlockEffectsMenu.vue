@@ -10,10 +10,11 @@
  * Effects already on the block are ticked and cannot be added twice: a second
  * reverb on one region would be a second set of controls for the same effect.
  */
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import MenuSurface, { type MenuGroup } from "../ui/MenuSurface.vue";
 import { useDismiss } from "@/lib/dismiss";
+import { visibleBounds } from "@/lib/frame";
 import { DEFAULT_CHAIN_ORDER, PINNED_DEVICES, SECTION_LABELS } from "@/lib/mixer";
 import type { DeviceSection } from "@/lib/mixer";
 
@@ -33,11 +34,19 @@ const emit = defineEmits<{ add: [section: DeviceSection] }>();
 const open = ref(false);
 const menuEl = ref<HTMLElement | null>(null);
 const buttonEl = ref<HTMLElement | null>(null);
+const menuStyle = ref<Record<string, string>>({});
+
+const GAP = 6;
+const MIN_ROOM = 140;
+const MAX_HEIGHT = 300;
 
 // The trigger is ignored so its own click still toggles the menu shut.
 useDismiss(
   () => open.value,
-  () => (open.value = false),
+  () => {
+    open.value = false;
+    stopTracking();
+  },
   menuEl,
   { ignore: [buttonEl] },
 );
@@ -59,18 +68,53 @@ const groups = computed<MenuGroup[]>(() => [
   group("Region", PINNED_DEVICES),
 ]);
 
+function place() {
+  const trigger = buttonEl.value?.getBoundingClientRect();
+  if (!trigger) return;
+  const frame = visibleBounds();
+  const below = frame.bottom - trigger.bottom - GAP;
+  const above = trigger.top - frame.top - GAP;
+  const flip = below < MIN_ROOM && above > below;
+  const room = Math.max(flip ? above : below, 0);
+
+  menuStyle.value = {
+    right: `${Math.max(frame.left, window.innerWidth - trigger.right)}px`,
+    minWidth: `${Math.max(176, trigger.width)}px`,
+    maxWidth: `${frame.width - 16}px`,
+    maxHeight: `${Math.min(MAX_HEIGHT, room)}px`,
+    transformOrigin: flip ? "bottom right" : "top right",
+    ...(flip
+      ? { bottom: `${window.innerHeight - trigger.top + GAP}px` }
+      : { top: `${trigger.bottom + GAP}px` }),
+  };
+}
+
+function stopTracking() {
+  window.removeEventListener("scroll", place, true);
+  window.removeEventListener("resize", place);
+}
+
 async function toggle() {
   if (props.disabled) return;
   open.value = !open.value;
-  if (!open.value) return;
+  if (!open.value) {
+    stopTracking();
+    return;
+  }
+  place();
+  window.addEventListener("scroll", place, true);
+  window.addEventListener("resize", place);
   await nextTick();
   menuEl.value?.querySelector<HTMLElement>("[role='menuitem']:not([disabled])")?.focus();
 }
 
 function onSelect(id: string) {
   open.value = false;
+  stopTracking();
   emit("add", id as DeviceSection);
 }
+
+onBeforeUnmount(stopTracking);
 </script>
 
 <template>
@@ -93,11 +137,18 @@ function onSelect(id: string) {
       <PnmIcon name="chevronDown" :size="14" />
     </button>
 
-    <Transition name="pop">
-      <div v-if="open" ref="menuEl" class="effects-menu__menu">
-        <MenuSurface :groups="groups" @select="onSelect" />
-      </div>
-    </Transition>
+    <Teleport to="body">
+      <Transition name="pop">
+        <div
+          v-if="open"
+          ref="menuEl"
+          class="effects-menu__menu"
+          :style="menuStyle"
+        >
+          <MenuSurface :groups="groups" @select="onSelect" />
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -131,14 +182,13 @@ function onSelect(id: string) {
 }
 
 .effects-menu__menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  position: fixed;
   z-index: var(--z-popover);
   min-width: 176px;
   border-radius: var(--radius);
   background: var(--bg-elevated);
   border: 0.5px solid var(--separator);
   box-shadow: var(--shadow-popover);
+  overflow-y: auto;
 }
 </style>

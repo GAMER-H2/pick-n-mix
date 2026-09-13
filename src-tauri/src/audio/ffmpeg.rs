@@ -93,7 +93,11 @@ fn probe() -> FfmpegStatus {
 }
 
 fn locate() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let name = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
     let from_path = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>());
@@ -248,10 +252,15 @@ mod tests {
         if capable {
             result.expect("encoding should succeed where ffmpeg has libmp3lame");
             let written = std::fs::metadata(&dest).expect("an MP3 should exist").len();
-            assert!(written > 1_000, "a second of audio should not be {written} bytes");
+            assert!(
+                written > 1_000,
+                "a second of audio should not be {written} bytes"
+            );
             let _ = std::fs::remove_file(&dest);
         } else {
-            let message = result.expect_err("without ffmpeg this cannot succeed").to_string();
+            let message = result
+                .expect_err("without ffmpeg this cannot succeed")
+                .to_string();
             assert!(
                 message.contains("ffmpeg"),
                 "the error should say what is missing, not {message}"

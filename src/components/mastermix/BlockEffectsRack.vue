@@ -37,6 +37,7 @@ import { useMasterMixStore } from "@/stores/masterMix";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
 import { useUiStore } from "@/stores/ui";
+import { SILENCE, useMeterFeed } from "@/composables/useMeterFeed";
 import type { DeviceSection } from "@/lib/mixer";
 import type { ChainStage, Eq, MixerSettings, OutputLevelFrame } from "@/lib/types";
 
@@ -50,13 +51,6 @@ const store = useMasterMixStore();
 const mixer = useMixerStore();
 const player = usePlayerStore();
 const ui = useUiStore();
-
-const FLOOR_DB = -60;
-const SILENCE: OutputLevelFrame = {
-  levelsDb: [FLOOR_DB, FLOOR_DB],
-  peaksDb: [FLOOR_DB, FLOOR_DB],
-  floorDb: FLOOR_DB,
-};
 
 const fx = computed(() => mixer.effective);
 /** Devices this block has, which is exactly the sections its own layer sets. */
@@ -91,9 +85,17 @@ function onEq(eq: Eq) {
 
 // -- meters ------------------------------------------------------------------
 
-const stageLevels = ref<OutputLevelFrame[]>([]);
-let animationFrame: number | null = null;
-let stopped = false;
+/**
+ * The meters in the row, by the gap they sit in, so one reading can be dealt
+ * out to all of them. Driven rather than bound: see `StereoLevelMeter`.
+ */
+const meters: ({ apply: (frame: OutputLevelFrame) => void } | null)[] = [];
+
+function bindMeter(index: number) {
+  return (element: unknown) => {
+    meters[index] = (element as { apply: (frame: OutputLevelFrame) => void }) ?? null;
+  };
+}
 
 /**
  * The reading at the point in the chain a meter sits at.
@@ -103,11 +105,11 @@ let stopped = false;
  * full chain, so a gap that spans a stage with no device in the rack still
  * reads the level at the right place.
  */
-function levelAt(index: number): OutputLevelFrame {
+function levelAt(index: number, stages: OutputLevelFrame[]): OutputLevelFrame {
   const stage = chain.value[index] ?? chain.value[index - 1];
   if (!stage) return SILENCE;
   const tap = fx.value.chainOrder.indexOf(stage) + (index < chain.value.length ? 0 : 1);
-  return stageLevels.value[tap] ?? SILENCE;
+  return stages[tap] ?? SILENCE;
 }
 
 function meterScope(index: number): string {
@@ -117,53 +119,46 @@ function meterScope(index: number): string {
   return next ? `between ${previous} and ${SECTION_LABELS[next]}` : `leaving ${previous}`;
 }
 
-async function poll() {
-  if (stopped) return;
-  try {
-    const frame = await api.chainLevelFrame();
-    // A frame for another block is one the engine published just before the
-    // selection moved; drawing it would put another region's levels in this
-    // region's rack.
-    if (!stopped && frame.blockId === props.blockId) stageLevels.value = frame.stages;
-  } catch {
-    // A missed frame is harmless: the last reading stands until the next one.
+/** Deal the newest reading out to every meter in the row. */
+function draw(stages: OutputLevelFrame[]) {
+  for (let index = 0; index <= chain.value.length; index += 1) {
+    meters[index]?.apply(levelAt(index, stages));
   }
-  if (!stopped) animationFrame = requestAnimationFrame(() => void poll());
 }
 
-function stopPolling() {
-  if (animationFrame !== null) cancelAnimationFrame(animationFrame);
-  animationFrame = null;
-}
+const feed = useMeterFeed((reading) => {
+  // A reading for another block is one the engine published just before the
+  // selection moved; drawing it would put another region's levels in this
+  // region's rack.
+  const chainFrame = reading.chain;
+  draw(chainFrame && chainFrame.blockId === props.blockId ? chainFrame.stages : []);
+}, { chain: true });
 
 watch(
   () => props.blockId,
   (blockId) => {
-    stageLevels.value = [];
+    draw([]);
     void api.setChainMeterBlock(blockId).catch(() => {});
   },
   { immediate: true },
 );
 
 /**
- * Poll only while the mix is sounding. Stopped, the engine's own meters fall
- * to the floor and stay there, so there is nothing to ask it for.
+ * Meter only while the mix is sounding. Stopped, nothing is passing through
+ * the chain, so the row falls to the floor rather than holding the last level
+ * it happened to see.
  */
 watch(
   () => store.previewing && !store.previewPaused,
   (sounding) => {
-    if (sounding) {
-      if (animationFrame === null) void poll();
-    } else {
-      stopPolling();
-    }
+    feed.setActive(sounding);
+    if (!sounding) draw([]);
   },
   { immediate: true },
 );
 
 onBeforeUnmount(() => {
-  stopped = true;
-  stopPolling();
+  feed.setActive(false);
   void api.setChainMeterBlock(null).catch(() => {});
 });
 
@@ -240,9 +235,10 @@ function movePinned(index: number, delta: number) {
       </p>
       <template v-for="(stage, index) in chain" :key="stage">
         <StereoLevelMeter
+          :ref="bindMeter(index)"
+          driven
           compact
           class="rack__meter"
-          :reading="levelAt(index)"
           :label="`Level ${meterScope(index)}`"
           :scope="meterScope(index)"
         />
@@ -305,9 +301,10 @@ function movePinned(index: number, delta: number) {
 
       <StereoLevelMeter
         v-if="chain.length"
+        :ref="bindMeter(chain.length)"
+        driven
         compact
         class="rack__meter"
-        :reading="levelAt(chain.length)"
         :label="`Level ${meterScope(chain.length)}`"
         :scope="meterScope(chain.length)"
       />

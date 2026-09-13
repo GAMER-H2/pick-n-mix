@@ -8,18 +8,16 @@ import { useSettingsStore } from "@/stores/settings";
 import type { ChainLevelFrame, OutputLevelFrame } from "@/lib/types";
 
 const setChainMeterBlock = vi.fn((_blockId: string | null) => Promise.resolve());
-const chainLevelFrame = vi.fn();
+const meterFrames = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   setChainMeterBlock: (blockId: string | null) => setChainMeterBlock(blockId),
-  chainLevelFrame: () => chainLevelFrame(),
+  meterFrames: (...args: unknown[]) => meterFrames(...args),
   setOutputMeterEnabled: () => Promise.resolve(),
   // The expanded EQ draws a live spectrum and can solo a band.
   setAnalyserEnabled: () => Promise.resolve(),
   analyserFrame: () => Promise.resolve({ bins: [], minHz: 20, maxHz: 20000, floorDb: -90 }),
   setEqSolo: () => Promise.resolve(),
-  outputLevelFrame: () =>
-    Promise.resolve({ levelsDb: [-60, -60], peaksDb: [-60, -60], floorDb: -60 }),
   savePreset: vi.fn(),
   deletePreset: vi.fn(),
 }));
@@ -35,14 +33,34 @@ const stages: ChainLevelFrame = {
 };
 
 /**
+ * Let a reading arrive and be drawn.
+ *
+ * Readings and drawing are separated — see `useMeterFeed` — so a meter shows
+ * nothing until an animation frame has run, however many replies have landed.
+ */
+async function drawnFrame() {
+  // A reading issued before this point may still be in flight and would land
+  // first, so wait for one asked for since — and then for the one after it,
+  // which is only asked for once the first has landed.
+  const from = meterFrames.mock.calls.length;
+  for (let tries = 0; tries < 60 && meterFrames.mock.calls.length < from + 2; tries += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  await flushPromises();
+  await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+  await flushPromises();
+}
+
+/**
  * Mounted racks are tracked and unmounted between tests: a rack left up goes
- * on polling for levels, and the next test would see its calls as its own.
+ * on reading levels, and the next test would see its calls as its own.
  */
 let mounted: ReturnType<typeof mount>[] = [];
 
 function rack() {
   const wrapper = mount(BlockEffectsRack, {
     props: { blockId: "blk", blockName: "First Song" },
+    global: { stubs: { teleport: true } },
   });
   mounted.push(wrapper);
   return wrapper;
@@ -52,7 +70,7 @@ describe("BlockEffectsRack", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     setChainMeterBlock.mockClear();
-    chainLevelFrame.mockReset().mockResolvedValue(stages);
+    meterFrames.mockReset().mockResolvedValue({ output: level(-60), chain: stages });
 
     const mixer = useMixerStore();
     mixer.target = { kind: "block", playlistId: "pl", blockId: "blk", name: "First Song" };
@@ -88,7 +106,7 @@ describe("BlockEffectsRack", () => {
     const store = useMasterMixStore();
     store.previewing = true;
     const wrapper = rack();
-    await flushPromises();
+    await drawnFrame();
 
     const meters = wrapper
       .findAll(".level-meter.is-compact [role='meter']")
@@ -114,22 +132,25 @@ describe("BlockEffectsRack", () => {
 
     expect(setChainMeterBlock).toHaveBeenCalledWith("blk");
     // Stopped, the engine's meters are at the floor and there is nothing to ask for.
-    expect(chainLevelFrame).not.toHaveBeenCalled();
+    expect(meterFrames).not.toHaveBeenCalled();
 
     store.previewing = true;
     await flushPromises();
-    expect(chainLevelFrame).toHaveBeenCalled();
+    expect(meterFrames).toHaveBeenCalledWith(true);
 
     wrapper.unmount();
     expect(setChainMeterBlock).toHaveBeenLastCalledWith(null);
   });
 
   it("ignores a frame published for another block", async () => {
-    chainLevelFrame.mockResolvedValue({ ...stages, blockId: "other" });
+    meterFrames.mockResolvedValue({
+      output: level(-60),
+      chain: { ...stages, blockId: "other" },
+    });
     const store = useMasterMixStore();
     store.previewing = true;
     const wrapper = rack();
-    await flushPromises();
+    await drawnFrame();
 
     // Still at the floor: the readings belong to a region no longer selected.
     const meter = wrapper.get(".level-meter.is-compact [role='meter']");

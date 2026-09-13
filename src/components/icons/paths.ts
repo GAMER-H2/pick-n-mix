@@ -299,7 +299,10 @@ const DEFS = {
   /** The blade: scissors, which is what splitting a region reads as. */
   blade: {
     mode: "stroke",
-    d: ["M7.4 7.4 18.6 18.6", "M16.6 7.4 9.6 14.4"],
+    // Each blade stops just short of the *opposite* handle, mirrored about the
+    // pivot at 12,12. Running one all the way to 18.6,18.6 put a stroke
+    // straight through the right-hand handle's ring.
+    d: ["M7.4 7.4 14.4 14.4", "M16.6 7.4 9.6 14.4"],
     circles: [
       { cx: 6.2, cy: 17.4, r: 2.6 },
       { cx: 17.8, cy: 17.4, r: 2.6 },

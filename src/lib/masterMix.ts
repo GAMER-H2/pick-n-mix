@@ -210,6 +210,36 @@ export function soundSignature(mix: MasterMix): string {
   );
 }
 
+/**
+ * What a mix already playing cannot absorb.
+ *
+ * The engine will take a re-resolved plan mid-flight as long as every block is
+ * still the same reading of the same file — see `try_update_plan` in
+ * `timeline.rs`, which is where the real decision is made. This is the
+ * editor's own copy of that test, used only to pick which of the two paths to
+ * take, so dragging a block does not first pay for a plan the engine is going
+ * to refuse. Being wrong either way costs a round trip, never a wrong sound.
+ */
+export function layoutSignature(mix: MasterMix): string {
+  const parts: string[] = [];
+  for (const lane of mix.lanes) {
+    for (const block of lane.blocks) {
+      parts.push(
+        block.id,
+        `${block.startSecs}`,
+        `${block.offsetSecs}`,
+        `${block.durationSecs}`,
+        JSON.stringify(block.source),
+        // Varispeed is resampled as the file is read, so a decoder opened at
+        // one speed cannot be handed another.
+        JSON.stringify(block.mixer?.pitch ?? null),
+        `${block.mixer?.enabled ?? ""}`,
+      );
+    }
+  }
+  return parts.join("\u0000");
+}
+
 export function blockEnd(block: MixBlock): number {
   return block.startSecs + block.durationSecs;
 }

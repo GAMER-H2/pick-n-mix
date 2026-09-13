@@ -1197,7 +1197,10 @@ mod tests {
         let at_band = solo_rms(Some(&band), 1000.0);
         let far_below = solo_rms(Some(&band), 100.0);
         let far_above = solo_rms(Some(&band), 10000.0);
-        assert!(at_band > 0.5, "the band's own frequency was lost: {at_band}");
+        assert!(
+            at_band > 0.5,
+            "the band's own frequency was lost: {at_band}"
+        );
         assert!(
             far_below < at_band * 0.1 && far_above < at_band * 0.1,
             "neighbouring ranges leaked through: {far_below} / {far_above} against {at_band}"
@@ -1217,7 +1220,10 @@ mod tests {
         };
         let below = solo_rms(Some(&band), 50.0);
         let above = solo_rms(Some(&band), 4000.0);
-        assert!(below > 0.5, "the range the filter acts on was lost: {below}");
+        assert!(
+            below > 0.5,
+            "the range the filter acts on was lost: {below}"
+        );
         assert!(above < below * 0.05, "the untouched range leaked: {above}");
     }
 

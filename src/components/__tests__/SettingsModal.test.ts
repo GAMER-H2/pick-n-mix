@@ -122,6 +122,21 @@ describe("SettingsModal", () => {
     expect(useSettingsStore().preferences.theme).toBe("dark");
   });
 
+  it("offers a manual square-corner override for unreported KDE tiles", async () => {
+    const wrapper = mountSettings();
+
+    await wrapper.get("[aria-label='Window corners']").trigger("click");
+    const square = buttonWithText(wrapper, "Always square");
+    if (!square) throw new Error("Missing the square window-corner option");
+    await square.trigger("click");
+    await settle();
+
+    expect(setAppPreferences).toHaveBeenCalledWith(
+      expect.objectContaining({ windowCorners: "square" }),
+    );
+    expect(useSettingsStore().preferences.windowCorners).toBe("square");
+  });
+
   it("requires a two-step confirmation before clearing all history", async () => {
     const wrapper = mountSettings();
     const recommendations = buttonWithText(wrapper, "Recommendations");

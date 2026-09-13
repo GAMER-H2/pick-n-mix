@@ -79,6 +79,7 @@ async function remove(id: string) {
     save-action-label="Save current settings…"
     delete-label="Delete preset"
     :stretch="props.stretch"
+    :floating="props.masterMix"
     @select="choose"
     @delete="remove"
     @save="save"

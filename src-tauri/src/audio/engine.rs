@@ -166,6 +166,12 @@ struct Shared {
     tail_active: AtomicBool,
     /// Let ambience beds keep sounding while playback is paused or stopped.
     ambience_alone: AtomicBool,
+    /// Holds the setting above off for as long as something else owns the
+    /// transport — the Master Mixer, which pauses the queue to audition its
+    /// own arrangement. Kept apart from the preference so that the listener's
+    /// choice survives, and so a settings save while the editor is open
+    /// cannot quietly switch the beds back on underneath it.
+    ambience_suspended: AtomicBool,
     /// Set by the worker each block: any ambience bed is sounding or still
     /// fading. With `ambience_alone` on, the callback treats this as playing
     /// so the beds are not faded away along with the paused music.
@@ -204,6 +210,7 @@ impl Shared {
             keep_tail: AtomicBool::new(false),
             tail_active: AtomicBool::new(false),
             ambience_alone: AtomicBool::new(false),
+            ambience_suspended: AtomicBool::new(false),
             beds_audible: AtomicBool::new(false),
             eq_solo: ArcSwap::from_pointee(None),
         }
@@ -211,6 +218,13 @@ impl Shared {
 
     fn volume(&self) -> f32 {
         f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+
+    /// Whether the beds should sound with nothing playing: what the listener
+    /// asked for, unless something else currently owns the transport.
+    fn ambience_alone(&self) -> bool {
+        self.ambience_alone.load(Ordering::Relaxed)
+            && !self.ambience_suspended.load(Ordering::Relaxed)
     }
 
     /// Whether the output should be sounding: either playing, or ringing out
@@ -326,6 +340,13 @@ enum Cmd {
     LoadTimeline {
         source: Box<TimelineSource>,
         reply: Sender<Result<StreamInfo>>,
+    },
+    /// Swap in a re-resolved plan for the master mix already loaded, so a
+    /// mixer edit is heard without the timeline being rebuilt. Replies with
+    /// whether it could be applied; see [`TimelineSource::try_update_plan`].
+    UpdateTimeline {
+        plan: Arc<crate::audio::timeline::Plan>,
+        reply: Sender<bool>,
     },
     Seek(f64),
     Clear,
@@ -496,6 +517,23 @@ impl AudioEngine {
             .map_err(|_| anyhow!("audio worker dropped the request"))?
     }
 
+    /// Apply a mixer edit to the mix that is playing, without reloading it.
+    ///
+    /// Returns `false` when the change is one a running timeline cannot adopt
+    /// — a block moved, trimmed, repitched, added or removed — in which case
+    /// the caller must go back through [`AudioEngine::load_timeline`].
+    pub fn update_timeline(&self, plan: Arc<crate::audio::timeline::Plan>) -> bool {
+        let (reply, rx) = bounded(1);
+        if self
+            .cmd_tx
+            .send(Cmd::UpdateTimeline { plan, reply })
+            .is_err()
+        {
+            return false;
+        }
+        rx.recv().unwrap_or(false)
+    }
+
     pub fn play(&self) {
         self.shared.playing.store(true, Ordering::Relaxed);
     }
@@ -597,6 +635,19 @@ impl AudioEngine {
     /// Keep ambience beds sounding while playback is paused or stopped.
     pub fn set_ambience_alone(&self, enabled: bool) {
         self.shared.ambience_alone.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Hold the setting above off while another surface owns the transport.
+    ///
+    /// The Master Mixer pauses the queue for as long as it is open, and beds
+    /// that went on playing over a silent editor would be heard against the
+    /// arrangement being auditioned — which carries its own atmospheres, per
+    /// block. Separate from the preference so the listener's choice is still
+    /// there when the editor closes.
+    pub fn set_ambience_suspended(&self, suspended: bool) {
+        self.shared
+            .ambience_suspended
+            .store(suspended, Ordering::Relaxed);
     }
 
     /// Start or stop maintaining the spectrum.
@@ -881,8 +932,7 @@ where
                 // do the beds: they are the only thing sounding, and fading
                 // them with the music would silence the whole feature.
                 let playing = shared.audible()
-                    || (shared.ambience_alone.load(Ordering::Relaxed)
-                        && shared.beds_audible.load(Ordering::Relaxed));
+                    || (shared.ambience_alone() && shared.beds_audible.load(Ordering::Relaxed));
                 let target_volume = shared.volume();
 
                 for frame in data.chunks_mut(channels) {
@@ -1098,6 +1148,13 @@ fn worker(
                             let _ = reply.send(Err(e));
                         }
                     }
+                }
+                Cmd::UpdateTimeline { plan, reply } => {
+                    let applied = match current.as_mut().map(|cur| &mut cur.source) {
+                        Some(Source::Timeline(timeline)) => timeline.try_update_plan(&plan),
+                        _ => false,
+                    };
+                    let _ = reply.send(applied);
                 }
                 Cmd::LoadTimeline { source, reply } => {
                     let info = source.info().clone();
@@ -1338,7 +1395,7 @@ fn worker(
             shared
                 .speed_millis
                 .store((speed * 1000.0) as u64, Ordering::Relaxed);
-        } else if shared.ambience_alone.load(Ordering::Relaxed) {
+        } else if shared.ambience_alone() {
             // No voice, but the listener wants the atmosphere on its own. The
             // global mixer settings stand in for the current voice's, and
             // still-undecoded beds are chased through the same request path
@@ -1396,7 +1453,7 @@ fn worker(
         // when the ring has no room, otherwise a ring still full of pre-pause
         // music could starve bed production forever (no room to push, no
         // callback consumption while faded down).
-        let ambience_alone = shared.ambience_alone.load(Ordering::Relaxed);
+        let ambience_alone = shared.ambience_alone();
         let beds_audible = ambience.is_audible();
         if !ambience_alone && current.is_none() && beds_audible {
             draining_beds = true;

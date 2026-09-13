@@ -175,6 +175,10 @@ pub struct AppPreferences {
     pub ambience_without_playback: bool,
     /// Crossfade the full-screen artwork and backdrop between tracks.
     pub crossfade_art: bool,
+    /// What the window's own corners do where the app draws its own frame:
+    /// `auto`, `square` or `rounded`. See `window_frame.rs` — automatic
+    /// cannot recognise every tile layout, and this is the way out.
+    pub window_corners: String,
     /// Scroll the queue to the song that has just started playing, when it is
     /// not already on screen.
     pub queue_follows_current: bool,
@@ -219,6 +223,7 @@ impl Default for AppPreferences {
             seek_step_secs: 10.0,
             ambience_without_playback: false,
             crossfade_art: true,
+            window_corners: "auto".into(),
             queue_follows_current: true,
             hidden_mixer_sections: Vec::new(),
             hidden_popover_sections: Vec::new(),
@@ -250,6 +255,9 @@ impl AppPreferences {
         }
         if !matches!(self.fade_mode.as_str(), "off" | "play" | "pause" | "both") {
             self.fade_mode = Self::default().fade_mode;
+        }
+        if !matches!(self.window_corners.as_str(), "auto" | "square" | "rounded") {
+            self.window_corners = Self::default().window_corners;
         }
         self.mix_length = self.mix_length.clamp(10, 200);
         self.replay_days = self.replay_days.clamp(1, 3_650);
@@ -652,6 +660,7 @@ mod tests {
         assert_eq!(json["previousRestartSecs"], 3.0);
         assert_eq!(json["seekStepSecs"], 10.0);
         assert_eq!(json["ambienceWithoutPlayback"], false);
+        assert_eq!(json["windowCorners"], "auto");
         assert_eq!(json["discoverMaxPlays"], 3);
         assert_eq!(json["hiddenBuiltInPresetIds"], serde_json::json!([]));
         assert_eq!(json["hideBuiltInMasterMixerPresets"], false);
@@ -716,6 +725,7 @@ mod tests {
             theme: "sepia".into(),
             accent: "#not-a-colour".into(),
             fade_mode: "sometimes".into(),
+            window_corners: "octagonal".into(),
             mix_length: usize::MAX,
             replay_days: 0,
             replay_min_plays: 0,
@@ -737,6 +747,7 @@ mod tests {
         assert_eq!(preferences.theme, "system");
         assert_eq!(preferences.accent, "#f56300");
         assert_eq!(preferences.fade_mode, "off");
+        assert_eq!(preferences.window_corners, "auto");
         assert_eq!(preferences.mix_length, 200);
         assert_eq!(preferences.replay_days, 1);
         assert_eq!(preferences.replay_min_plays, 1);

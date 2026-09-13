@@ -2,22 +2,26 @@
 /**
  * A stereo peak meter: two channels, a green-to-red gradient and a held peak.
  *
- * By default it is the Master Mixer's own output meter and polls the engine
- * for the post-limiter master bus. Given a `reading` it draws that instead and
- * polls nothing, which is how the rack puts a small one between each pair of
- * effects — those readings all arrive in a single frame, so one poll feeds
- * every meter in the row rather than each meter asking separately.
+ * By default it is the Master Mixer's own output meter and draws the
+ * post-limiter master bus. Marked `driven` it draws whatever its parent hands
+ * it through `apply`, which is how the rack puts a small one between each pair
+ * of effects — those readings all arrive in one frame, so the rack feeds every
+ * meter in the row from a single reading rather than each meter asking
+ * separately.
+ *
+ * The bars are written straight to the DOM rather than bound.
+ *
+ * A meter is the one thing on the screen that genuinely changes every frame,
+ * and nothing else depends on what it reads. Routing it through reactive state
+ * meant re-rendering the component — and, in the rack, its neighbours — sixty
+ * times a second to move two boxes. Both moving parts are transforms now, so
+ * the browser composites them instead of repainting a gradient under a
+ * changing clip.
  */
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import * as api from "@/lib/api";
+import { onBeforeUnmount, onMounted, ref } from "vue";
+import { FLOOR_DB, SILENCE, useMeterFeed } from "@/composables/useMeterFeed";
 import type { OutputLevelFrame } from "@/lib/types";
 
-const DEFAULT_FLOOR_DB = -60;
-const SILENCE: OutputLevelFrame = {
-  levelsDb: [DEFAULT_FLOOR_DB, DEFAULT_FLOOR_DB],
-  peaksDb: [DEFAULT_FLOOR_DB, DEFAULT_FLOOR_DB],
-  floorDb: DEFAULT_FLOOR_DB,
-};
 const CHANNELS = [
   { index: 0, short: "L", label: "Left output level" },
   { index: 1, short: "R", label: "Right output level" },
@@ -26,8 +30,8 @@ const SCALE_DB = [0, -6, -12, -24, -48] as const;
 
 const props = withDefaults(
   defineProps<{
-    /** A reading from elsewhere. Given one, this meter does not poll. */
-    reading?: OutputLevelFrame | null;
+    /** Fed by its parent through `apply`, rather than reading the master bus. */
+    driven?: boolean;
     /** Small enough to sit between two effects: no scale, narrower bars. */
     compact?: boolean;
     /** What this meter is measuring, for its tooltip. */
@@ -39,67 +43,109 @@ const props = withDefaults(
      */
     scope?: string;
   }>(),
-  { reading: null, compact: false, label: "Post-limiter master bus level", scope: "" },
+  { driven: false, compact: false, label: "Post-limiter master bus level", scope: "" },
 );
 
-const polled = ref<OutputLevelFrame>(SILENCE);
-/** Named apart from the `reading` prop: a setup binding and a prop of the same
- *  name collide in the template. */
-const level = computed<OutputLevelFrame>(() => props.reading ?? polled.value);
-const selfDriven = computed(() => props.reading === null);
-let animationFrame: number | null = null;
-let stopped = false;
+/**
+ * The bottom of the scale, which is the only part of a reading the marks down
+ * the side depend on. It does not change in practice, so binding it costs a
+ * render that never happens.
+ */
+const floorDb = ref(FLOOR_DB);
 
-function clampedDb(value: number): number {
-  return Math.min(0, Math.max(level.value.floorDb, value));
+const tracks: (HTMLElement | null)[] = [null, null];
+const fills: (HTMLElement | null)[] = [null, null];
+const masks: (HTMLElement | null)[] = [null, null];
+const rails: (HTMLElement | null)[] = [null, null];
+const peaks: (HTMLElement | null)[] = [null, null];
+
+function bind(into: (HTMLElement | null)[], index: number) {
+  return (element: unknown) => {
+    into[index] = (element as HTMLElement | null) ?? null;
+  };
 }
 
-function percent(value: number): number {
-  const floor = level.value.floorDb;
+/** Built once: a fresh callback each render would rebind every element. */
+const binders = CHANNELS.map((channel) => ({
+  track: bind(tracks, channel.index),
+  fill: bind(fills, channel.index),
+  mask: bind(masks, channel.index),
+  rail: bind(rails, channel.index),
+  peak: bind(peaks, channel.index),
+}));
+
+function clampedDb(value: number, floor: number): number {
+  return Math.min(0, Math.max(floor, value));
+}
+
+function percent(value: number, floor = floorDb.value): number {
   if (!Number.isFinite(value) || !Number.isFinite(floor) || floor >= 0) return 0;
-  return ((clampedDb(value) - floor) / -floor) * 100;
+  return ((clampedDb(value, floor) - floor) / -floor) * 100;
 }
 
-function levelClip(channel: 0 | 1): string {
-  return `inset(${(100 - percent(level.value.levelsDb[channel])).toFixed(2)}% 0 0)`;
-}
-
-function peakPosition(channel: 0 | 1): string {
-  return `${percent(level.value.peaksDb[channel]).toFixed(2)}%`;
-}
-
-function valueText(channel: 0 | 1): string {
-  const current = level.value.levelsDb[channel];
-  const peak = level.value.peaksDb[channel];
+function valueText(frame: OutputLevelFrame, channel: number): string {
+  const current = frame.levelsDb[channel];
+  const peak = frame.peaksDb[channel];
   return `${current.toFixed(1)} dBFS, peak ${peak.toFixed(1)} dBFS`;
 }
 
-async function poll() {
-  if (stopped) return;
-  try {
-    const next = await api.outputLevelFrame();
-    if (!stopped) polled.value = next;
-  } catch {
-    // A missed frame is harmless; keep the last reading and try next frame.
-  }
-  if (!stopped) animationFrame = requestAnimationFrame(() => void poll());
+let painted: OutputLevelFrame | null = null;
+
+function unchanged(frame: OutputLevelFrame): boolean {
+  return (
+    painted !== null &&
+    painted.floorDb === frame.floorDb &&
+    painted.levelsDb[0] === frame.levelsDb[0] &&
+    painted.levelsDb[1] === frame.levelsDb[1] &&
+    painted.peaksDb[0] === frame.peaksDb[0] &&
+    painted.peaksDb[1] === frame.peaksDb[1]
+  );
 }
 
-onMounted(async () => {
-  if (!selfDriven.value) return;
-  try {
-    await api.setOutputMeterEnabled(true);
-  } catch {
-    // The meter stays at its floor if the audio engine is unavailable.
+/** Draw a reading. Safe to call every frame: a still meter writes nothing. */
+function apply(frame: OutputLevelFrame) {
+  if (unchanged(frame)) return;
+  painted = frame;
+  if (frame.floorDb !== floorDb.value) floorDb.value = frame.floorDb;
+
+  for (const { index } of CHANNELS) {
+    const floor = frame.floorDb;
+    const level = percent(frame.levelsDb[index], floor);
+    const peak = percent(frame.peaksDb[index], floor);
+    const over = frame.peaksDb[index] >= 0;
+
+    // The mask covers the gradient from the top down to the level, so the
+    // colour at a given height stays put as the bar moves.
+    masks[index]?.style.setProperty("transform", `scaleY(${(1 - level / 100).toFixed(4)})`);
+    // The rail is the full height of the track, so a percentage of it is a
+    // percentage of the scale.
+    rails[index]?.style.setProperty("transform", `translateY(${(-peak).toFixed(2)}%)`);
+    fills[index]?.classList.toggle("is-over", over);
+    peaks[index]?.classList.toggle("is-over", over);
+
+    const track = tracks[index];
+    if (track) {
+      track.setAttribute("aria-valuenow", `${clampedDb(frame.levelsDb[index], floor)}`);
+      track.setAttribute("aria-valuetext", valueText(frame, index));
+    }
   }
-  if (!stopped) void poll();
-});
+}
+
+defineExpose({ apply });
+
+/** Driven meters are fed by their parent, so they read nothing themselves. */
+const feed = props.driven ? null : useMeterFeed((reading) => apply(reading.output));
 
 onBeforeUnmount(() => {
-  stopped = true;
-  if (!selfDriven.value) return;
-  if (animationFrame !== null) cancelAnimationFrame(animationFrame);
-  void api.setOutputMeterEnabled(false).catch(() => {});
+  feed?.setActive(false);
+  painted = null;
+});
+
+onMounted(() => {
+  // Until the engine says otherwise a meter reads its floor, which is what the
+  // untransformed mask already shows; this is what labels it as such.
+  apply(SILENCE);
+  feed?.setActive(true);
 });
 </script>
 
@@ -123,27 +169,33 @@ onBeforeUnmount(() => {
       :key="channel.short"
       class="level-meter__channel"
     >
+      <!-- `aria-valuenow` and `aria-valuetext` are written by `apply` rather
+           than bound, because that is where the reading is. -->
       <div
+        :ref="binders[channel.index].track"
         class="level-meter__track"
         role="meter"
         :aria-label="scope ? `${channel.label} ${scope}` : channel.label"
-        :aria-valuemin="level.floorDb"
+        :aria-valuemin="floorDb"
         aria-valuemax="0"
-        :aria-valuenow="clampedDb(level.levelsDb[channel.index])"
-        :aria-valuetext="valueText(channel.index)"
       >
         <div
+          :ref="binders[channel.index].fill"
           class="level-meter__fill"
-          :class="{ 'is-over': level.peaksDb[channel.index] >= 0 }"
-          :style="{ clipPath: levelClip(channel.index) }"
           aria-hidden="true"
         />
-        <span
-          class="level-meter__peak"
-          :class="{ 'is-over': level.peaksDb[channel.index] >= 0 }"
-          :style="{ bottom: peakPosition(channel.index) }"
+        <div
+          :ref="binders[channel.index].mask"
+          class="level-meter__mask"
           aria-hidden="true"
         />
+        <div
+          :ref="binders[channel.index].rail"
+          class="level-meter__peak-rail"
+          aria-hidden="true"
+        >
+          <span :ref="binders[channel.index].peak" class="level-meter__peak" />
+        </div>
       </div>
       <span v-if="!compact" class="level-meter__label" aria-hidden="true">{{ channel.short }}</span>
     </div>
@@ -195,6 +247,8 @@ onBeforeUnmount(() => {
   background: var(--control-track);
 }
 
+/* The gradient stays put at full height so a given colour always means the
+   same level; what moves is the mask over it. */
 .level-meter__fill {
   position: absolute;
   inset: 0;
@@ -206,16 +260,44 @@ onBeforeUnmount(() => {
     #e56a32 91%,
     #d7373f 100%
   );
-  transition: clip-path 45ms linear;
 }
 
 .level-meter__fill.is-over {
   filter: saturate(1.2) brightness(1.08);
 }
 
+/* Veils the gradient from the top down to the level, rather than hiding it:
+   the part of the scale the signal is not reaching keeps a dimmed version of
+   the colour it will turn, which makes how much headroom is left something you
+   can see rather than something you have to know.
+
+   A scale rather than a clip because the browser can composite one without
+   repainting what is underneath, which is what lets these run at the display's
+   rate. */
+.level-meter__mask {
+  position: absolute;
+  inset: 0;
+  transform: scaleY(1);
+  transform-origin: top;
+  background: var(--meter-unlit);
+  transition: transform 45ms linear;
+  will-change: transform;
+}
+
+/* Full height, so shifting it by a percentage shifts the marker by that much
+   of the scale — and, again, as a transform rather than a new `bottom`. */
+.level-meter__peak-rail {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  transition: transform 45ms linear;
+  will-change: transform;
+  pointer-events: none;
+}
+
 .level-meter__peak {
   position: absolute;
-  z-index: 1;
+  bottom: 0;
   left: 1px;
   right: 1px;
   height: 2px;
@@ -223,7 +305,6 @@ onBeforeUnmount(() => {
   border-radius: 1px;
   background: var(--text);
   box-shadow: 0 0 0 0.5px var(--bg);
-  transition: bottom 45ms linear;
 }
 
 .level-meter__peak.is-over {

@@ -669,14 +669,32 @@ onBeforeUnmount(() => {
 .screen__art-stage {
   position: relative;
   display: flex;
+  align-items: center;
   justify-content: center;
-  width: 100%;
+  /*
+   * The stage, not the cover, is what carries the size. A percentage of the
+   * art column, not `vw`/`cqw`: the column is a flex item that shrinks with
+   * `.app__main` — when the window narrows or a side panel opens — so the
+   * cover shrinks with it in every webview, including ones without container
+   * query support. The `62vh` cap keeps the cover visually balanced with the
+   * queue on short windows.
+   *
+   * `flex: none` because the column must not compress a square, and the
+   * square is declared here rather than on the cover so that neither layer
+   * ever has an `auto` cross size for a flex `stretch` to claim — which is
+   * what squashed and stretched the cover once the fade overlay gave it a
+   * flex parent.
+   */
+  flex: none;
+  width: min(100%, 62vh);
+  aspect-ratio: 1;
 }
 
 .screen__art-fade {
   position: absolute;
   inset: 0;
   display: flex;
+  align-items: center;
   justify-content: center;
   pointer-events: none;
   animation: screen-art-in var(--screen-fade) var(--ease) forwards;
@@ -688,22 +706,21 @@ onBeforeUnmount(() => {
   }
 }
 
-.screen__art :deep(.artwork),
-.screen__art :deep(.quilt) {
-  /*
-   * A percentage of the art column, not `vw`/`cqw`: the column is a flex
-   * item that shrinks with `.app__main` — when the window narrows or a side
-   * panel opens — so the cover shrinks with it in every webview, including
-   * ones without container-query support. The `62vh` cap keeps the cover
-   * visually balanced with the queue on short windows; the upper clamp is
-   * unnecessary now that the column itself bounds the size. The quilt is
-   * overridden alongside the single cover: `PlaylistArtwork` sizes the quilt
-   * inline in px, which would otherwise stay fixed while everything around
-   * it shrank.
-   */
-  width: min(100%, 62vh) !important;
-  height: auto !important;
-  aspect-ratio: 1 !important;
+/*
+ * Both layers simply fill the stage. The quilt is overridden alongside the
+ * single cover: `PlaylistArtwork` sizes the quilt inline in px, which would
+ * otherwise stay fixed while everything around it shrank.
+ *
+ * Direct children only. A descendant selector would also catch the four
+ * covers *inside* a quilt, which `PlaylistArtwork` already sizes to their
+ * own quarter of it.
+ */
+.screen__art-stage > :deep(.artwork),
+.screen__art-stage > :deep(.quilt),
+.screen__art-fade > :deep(.artwork),
+.screen__art-fade > :deep(.quilt) {
+  width: 100% !important;
+  height: 100% !important;
 }
 
 .screen__meta {
@@ -926,10 +943,9 @@ onBeforeUnmount(() => {
     width: 100%;
   }
 
-  .screen__art :deep(.artwork),
-  .screen__art :deep(.quilt) {
+  .screen__art-stage {
     /* The single-column layout still leaves meaningful room for the queue. */
-    width: min(100%, 38vh) !important;
+    width: min(100%, 38vh);
   }
 
   .screen__queue {
@@ -959,9 +975,8 @@ onBeforeUnmount(() => {
     width: 100%;
   }
 
-  .screen__art :deep(.artwork),
-  .screen__art :deep(.quilt) {
-    width: min(100%, 38vh) !important;
+  .screen__art-stage {
+    width: min(100%, 38vh);
   }
 
   .screen__queue {

@@ -515,6 +515,14 @@ pub fn run() {
                 // has to be told which part of it is only shadow.
                 window_frame::install(&window);
                 if let Some(state) = app.try_state::<AppState>() {
+                    // After `install`, which seeds the state the window
+                    // started in that this may override.
+                    window_frame::set_corners(
+                        &window,
+                        window_frame::Corners::from_id(
+                            &crate::state::load_app_preferences(&state.db).window_corners,
+                        ),
+                    );
                     restore_geometry(&state, &window);
                 }
                 let handle = app.handle().clone();
@@ -570,9 +578,8 @@ pub fn run() {
             commands::set_analyser_enabled,
             commands::analyser_frame,
             commands::set_output_meter_enabled,
-            commands::output_level_frame,
             commands::set_chain_meter_block,
-            commands::chain_level_frame,
+            commands::meter_frames,
             commands::set_eq_solo,
             // home
             commands::home_shelves,
@@ -642,6 +649,7 @@ pub fn run() {
             commands::master_mix_now_playing,
             commands::queue_playlist,
             commands::play_master_mix,
+            commands::update_master_mix,
             commands::set_master_mix_playing,
             commands::stop_master_mix,
             commands::import_mix_asset,

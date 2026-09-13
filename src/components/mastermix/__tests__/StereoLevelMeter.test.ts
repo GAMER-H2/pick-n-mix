@@ -1,14 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import StereoLevelMeter from "../StereoLevelMeter.vue";
 import type { OutputLevelFrame } from "@/lib/types";
 
 const setOutputMeterEnabled = vi.fn();
-const outputLevelFrame = vi.fn();
+const meterFrames = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   setOutputMeterEnabled: (...args: unknown[]) => setOutputMeterEnabled(...args),
-  outputLevelFrame: (...args: unknown[]) => outputLevelFrame(...args),
+  meterFrames: (...args: unknown[]) => meterFrames(...args),
 }));
 
 const silent: OutputLevelFrame = {
@@ -17,66 +17,58 @@ const silent: OutputLevelFrame = {
   floorDb: -60,
 };
 
-let nextFrameId = 1;
-let frameCallbacks = new Map<number, FrameRequestCallback>();
-const requestFrame = vi.fn((callback: FrameRequestCallback): number => {
-  const id = nextFrameId;
-  nextFrameId += 1;
-  frameCallbacks.set(id, callback);
-  return id;
-});
-const cancelFrame = vi.fn((id: number): void => {
-  frameCallbacks.delete(id);
-});
+function reads(output: OutputLevelFrame) {
+  meterFrames.mockResolvedValue({ output, chain: null });
+}
 
-async function runNextFrame() {
-  const next = frameCallbacks.entries().next().value as
-    | [number, FrameRequestCallback]
-    | undefined;
-  if (!next) throw new Error("no animation frame was scheduled");
-  frameCallbacks.delete(next[0]);
-  next[1](performance.now());
+/**
+ * Let a reading arrive and be drawn.
+ *
+ * Reading and drawing are separated — see `useMeterFeed` — so a meter shows
+ * nothing until an animation frame has run, however many replies have landed.
+ */
+async function drawnFrame() {
+  // A reading issued before this point may still be in flight and would land
+  // first, so wait for one asked for since — and then for the one after it,
+  // which is only asked for once the first has landed.
+  const from = meterFrames.mock.calls.length;
+  for (let tries = 0; tries < 60 && meterFrames.mock.calls.length < from + 2; tries += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  await flushPromises();
+  await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
   await flushPromises();
 }
 
 describe("StereoLevelMeter", () => {
   beforeEach(() => {
     setOutputMeterEnabled.mockReset().mockResolvedValue(undefined);
-    outputLevelFrame.mockReset().mockResolvedValue(silent);
-    nextFrameId = 1;
-    frameCallbacks = new Map();
-    requestFrame.mockClear();
-    cancelFrame.mockClear();
-    vi.stubGlobal("requestAnimationFrame", requestFrame);
-    vi.stubGlobal("cancelAnimationFrame", cancelFrame);
+    meterFrames.mockReset();
+    reads(silent);
   });
 
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("enables polling only for its mounted lifetime", async () => {
+  it("reads the engine's meters only for its mounted lifetime", async () => {
     const wrapper = mount(StereoLevelMeter);
-    await flushPromises();
+    await drawnFrame();
 
     expect(setOutputMeterEnabled).toHaveBeenCalledWith(true);
-    expect(outputLevelFrame).toHaveBeenCalledTimes(1);
-    expect(requestFrame).toHaveBeenCalledTimes(1);
+    // The master meter has no rack beside it, so it does not ask for the taps.
+    expect(meterFrames).toHaveBeenCalledWith(false);
 
     wrapper.unmount();
-    expect(cancelFrame).toHaveBeenCalledWith(1);
+    await flushPromises();
     expect(setOutputMeterEnabled).toHaveBeenLastCalledWith(false);
+
+    const calls = meterFrames.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(meterFrames).toHaveBeenCalledTimes(calls);
   });
 
-  it("renders independent accessible levels and held peaks", async () => {
-    outputLevelFrame.mockResolvedValue({
-      levelsDb: [-30, -12],
-      peaksDb: [-6, -3],
-      floorDb: -60,
-    } satisfies OutputLevelFrame);
+  it("draws independent accessible levels and held peaks", async () => {
+    reads({ levelsDb: [-30, -12], peaksDb: [-6, -3], floorDb: -60 });
 
     const wrapper = mount(StereoLevelMeter);
-    await flushPromises();
+    await drawnFrame();
     const meters = wrapper.findAll('[role="meter"]');
 
     expect(meters).toHaveLength(2);
@@ -86,56 +78,77 @@ describe("StereoLevelMeter", () => {
     expect(meters[1].attributes("aria-valuenow")).toBe("-12");
     expect(meters[0].attributes("aria-valuetext")).toContain("peak -6.0 dBFS");
 
-    const fills = wrapper.findAll(".level-meter__fill");
-    expect(fills[0].attributes("style")).toContain("inset(50.00% 0 0)");
-    expect(fills[1].attributes("style")).toContain("inset(20.00% 0 0)");
-    const peaks = wrapper.findAll(".level-meter__peak");
-    expect(peaks[0].attributes("style")).toContain("90.00%");
-    expect(peaks[1].attributes("style")).toContain("95.00%");
+    // The mask covers everything above the level: half the scale at -30 dB of
+    // a -60 dB floor, a fifth of it at -12 dB.
+    const masks = wrapper.findAll(".level-meter__mask");
+    expect(masks[0].attributes("style")).toContain("scaleY(0.5000)");
+    expect(masks[1].attributes("style")).toContain("scaleY(0.2000)");
+
+    const rails = wrapper.findAll(".level-meter__peak-rail");
+    expect(rails[0].attributes("style")).toContain("translateY(-90.00%)");
+    expect(rails[1].attributes("style")).toContain("translateY(-95.00%)");
 
     wrapper.unmount();
   });
 
   it("clamps display geometry while marking a peak at or above zero", async () => {
-    outputLevelFrame.mockResolvedValue({
-      levelsDb: [1.5, -90],
-      peaksDb: [2.0, -90],
-      floorDb: -60,
-    } satisfies OutputLevelFrame);
+    reads({ levelsDb: [1.5, -90], peaksDb: [2.0, -90], floorDb: -60 });
 
     const wrapper = mount(StereoLevelMeter);
-    await flushPromises();
+    await drawnFrame();
     const meters = wrapper.findAll('[role="meter"]');
 
     expect(meters[0].attributes("aria-valuenow")).toBe("0");
+    // Clamped for drawing, reported as it came: the reading is over, and
+    // saying so is the point of a meter.
     expect(meters[0].attributes("aria-valuetext")).toContain("1.5 dBFS");
-    expect(wrapper.findAll(".level-meter__fill")[0].attributes("style")).toContain(
-      "inset(0.00% 0 0)",
-    );
+
+    const masks = wrapper.findAll(".level-meter__mask");
+    expect(masks[0].attributes("style")).toContain("scaleY(0.0000)");
+    expect(masks[1].attributes("style")).toContain("scaleY(1.0000)");
     expect(wrapper.findAll(".level-meter__peak")[0].classes()).toContain("is-over");
-    expect(wrapper.findAll(".level-meter__fill")[1].attributes("style")).toContain(
-      "inset(100.00% 0 0)",
-    );
+    expect(wrapper.findAll(".level-meter__peak")[1].classes()).not.toContain("is-over");
 
     wrapper.unmount();
   });
 
-  it("keeps polling after a transient frame failure", async () => {
-    outputLevelFrame
+  it("keeps reading after a transient failure", async () => {
+    meterFrames
       .mockRejectedValueOnce(new Error("engine starting"))
-      .mockResolvedValueOnce({
-        levelsDb: [-18, -24],
-        peaksDb: [-12, -18],
-        floorDb: -60,
-      } satisfies OutputLevelFrame);
+      .mockResolvedValue({
+        output: { levelsDb: [-18, -24], peaksDb: [-12, -18], floorDb: -60 },
+        chain: null,
+      });
 
     const wrapper = mount(StereoLevelMeter);
-    await flushPromises();
-    expect(requestFrame).toHaveBeenCalledTimes(1);
+    // Long enough for the reader to come back round after the failed reply.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await drawnFrame();
 
-    await runNextFrame();
-    expect(outputLevelFrame).toHaveBeenCalledTimes(2);
+    expect(meterFrames.mock.calls.length).toBeGreaterThan(1);
     expect(wrapper.findAll('[role="meter"]')[0].attributes("aria-valuenow")).toBe("-18");
+
+    wrapper.unmount();
+  });
+
+  /** Given a reading by its parent, it draws that and asks the engine nothing. */
+  it("draws what it is handed when it is driven", async () => {
+    const wrapper = mount(StereoLevelMeter, { props: { driven: true, compact: true } });
+    await flushPromises();
+
+    expect(meterFrames).not.toHaveBeenCalled();
+    expect(setOutputMeterEnabled).not.toHaveBeenCalled();
+
+    (wrapper.vm as unknown as { apply: (frame: OutputLevelFrame) => void }).apply({
+      levelsDb: [-30, -30],
+      peaksDb: [-30, -30],
+      floorDb: -60,
+    });
+
+    expect(wrapper.findAll('[role="meter"]')[0].attributes("aria-valuenow")).toBe("-30");
+    expect(wrapper.findAll(".level-meter__mask")[0].attributes("style")).toContain(
+      "scaleY(0.5000)",
+    );
 
     wrapper.unmount();
   });

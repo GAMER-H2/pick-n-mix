@@ -109,7 +109,6 @@ export const analyserFrame = () => invoke<AnalyserFrame>("analyser_frame");
 /** Maintain stereo master-bus levels only while the Master Mixer is visible. */
 export const setOutputMeterEnabled = (enabled: boolean) =>
   invoke<void>("set_output_meter_enabled", { enabled });
-export const outputLevelFrame = () => invoke<OutputLevelFrame>("output_level_frame");
 
 /**
  * Meter one master-mix block's effect chain, or `null` to stop. Only the
@@ -118,8 +117,17 @@ export const outputLevelFrame = () => invoke<OutputLevelFrame>("output_level_fra
  */
 export const setChainMeterBlock = (blockId: string | null) =>
   invoke<void>("set_chain_meter_block", { blockId });
-/** Levels at every point in that chain: in, then after each effect. */
-export const chainLevelFrame = () => invoke<ChainLevelFrame>("chain_level_frame");
+/**
+ * Every meter on screen in one reply: the master bus, and — with `chain` —
+ * the taps either side of each of the selected block's effects.
+ *
+ * One call rather than one per meter, because the cost of a reading is the
+ * round trip and not the reading. See `useMeterFeed`.
+ */
+export const meterFrames = (chain: boolean) =>
+  invoke<{ output: OutputLevelFrame; chain: ChainLevelFrame | null }>("meter_frames", {
+    chain,
+  });
 
 /**
  * Narrow the output to one EQ band's own range while its solo button is held,
@@ -296,6 +304,15 @@ export const playMasterMix = (
   token: string,
 ) =>
   invoke<number>("play_master_mix", { playlistId, mix, positionSecs, token });
+/**
+ * Apply an edit to the mix already being auditioned, without rebuilding it.
+ *
+ * Resolves to whether it landed: `false` means the edit moved, trimmed,
+ * repitched, added or removed a block, which a running timeline cannot adopt,
+ * and the caller must reload the preview instead.
+ */
+export const updateMasterMix = (playlistId: string, mix: MasterMix, token: string) =>
+  invoke<boolean>("update_master_mix", { playlistId, mix, token });
 export const setMasterMixPlaying = (playing: boolean, token: string) =>
   invoke<boolean>("set_master_mix_playing", { playing, token });
 export const stopMasterMix = (token: string) =>

@@ -10,6 +10,7 @@
  */
 import { nextTick, onBeforeUnmount, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
+import WindowDragRegion from "./WindowDragRegion.vue";
 
 const props = withDefaults(
   defineProps<{
@@ -108,6 +109,7 @@ defineExpose({ dialogRef });
         :class="`modal__scrim--${layer}`"
         @click.self="onScrimClick"
       >
+        <WindowDragRegion />
         <div
           ref="dialogRef"
           class="modal__dialog"
@@ -177,6 +179,9 @@ defineExpose({ dialogRef });
 }
 
 .modal__dialog {
+  /* Positioned so it paints over the scrim's drag strip: a dialog tall enough
+     to reach into the title bar keeps its own clicks. */
+  position: relative;
   display: flex;
   flex-direction: column;
   max-width: calc(var(--frame-width) - 44px);

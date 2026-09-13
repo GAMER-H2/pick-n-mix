@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as api from "@/lib/api";
 import {
+  layoutSignature,
   mixDuration,
   scaleBlockForSpeed,
   setBlockMixer as patchBlockMixer,
@@ -29,6 +30,21 @@ const UNDO_DEPTH = 100;
 const SAVE_DELAY_MS = 600;
 /** How far short of a requested position still counts as having arrived. */
 const STALE_TOLERANCE_SECS = 0.35;
+/**
+ * How long an edit that has to rebuild the mix waits for the next one.
+ *
+ * Long enough that a gesture ending in several writes rebuilds once.
+ */
+const PREVIEW_RELOAD_DELAY_MS = 150;
+/**
+ * The same, for an edit the running mix can simply absorb.
+ *
+ * These cost nothing but an IPC call and are heard on the next audio buffer,
+ * so the wait is only there to coalesce a knob's stream of pointermoves — not
+ * to protect the engine from them. Short enough that turning a knob in the
+ * rack sounds like turning the one downstairs.
+ */
+const LIVE_UPDATE_DELAY_MS = 25;
 
 export const useMasterMixStore = defineStore("masterMix", () => {
   const open = ref(false);
@@ -118,6 +134,14 @@ export const useMasterMixStore = defineStore("masterMix", () => {
   let previewReloadTimer: number | undefined;
   let sessionToken: string | null = null;
   let lifecycle = 0;
+  /**
+   * The arrangement of the plan the engine currently has loaded.
+   *
+   * An edit that leaves this unchanged is one the running mix can take without
+   * being rebuilt — no file reopened, no seek, no gap — so it goes down the
+   * live path instead. Empty when nothing is loaded.
+   */
+  let previewLayout = "";
 
   const duration = computed(() => mixDuration(mix.value));
   const canUndo = computed(() => undoStack.value.length > 0);
@@ -128,6 +152,29 @@ export const useMasterMixStore = defineStore("masterMix", () => {
    * at every depth while retaining forward-compatible fields verbatim. */
   function snapshotMix(value: MasterMix): MasterMix {
     return JSON.parse(JSON.stringify(value));
+  }
+
+  /**
+   * The sound signature of the arrangement in hand.
+   *
+   * Every edit asks what the current one is so it can tell a change that has
+   * to be heard from one that does not, and working it out walks the whole
+   * arrangement. Keyed on the object itself, which is replaced wholesale
+   * rather than edited in place, so it cannot go stale.
+   */
+  let signatureCache: { of: MasterMix; value: string } | null = null;
+
+  function currentSignature(): string {
+    if (signatureCache?.of !== mix.value) {
+      signatureCache = { of: mix.value, value: soundSignature(mix.value) };
+    }
+    return signatureCache.value;
+  }
+
+  /** Adopt an arrangement whose signature is already known. */
+  function adoptMix(next: MasterMix, signature: string) {
+    mix.value = next;
+    signatureCache = { of: next, value: signature };
   }
 
   async function openFor(id: string) {
@@ -187,6 +234,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     sessionToken = null;
     previewing.value = false;
     previewPaused.value = false;
+    previewLayout = "";
     if (token) {
       try {
         await api.endMasterMixSession(token);
@@ -207,39 +255,42 @@ export const useMasterMixStore = defineStore("masterMix", () => {
    * release.
    */
   function commit(next: MasterMix) {
-    const before = soundSignature(mix.value);
+    const before = currentSignature();
     undoStack.value = [
       ...undoStack.value.slice(-(UNDO_DEPTH - 1)),
       snapshotMix(mix.value),
     ];
     redoStack.value = [];
-    mix.value = next;
+    const after = soundSignature(next);
+    adoptMix(next, after);
     scheduleSave();
     // Moving a block should be audible without having to nudge the transport
     // to notice. Renaming or recolouring a lane should not cost a re-seek.
-    if (soundSignature(next) !== before) schedulePreviewReload();
+    if (after !== before) schedulePreviewReload();
   }
 
   function undo() {
     const previous = undoStack.value.pop();
     if (!previous) return;
-    const before = soundSignature(mix.value);
+    const before = currentSignature();
     redoStack.value = [...redoStack.value, snapshotMix(mix.value)];
-    mix.value = previous;
+    const after = soundSignature(previous);
+    adoptMix(previous, after);
     pruneSelection();
     scheduleSave();
-    if (soundSignature(previous) !== before) schedulePreviewReload();
+    if (after !== before) schedulePreviewReload();
   }
 
   function redo() {
     const next = redoStack.value.pop();
     if (!next) return;
-    const before = soundSignature(mix.value);
+    const before = currentSignature();
     undoStack.value = [...undoStack.value, snapshotMix(mix.value)];
-    mix.value = next;
+    const after = soundSignature(next);
+    adoptMix(next, after);
     pruneSelection();
     scheduleSave();
-    if (soundSignature(next) !== before) schedulePreviewReload();
+    if (after !== before) schedulePreviewReload();
   }
 
   /** Undo can remove blocks that were selected; a stale id would break the
@@ -270,12 +321,36 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     try {
       // The backend normalises and hands the result back, so the interface
       // shows what was actually stored rather than what it asked for.
-      apply(await api.setMasterMix(playlistId.value, mix.value));
+      settle(await api.setMasterMix(playlistId.value, mix.value));
       pruneSelection();
       error.value = null;
     } catch (e) {
       error.value = String(e);
     }
+  }
+
+  /**
+   * Take what was actually stored, without redrawing a timeline that has not
+   * moved.
+   *
+   * A write comes back normalised and with its revision advanced, so the
+   * arrangement is never *identical* to the one that was sent — but its lanes
+   * almost always are. Adopting the reply wholesale would hand every region on
+   * the timeline a new object, and its waveform a new canvas, six hundred
+   * milliseconds after every edit; keeping the parts that did not change means
+   * the only edit that redraws the timeline is one that altered it.
+   */
+  function settle(view: { mix: MasterMix; entries: MixEntry[]; playlistName: string }) {
+    const lanes =
+      JSON.stringify(view.mix.lanes) === JSON.stringify(mix.value.lanes)
+        ? mix.value.lanes
+        : view.mix.lanes;
+    mix.value = { ...view.mix, lanes };
+    signatureCache = null;
+    if (JSON.stringify(view.entries) !== JSON.stringify(entries.value)) {
+      entries.value = view.entries;
+    }
+    playlistName.value = view.playlistName;
   }
 
   async function setEnabled(enabled: boolean) {
@@ -313,6 +388,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
       if (sessionToken !== token) return;
       previewing.value = true;
       previewPaused.value = false;
+      previewLayout = layoutSignature(mix.value);
       playStartSecs.value = from;
       playhead.value = from;
       expectedPosition.value = from;
@@ -355,13 +431,43 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     if (wasPaused && previewing.value) await pause();
   }
 
+  /**
+   * Push an edit into the mix that is playing.
+   *
+   * Falls back to a rebuild if the engine will not take it, which is the
+   * authority on the question — the check in `schedulePreviewReload` only
+   * decides which to try first.
+   */
+  async function pushPreviewEdit() {
+    const token = sessionToken;
+    if (!previewing.value || !token) return;
+    try {
+      if (await api.updateMasterMix(playlistId.value, mix.value, token)) {
+        if (sessionToken === token) previewLayout = layoutSignature(mix.value);
+        return;
+      }
+    } catch {
+      // Whatever went wrong, a rebuild is the answer to it.
+    }
+    if (sessionToken === token) await reloadPreview();
+  }
+
+  /**
+   * Make an edit audible.
+   *
+   * An edit that leaves every block the same reading of the same file is
+   * handed to the running timeline and heard on the next audio buffer; one
+   * that moves, trims, repitches, adds or removes a block has to rebuild,
+   * which costs a seek and so waits longer for the gesture to settle.
+   */
   function schedulePreviewReload() {
     if (!previewing.value) return;
+    const live = layoutSignature(mix.value) === previewLayout;
     window.clearTimeout(previewReloadTimer);
     previewReloadTimer = window.setTimeout(() => {
       previewReloadTimer = undefined;
-      void reloadPreview();
-    }, 150);
+      void (live ? pushPreviewEdit() : reloadPreview());
+    }, live ? LIVE_UPDATE_DELAY_MS : PREVIEW_RELOAD_DELAY_MS);
   }
 
   async function stop() {
@@ -372,6 +478,7 @@ export const useMasterMixStore = defineStore("masterMix", () => {
     previewing.value = false;
     previewPaused.value = false;
     expectedPosition.value = null;
+    previewLayout = "";
     try {
       await api.stopMasterMix(token);
     } catch {

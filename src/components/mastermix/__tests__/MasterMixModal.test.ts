@@ -50,10 +50,12 @@ vi.mock("@/lib/api", () => ({
   // Plain functions rather than `vi.fn()`: the suites below clear all mocks
   // between tests, and a meter whose poll resolves `undefined` renders nothing.
   setOutputMeterEnabled: () => Promise.resolve(),
-  outputLevelFrame: () =>
-    Promise.resolve({ levelsDb: [-60, -60], peaksDb: [-60, -60], floorDb: -60 }),
+  meterFrames: () =>
+    Promise.resolve({
+      output: { levelsDb: [-60, -60], peaksDb: [-60, -60], floorDb: -60 },
+      chain: null,
+    }),
   setChainMeterBlock: (blockId: string | null) => setChainMeterBlock(blockId),
-  chainLevelFrame: () => Promise.resolve({ blockId: "", stages: [] }),
   setPlaylistMixer: vi.fn(),
   setPlaylistEntryMixer: vi.fn(),
   setGlobalMixer: vi.fn(),
@@ -263,7 +265,9 @@ describe("MasterMixModal", () => {
       clientY: 60,
     });
     const line = wrapper.get(".mm__snapline");
-    expect(line.attributes("style")).toContain(`${190 + 60 * 8}px`);
+    // Offset from the track-information column by a transform, so moving it
+    // does not lay out the timeline beside it again.
+    expect(line.attributes("style")).toContain(`translateX(${60 * 8}px)`);
 
     expect(line.classes()).toContain("is-locked");
 
@@ -274,7 +278,7 @@ describe("MasterMixModal", () => {
       clientY: 60,
     });
     const free = wrapper.get(".mm__snapline");
-    expect(free.attributes("style")).toContain(`${190 + 40 * 8}px`);
+    expect(free.attributes("style")).toContain(`translateX(${40 * 8}px)`);
     expect(free.classes()).not.toContain("is-locked");
   });
 
@@ -290,7 +294,7 @@ describe("MasterMixModal", () => {
       clientY: 60,
     });
     const line = wrapper.get(".mm__snapline");
-    expect(line.attributes("style")).toContain(`${190 + 60.5 * 8}px`);
+    expect(line.attributes("style")).toContain(`translateX(${60.5 * 8}px)`);
     expect(line.classes()).not.toContain("is-locked");
   });
 
@@ -300,7 +304,9 @@ describe("MasterMixModal", () => {
     await wrapper.vm.$nextTick();
 
     await wrapper.get(".mm__body").trigger("pointermove", { clientX: 40, clientY: 60 });
-    expect(wrapper.find(".mm__snapline").exists()).toBe(false);
+    // Hidden rather than removed: the element the frame loop positions outlives
+    // being hidden, so it never shows at the start of the timeline first.
+    expect(wrapper.get(".mm__snapline").attributes("style")).toContain("display: none");
   });
 
   it("offers the ruler grid only while snapping is on", async () => {
@@ -616,8 +622,13 @@ describe("MasterMixModal", () => {
   it("toggles the selected block's rack and adds effects from its title bar", async () => {
     const { wrapper, store } = await open();
     const effects = wrapper.get(".mm__mixer-button");
-    expect((effects.element as HTMLButtonElement).disabled).toBe(true);
+    expect((effects.element as HTMLButtonElement).disabled).toBe(false);
     expect(wrapper.find(".rack").exists()).toBe(false);
+
+    await effects.trigger("click");
+    expect(wrapper.get(".mm__effects-empty").text()).toContain(
+      "Select an audio block to start adding and editing effects.",
+    );
 
     await wrapper.findAll(".block")[0].trigger("pointerdown", {
       button: 0,
@@ -626,11 +637,7 @@ describe("MasterMixModal", () => {
     });
     await flushPromises();
 
-    expect((effects.element as HTMLButtonElement).disabled).toBe(false);
-    expect(wrapper.find(".rack").exists()).toBe(false);
-    await effects.trigger("click");
-    await flushPromises();
-
+    expect(wrapper.find(".mm__effects-empty").exists()).toBe(false);
     const rack = wrapper.get(".rack");
     expect(effects.attributes("aria-pressed")).toBe("true");
     expect(rack.text()).toContain("This block has no effects yet");
@@ -638,10 +645,10 @@ describe("MasterMixModal", () => {
     expect(rack.text()).toContain("+ Add Effect");
 
     await rack.get(".effects-menu__trigger").trigger("click");
-    const reverb = rack
-      .findAll(".effects-menu__menu [role='menuitem']")
-      .find((item) => item.text() === "Reverb");
-    await reverb?.trigger("click");
+    const reverb = Array.from(
+      document.body.querySelectorAll<HTMLElement>(".effects-menu__menu [role='menuitem']"),
+    ).find((item) => item.textContent?.trim() === "Reverb");
+    reverb?.click();
     await flushPromises();
 
     // Added switched on, so it does something without a second trip to a toggle.

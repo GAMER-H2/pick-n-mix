@@ -13,6 +13,7 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   seekStepSecs: 10,
   ambienceWithoutPlayback: false,
   crossfadeArt: true,
+  windowCorners: "auto",
   queueFollowsCurrent: true,
   hiddenMixerSections: [],
   hiddenPopoverSections: [],

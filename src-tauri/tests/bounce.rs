@@ -293,7 +293,10 @@ fn a_bounce_reports_its_progress() {
     .expect("bounce");
 
     let seen = seen.into_inner().unwrap();
-    assert!(seen.len() > 1, "a three-second render should report more than once");
+    assert!(
+        seen.len() > 1,
+        "a three-second render should report more than once"
+    );
     assert!(
         seen.windows(2).all(|w| w[1] >= w[0]),
         "progress must not go backwards: {seen:?}"

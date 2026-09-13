@@ -184,7 +184,9 @@ impl<'a> OfflineMix<'a> {
     /// Throttled to whole half-percents: a bounce reads a thousand blocks a
     /// second, and an event per block would cost more than the encoding.
     fn report(&mut self) {
-        let Some(progress) = self.progress else { return };
+        let Some(progress) = self.progress else {
+            return;
+        };
         let fraction = (self.produced as f64 / self.expected).clamp(0.0, 0.999);
         if fraction < self.reported + 0.005 {
             return;
