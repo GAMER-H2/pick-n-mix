@@ -1,7 +1,14 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import * as api from "@/lib/api";
-import { DEFAULTS, clone, pitchRatio, resolve, type Section } from "@/lib/mixer";
+import {
+  DEFAULTS,
+  clone,
+  pitchRatio,
+  resolve,
+  withStageMoved,
+  type Section,
+} from "@/lib/mixer";
 import type { Eq, FilterInfo, MixerSettings, Preset, ResolvedMixer } from "@/lib/types";
 
 /**
@@ -159,6 +166,37 @@ export const useMixerStore = defineStore("mixer", () => {
     await persist();
   }
 
+  /**
+   * Move one effect along the chain, which is what the panel's grips and the
+   * rack's arrows both end in.
+   *
+   * The whole order is written, never a difference, so the layer says outright
+   * what it wants rather than depending on what the layer below happens to be
+   * — and a stage moved at playlist level cannot be undone by a later change
+   * to the global order.
+   */
+  async function moveChainStage(from: number, to: number) {
+    await moveOrder("chainOrder", from, to);
+  }
+
+  /**
+   * Move a section that is not part of the chain.
+   *
+   * Where these are listed is a matter of layout and nothing else — none of
+   * them is a stage the signal passes through — so this changes the panel and
+   * the rack, and never the sound.
+   */
+  async function moveLayoutSection(from: number, to: number) {
+    await moveOrder("layoutOrder", from, to);
+  }
+
+  async function moveOrder(section: "chainOrder" | "layoutOrder", from: number, to: number) {
+    const order = effective.value[section];
+    const next = withStageMoved(order, from, to);
+    if (next.every((id, index) => id === order[index])) return;
+    await setSection(section, next);
+  }
+
   /** Drop an override so the section falls through to the layer below again. */
   async function clearSection(section: Section) {
     const next = { ...targetLayer.value };
@@ -274,6 +312,8 @@ export const useMixerStore = defineStore("mixer", () => {
     editPlaylistEntry,
     editMixBlock,
     setSection,
+    moveChainStage,
+    moveLayoutSection,
     clearSection,
     setEnabled,
     resetLayer,

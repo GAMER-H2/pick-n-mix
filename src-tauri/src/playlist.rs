@@ -189,10 +189,16 @@ impl Playlist {
         }
         // A file written by a future version still loads; the fields we do not
         // understand ride along in `extra`.
+        //
+        // Older versions could write both playback modes at once. They already
+        // played the master mix in that state, so retain that observable choice
+        // and discard the contradictory shuffle-only flag.
+        playlist.normalise_playback_mode();
         Ok(playlist)
     }
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
+        self.normalise_playback_mode();
         self.updated_at = crate::library::db::now();
         self.format = FORMAT_TAG.to_string();
         if let Some(parent) = path.parent() {
@@ -207,6 +213,40 @@ impl Playlist {
         std::fs::rename(&temp, path)
             .with_context(|| format!("replacing playlist {}", path.display()))?;
         Ok(())
+    }
+
+    /// Make this playlist shuffle whenever it is played.
+    ///
+    /// The two playlist playback modes are alternatives. Enabling this one
+    /// switches an existing master mix off without discarding its arrangement;
+    /// disabling it does not implicitly enable anything else.
+    pub fn set_shuffle_only(&mut self, enabled: bool) {
+        self.shuffle_only = enabled;
+        if enabled {
+            if let Some(mix) = self.master_mix.as_mut().filter(|mix| mix.enabled) {
+                mix.enabled = false;
+                mix.touch();
+            }
+        }
+    }
+
+    /// Store a master mix, making an enabled mix the playlist's playback mode.
+    ///
+    /// A disabled arrangement may coexist with shuffle-only because it is only
+    /// saved work. Once enabled, it takes over and shuffle-only is switched off.
+    pub fn set_master_mix(&mut self, mix: MasterMix) {
+        if mix.enabled {
+            self.shuffle_only = false;
+        }
+        self.master_mix = Some(mix);
+    }
+
+    /// Resolve an impossible state from an older or hand-written playlist.
+    /// Master mix wins because that is how such files have always played.
+    fn normalise_playback_mode(&mut self) {
+        if self.master_mix.as_ref().is_some_and(|mix| mix.enabled) {
+            self.shuffle_only = false;
+        }
     }
 
     /// Add a song to the end of the list.
@@ -582,6 +622,73 @@ mod tests {
         playlist.shuffle_only = true;
         playlist.save(&path).unwrap();
         assert!(Playlist::load(&path).unwrap().shuffle_only);
+    }
+
+    #[test]
+    fn enabling_shuffle_only_disables_but_preserves_a_master_mix() {
+        let mut playlist = Playlist {
+            master_mix: Some(MasterMix {
+                enabled: true,
+                revision: 7,
+                lanes: vec![crate::master_mix::Lane {
+                    name: "Kept arrangement".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        playlist.set_shuffle_only(true);
+
+        assert!(playlist.shuffle_only);
+        let mix = playlist.master_mix.as_ref().unwrap();
+        assert!(!mix.enabled);
+        assert_eq!(mix.lanes.len(), 1);
+        assert_eq!(mix.lanes[0].name, "Kept arrangement");
+        assert_eq!(mix.revision, 8);
+    }
+
+    #[test]
+    fn enabled_master_mix_wins_and_disabled_actions_do_not_enable_the_other_mode() {
+        let mut playlist = Playlist {
+            shuffle_only: true,
+            ..Default::default()
+        };
+        playlist.set_master_mix(MasterMix {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(!playlist.shuffle_only);
+        assert!(playlist.master_mix.as_ref().unwrap().enabled);
+
+        playlist.set_master_mix(MasterMix::default());
+        assert!(!playlist.shuffle_only);
+        assert!(!playlist.master_mix.as_ref().unwrap().enabled);
+
+        playlist.set_shuffle_only(false);
+        assert!(!playlist.master_mix.as_ref().unwrap().enabled);
+    }
+
+    #[test]
+    fn loading_a_legacy_conflict_keeps_the_enabled_master_mix() {
+        let dir = tempdir();
+        let path = dir.join("conflict.pnmx");
+        std::fs::write(
+            &path,
+            r#"{
+                "name": "Conflict",
+                "shuffleOnly": true,
+                "masterMix": { "enabled": true, "revision": 9, "lanes": [] },
+                "tracks": []
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = Playlist::load(&path).unwrap();
+        assert!(!loaded.shuffle_only);
+        assert!(loaded.master_mix.as_ref().unwrap().enabled);
+        assert_eq!(loaded.master_mix.as_ref().unwrap().revision, 9);
     }
 
     #[test]

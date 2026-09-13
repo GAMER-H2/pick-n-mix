@@ -6,6 +6,7 @@ pub mod decode;
 pub mod dsp;
 pub mod engine;
 pub mod ffmpeg;
+pub mod meter;
 pub mod params;
 pub mod peaks;
 pub mod timeline;

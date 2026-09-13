@@ -216,13 +216,24 @@ impl Player {
 
     /// Replace the queue with entries that may carry their own overrides.
     pub fn set_queue_items(&mut self, items: Vec<QueueItem>, start_index: usize) {
-        self.set_queue_entries(items.into_iter().map(QueueEntry::from).collect(), start_index);
+        self.set_queue_entries(
+            items.into_iter().map(QueueEntry::from).collect(),
+            start_index,
+        );
     }
 
     /// Replace the queue with anything it can hold, mixes included.
     pub fn set_queue_entries(&mut self, entries: Vec<QueueEntry>, start_index: usize) {
         self.queue = entries;
-        self.rebuild_order(Some(start_index.min(self.queue.len().saturating_sub(1))));
+        let start = start_index.min(self.queue.len().saturating_sub(1));
+        if self
+            .queue
+            .get(start)
+            .is_some_and(|entry| entry.mix().is_some())
+        {
+            self.shuffle = false;
+        }
+        self.rebuild_order(Some(start));
     }
 
     /// Update the override on whichever entry holds `track_id`, used when a
@@ -230,7 +241,9 @@ impl Player {
     pub fn set_entry_mixer(&mut self, track_id: &str, mixer: Option<MixerSettings>) -> bool {
         let mut changed = false;
         for entry in self.queue.iter_mut() {
-            let QueueEntry::Track(item) = entry else { continue };
+            let QueueEntry::Track(item) = entry else {
+                continue;
+            };
             if item.track.id != track_id {
                 continue;
             }
@@ -241,6 +254,9 @@ impl Player {
     }
 
     pub fn set_shuffle(&mut self, on: bool) {
+        // A master mix is already a fixed arrangement. It is one atomic queue
+        // entry, not a list of songs whose order shuffle may replace.
+        let on = on && self.current_mix().is_none();
         if self.shuffle == on {
             return;
         }
@@ -595,7 +611,11 @@ mod tests {
         p.set_queue(tracks(2), 0);
         p.set_repeat(Repeat::All);
         p.advance(false);
-        assert_eq!(p.advance(false).unwrap().track().unwrap().id, "t0", "repeat all wraps");
+        assert_eq!(
+            p.advance(false).unwrap().track().unwrap().id,
+            "t0",
+            "repeat all wraps"
+        );
     }
 
     #[test]
@@ -603,7 +623,11 @@ mod tests {
         let mut p = Player::new();
         p.set_queue(tracks(3), 0);
         p.set_repeat(Repeat::One);
-        assert_eq!(p.advance(true).unwrap().track().unwrap().id, "t0", "auto-advance repeats");
+        assert_eq!(
+            p.advance(true).unwrap().track().unwrap().id,
+            "t0",
+            "auto-advance repeats"
+        );
         assert_eq!(
             p.advance(false).unwrap().track().unwrap().id,
             "t1",
@@ -712,7 +736,10 @@ mod tests {
         let view = p.view();
         assert_eq!(view.items.len(), 3);
         assert_eq!(
-            view.items.iter().map(|r| row_track(r).id.as_str()).collect::<Vec<_>>(),
+            view.items
+                .iter()
+                .map(|r| row_track(r).id.as_str())
+                .collect::<Vec<_>>(),
             ["t0", "t2", "t3"]
         );
         assert_eq!(p.advance(false).unwrap().track().unwrap().id, "t2");
@@ -935,7 +962,11 @@ mod scope_tests {
         );
 
         let view = p.view();
-        let ids: Vec<&str> = view.items.iter().map(|r| row_track(r).id.as_str()).collect();
+        let ids: Vec<&str> = view
+            .items
+            .iter()
+            .map(|r| row_track(r).id.as_str())
+            .collect();
         assert_eq!(ids, ["d", "a", "b", "c"]);
         assert_eq!(p.advance(false).unwrap().track().unwrap().id, "c");
     }
@@ -969,6 +1000,44 @@ mod scope_tests {
         assert_eq!(row_track(&view.items[1]).id, "a");
         assert_eq!(row_track(&view.items[2]).id, "b");
         assert_eq!(view.current_index, Some(0));
+    }
+
+    #[test]
+    fn shuffle_cannot_be_enabled_while_a_mix_is_current() {
+        let mut p = Player::new();
+        p.set_shuffle(true);
+        p.set_queue_entries(vec![QueueEntry::Mix(a_mix("Evening"))], 0);
+        assert!(!p.shuffle(), "loading a mix clears existing shuffle");
+
+        p.set_shuffle(true);
+
+        assert!(!p.shuffle(), "shuffle cannot be re-enabled on the mix");
+        assert!(!p.view().shuffle);
+    }
+
+    #[test]
+    fn shuffle_can_be_enabled_after_the_mix_has_finished() {
+        let mut p = Player::new();
+        p.set_queue_entries(vec![QueueEntry::Mix(a_mix("Evening"))], 0);
+        p.add_to_queue(vec![track("after")]);
+        p.advance(true);
+
+        p.set_shuffle(true);
+
+        assert!(p.shuffle());
+        assert_eq!(p.current().unwrap().id, "after");
+    }
+
+    #[test]
+    fn a_mix_queued_for_later_does_not_disable_shuffle() {
+        let mut p = Player::new();
+        p.set_queue(vec![track("now")], 0);
+        p.add_to_queue_entries(vec![QueueEntry::Mix(a_mix("Evening"))]);
+
+        p.set_shuffle(true);
+
+        assert!(p.shuffle());
+        assert_eq!(p.current().unwrap().id, "now");
     }
 
     /// The mix is a queue entry like any other: when it ends, the queue goes on.

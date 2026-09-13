@@ -675,6 +675,40 @@ pub fn set_analyser_enabled(state: State<'_, AppState>, enabled: bool) -> Cmd<()
     Ok(())
 }
 
+/// Maintain stereo master-bus levels only while the Master Mixer is visible.
+#[tauri::command]
+pub fn set_output_meter_enabled(state: State<'_, AppState>, enabled: bool) -> Cmd<()> {
+    state.engine.set_output_meter_enabled(enabled);
+    Ok(())
+}
+
+/// Latest post-limiter, pre-player-volume stereo levels in dBFS.
+#[tauri::command]
+pub fn output_level_frame(
+    state: State<'_, AppState>,
+) -> Cmd<crate::audio::meter::OutputLevelFrame> {
+    Ok(*state.engine.output_level_frame())
+}
+
+/// Meter one master-mix block's effect chain, or `None` to stop.
+///
+/// The rack in the Master Mixer asks for whichever block is selected. Only one
+/// block is ever metered: the meters are there to show what one chain does to
+/// one signal, and measuring the rest would be work with nothing to draw it.
+#[tauri::command]
+pub fn set_chain_meter_block(state: State<'_, AppState>, block_id: Option<String>) -> Cmd<()> {
+    state.chain_meter.select(block_id);
+    Ok(())
+}
+
+/// Levels at every point in the metered block's chain: in, then after each
+/// effect. Empty until the mix is auditioned, since nothing has passed through
+/// the chain to measure.
+#[tauri::command]
+pub fn chain_level_frame(state: State<'_, AppState>) -> Cmd<crate::audio::meter::ChainLevelFrame> {
+    Ok(state.chain_meter.frame())
+}
+
 /// Audition one EQ band's own frequency range on its own.
 ///
 /// Held, not toggled: the expanded EQ sends the band on press and `None` on
@@ -782,11 +816,20 @@ pub fn clear_queue(app: AppHandle, state: State<'_, AppState>) -> Cmd<()> {
 
 #[tauri::command]
 pub fn set_shuffle(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Cmd<()> {
+    // The editor audition and saved timeline playback both own a fixed
+    // arrangement. A stale UI or direct command may ask for shuffle anyway;
+    // normalize that request to off rather than exposing a new command error.
+    let mix_owns_playback =
+        master_mix_owns_playback(&state) || enabled_mix_playing(&state).is_some();
     state.cancel_preview();
-    state.player.lock().set_shuffle(enabled);
+    let shuffle = {
+        let mut player = state.player.lock();
+        player.set_shuffle(enabled && !mix_owns_playback);
+        player.shuffle()
+    };
     let _ = state
         .db
-        .set_setting(SETTING_SHUFFLE, if enabled { "true" } else { "false" });
+        .set_setting(SETTING_SHUFFLE, if shuffle { "true" } else { "false" });
     // What comes after the current track can change completely.
     state.engine.cancel_next();
     let _ = app.emit("queue-changed", state.player.lock().view());
@@ -1341,7 +1384,7 @@ pub fn set_playlist_shuffle_only(
     let Some((path, mut p)) = find_playlist(&state, &id) else {
         return Err("playlist not found".into());
     };
-    p.shuffle_only = enabled;
+    p.set_shuffle_only(enabled);
     p.save(&path).map_err(err)?;
     let _ = app.emit("playlists-changed", ());
     Ok(())
@@ -2312,7 +2355,7 @@ pub fn set_master_mix(
     let mut mix = mix;
     mix.normalise(p.tracks.len());
     mix.touch();
-    p.master_mix = Some(mix);
+    p.set_master_mix(mix);
     p.save(&path).map_err(err)?;
     let _ = app.emit("playlists-changed", ());
     view_of(&state, p).map_err(err)
@@ -2336,7 +2379,7 @@ pub fn set_master_mix_enabled(
     mix.normalise(p.tracks.len());
     mix.enabled = enabled;
     mix.touch();
-    p.master_mix = Some(mix);
+    p.set_master_mix(mix);
     p.save(&path).map_err(err)?;
     let _ = app.emit("playlists-changed", ());
     view_of(&state, p).map_err(err)
@@ -2355,7 +2398,7 @@ pub fn reset_master_mix(
     p.master_mix = None;
     let mut fresh = p.master_mix_or_default(&state.db).map_err(err)?;
     fresh.normalise(p.tracks.len());
-    p.master_mix = Some(fresh);
+    p.set_master_mix(fresh);
     p.save(&path).map_err(err)?;
     let _ = app.emit("playlists-changed", ());
     view_of(&state, p).map_err(err)
@@ -2405,13 +2448,19 @@ pub async fn entry_waveform(
 
 /// Capture and pause normal playback before the Master Mixer can replace it.
 #[tauri::command]
-pub fn begin_master_mix_session(state: State<'_, AppState>) -> Cmd<String> {
+pub fn begin_master_mix_session(app: AppHandle, state: State<'_, AppState>) -> Cmd<String> {
     // Repeated opens share the capture rather than accidentally treating an
     // audition as the normal source that should later be restored.
     let mut slot = state.master_mix_session.lock();
     if let Some(session) = slot.as_ref() {
         return Ok(session.token.clone());
     }
+
+    // The editor owns a fixed timeline for this session, so queue shuffle is
+    // neither applicable now nor something the durable state should report.
+    state.player.lock().set_shuffle(false);
+    let _ = state.db.set_setting(SETTING_SHUFFLE, "false");
+    let _ = app.emit("queue-changed", state.player.lock().view());
 
     // A physical-file preview is not normal playback. Put its original back
     // before taking the modal's longer-lived snapshot.
@@ -2575,6 +2624,9 @@ pub fn play_master_mix(
     state.engine.cancel_next();
     let rate = state.engine.device_sample_rate();
     let mut source = crate::audio::timeline::TimelineSource::new(plan, rate);
+    // Only the audition is metered: the rack is part of the editor, and a
+    // playlist playing its mix normally has nobody watching the levels.
+    source.set_meter_bus(std::sync::Arc::clone(&state.chain_meter));
     if let Some(position) = position_secs.filter(|p| *p > 0.0) {
         source.seek(position).map_err(err)?;
     }
@@ -2923,6 +2975,11 @@ fn load_queued_mix(
     if !loaded {
         return Err(format!("there is nothing left to play in {}", mix.name));
     }
+    // Starting a fixed arrangement ends queue shuffle as a mode, including its
+    // durable setting, so neither the UI nor the next launch reports a shuffle
+    // that cannot apply to what is playing.
+    state.player.lock().set_shuffle(false);
+    let _ = state.db.set_setting(SETTING_SHUFFLE, "false");
     // No song is playing, and the bar has to be told so or it goes on showing
     // whatever was current before the mix started.
     let _ = app.emit("track-changed", Option::<Track>::None);

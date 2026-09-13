@@ -25,6 +25,15 @@ pub struct MixerSettings {
     pub delay: Option<Delay>,
     pub normalisation: Option<Normalisation>,
     pub lofi: Option<Lofi>,
+    /// The order the chain stages are applied in, as stage ids. Stages this
+    /// list does not mention keep their default place, so a layer saved before
+    /// a stage existed still gets it. See [`ChainStage`].
+    pub chain_order: Option<Vec<String>>,
+    /// The order the panel and the master mixer's rack *list* the sections
+    /// that are not stages of the chain. Display only, like `preset`: nothing
+    /// about the sound depends on it, which is why it never reaches
+    /// [`Resolved`].
+    pub layout_order: Option<Vec<String>>,
     /// Crossfade is layered globally and per playlist, but never per entry.
     pub crossfade: Option<CrossfadeSettings>,
     pub filters: Option<Vec<Filter>>,
@@ -54,6 +63,14 @@ impl MixerSettings {
                 .clone()
                 .or_else(|| self.normalisation.clone()),
             lofi: over.lofi.clone().or_else(|| self.lofi.clone()),
+            chain_order: over
+                .chain_order
+                .clone()
+                .or_else(|| self.chain_order.clone()),
+            layout_order: over
+                .layout_order
+                .clone()
+                .or_else(|| self.layout_order.clone()),
             crossfade: over.crossfade.clone().or_else(|| self.crossfade.clone()),
             filters: over.filters.clone().or_else(|| self.filters.clone()),
             extra,
@@ -84,6 +101,7 @@ impl MixerSettings {
             delay: merged.delay.unwrap_or_default(),
             normalisation: merged.normalisation.unwrap_or_default(),
             lofi: merged.lofi.unwrap_or_default(),
+            chain_order: ChainStage::order(merged.chain_order.as_deref().unwrap_or_default()),
             crossfade,
             filters: merged.filters.unwrap_or_default(),
         }
@@ -367,6 +385,75 @@ impl Default for Filter {
     }
 }
 
+/// One stage of the per-voice effect chain, in the order it can be moved to.
+///
+/// Only the stages that genuinely sit in the signal path are here. Pitch is
+/// varispeed applied at decode time, normalisation is a gain ride after the
+/// chain (with the one limiter on the master bus), the ambience beds are laid
+/// over the top afterwards, and a crossfade belongs to the join between two
+/// tracks — none of them has a place in the chain to be moved to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ChainStage {
+    Eq,
+    Delay,
+    Reverb,
+    Lofi,
+    Panning,
+}
+
+/// The chain as it was before the order became editable. Kept as the default
+/// so every mix, preset and playlist saved until now goes on sounding exactly
+/// as it did.
+pub const DEFAULT_CHAIN_ORDER: [ChainStage; 5] = [
+    ChainStage::Eq,
+    ChainStage::Delay,
+    ChainStage::Reverb,
+    ChainStage::Lofi,
+    ChainStage::Panning,
+];
+
+impl ChainStage {
+    pub fn id(self) -> &'static str {
+        match self {
+            ChainStage::Eq => "eq",
+            ChainStage::Delay => "delay",
+            ChainStage::Reverb => "reverb",
+            ChainStage::Lofi => "lofi",
+            ChainStage::Panning => "panning",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        DEFAULT_CHAIN_ORDER
+            .into_iter()
+            .find(|stage| stage.id() == id)
+    }
+
+    /// A saved order turned into a complete one.
+    ///
+    /// Ids that are not stages are dropped and stages the list does not
+    /// mention keep their default place, so a layer written by an older
+    /// version — or by hand — still gets every stage exactly once rather than
+    /// silently losing one.
+    pub fn order(saved: &[String]) -> Vec<ChainStage> {
+        let mut out: Vec<ChainStage> = Vec::with_capacity(DEFAULT_CHAIN_ORDER.len());
+        for id in saved {
+            if let Some(stage) = ChainStage::from_id(id) {
+                if !out.contains(&stage) {
+                    out.push(stage);
+                }
+            }
+        }
+        for stage in DEFAULT_CHAIN_ORDER {
+            if !out.contains(&stage) {
+                out.push(stage);
+            }
+        }
+        out
+    }
+}
+
 /// Fully-populated settings handed to the DSP chain.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -379,6 +466,8 @@ pub struct Resolved {
     pub delay: Delay,
     pub normalisation: Normalisation,
     pub lofi: Lofi,
+    /// Every stage exactly once, in the order the DSP applies them.
+    pub chain_order: Vec<ChainStage>,
     /// Fully resolved so the audio engine can always apply a concrete setting.
     pub crossfade: CrossfadeSettings,
     pub filters: Vec<Filter>,
@@ -502,6 +591,43 @@ mod tests {
 
         let resolved = MixerSettings::resolve(&[&global, &playlist, &entry]);
         assert_eq!(resolved.crossfade.length_secs, 1.5);
+    }
+
+    #[test]
+    fn an_unset_chain_order_resolves_to_the_original_chain() {
+        let r = MixerSettings::resolve(&[&MixerSettings::default()]);
+        assert_eq!(r.chain_order, DEFAULT_CHAIN_ORDER.to_vec());
+    }
+
+    #[test]
+    fn a_partial_chain_order_keeps_every_stage_exactly_once() {
+        let order = ChainStage::order(&["panning".into(), "nonsense".into(), "panning".into()]);
+        assert_eq!(order[0], ChainStage::Panning);
+        assert_eq!(order.len(), DEFAULT_CHAIN_ORDER.len());
+        for stage in DEFAULT_CHAIN_ORDER {
+            assert_eq!(order.iter().filter(|s| **s == stage).count(), 1);
+        }
+    }
+
+    #[test]
+    fn chain_order_cascades_like_any_other_section() {
+        let global = MixerSettings {
+            chain_order: Some(vec!["reverb".into(), "eq".into()]),
+            ..Default::default()
+        };
+        let block = MixerSettings {
+            chain_order: Some(vec!["lofi".into()]),
+            ..Default::default()
+        };
+        let resolved = MixerSettings::resolve(&[&global, &block]);
+        assert_eq!(resolved.chain_order[0], ChainStage::Lofi);
+
+        // Nothing said about the order downstream leaves the layer below in force.
+        let resolved = MixerSettings::resolve(&[&global, &MixerSettings::default()]);
+        assert_eq!(
+            resolved.chain_order[..2],
+            [ChainStage::Reverb, ChainStage::Eq]
+        );
     }
 
     #[test]

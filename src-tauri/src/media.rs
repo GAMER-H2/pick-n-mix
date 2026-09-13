@@ -56,12 +56,30 @@ impl Default for MediaBridge {
 /// Register with the OS. A failure here is not fatal: the app simply runs
 /// without system transport controls.
 pub fn init(app: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    let hwnd = {
+        let Some(window) = app.get_webview_window("main") else {
+            eprintln!("media: main window unavailable; system controls disabled");
+            return;
+        };
+        match window.hwnd() {
+            Ok(hwnd) => Some(hwnd.0 as *mut std::ffi::c_void),
+            Err(e) => {
+                eprintln!("media: could not get the Windows window handle: {e}");
+                return;
+            }
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let hwnd = None;
+
     let config = PlatformConfig {
         // Reverse-DNS, as MPRIS expects.
         dbus_name: "picknmix",
         display_name: "Pick n Mix",
-        // Windows needs a window handle here; the platforms we target do not.
-        hwnd: None,
+        // Windows SMTC is attached to the app's native window. Souvlaki
+        // panics rather than returning an error when this is absent.
+        hwnd,
     };
 
     let mut controls = match MediaControls::new(config) {

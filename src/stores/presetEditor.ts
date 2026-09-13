@@ -1,7 +1,7 @@
 import { computed, ref } from "vue";
 import { defineStore } from "pinia";
 import * as api from "@/lib/api";
-import { clone, resolve, type Section } from "@/lib/mixer";
+import { clone, resolve, withStageMoved, type Section } from "@/lib/mixer";
 import { useMixerStore } from "@/stores/mixer";
 import type { MixerSettings, Preset, PresetKind } from "@/lib/types";
 
@@ -58,6 +58,23 @@ export const usePresetEditorStore = defineStore("presetEditor", () => {
   function setSection<K extends Section>(section: K, value: MixerSettings[K]) {
     if (!session.value) return;
     session.value.draft = { ...session.value.draft, [section]: value };
+  }
+
+  /** Move an effect along the chain this preset describes. */
+  function moveChainStage(from: number, to: number) {
+    moveOrder("chainOrder", from, to);
+  }
+
+  /** Move a section that is not part of the chain. Layout only. */
+  function moveLayoutSection(from: number, to: number) {
+    moveOrder("layoutOrder", from, to);
+  }
+
+  function moveOrder(section: "chainOrder" | "layoutOrder", from: number, to: number) {
+    const order = effective.value[section];
+    const next = withStageMoved(order, from, to);
+    if (next.every((id, index) => id === order[index])) return;
+    setSection(section, next);
   }
 
   function clearSection(section: Section) {
@@ -127,6 +144,8 @@ export const usePresetEditorStore = defineStore("presetEditor", () => {
     close,
     setEnabled,
     setSection,
+    moveChainStage,
+    moveLayoutSection,
     clearSection,
     toggleFilter,
     setFilterVolume,

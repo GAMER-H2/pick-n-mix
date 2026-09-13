@@ -19,8 +19,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import AppSlider from "../ui/AppSlider.vue";
-import AdvancedMixer from "../mixer/AdvancedMixer.vue";
+import BlockEffectsMenu from "./BlockEffectsMenu.vue";
+import BlockEffectsRack from "./BlockEffectsRack.vue";
 import MixBlockView from "./MixBlockView.vue";
+import StereoLevelMeter from "./StereoLevelMeter.vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -60,7 +62,13 @@ import {
   updateLane,
 } from "@/lib/masterMix";
 import { formatDuration } from "@/lib/format";
-import { pitchRatio, resolve } from "@/lib/mixer";
+import {
+  RACK_DEVICES,
+  SECTION_LABELS,
+  deviceDefault,
+  pitchRatio,
+  resolve,
+} from "@/lib/mixer";
 import { useDismiss } from "@/lib/dismiss";
 import { visibleBounds } from "@/lib/frame";
 import { useMasterMixStore, type Tool } from "@/stores/masterMix";
@@ -69,6 +77,7 @@ import { usePlayerStore } from "@/stores/player";
 import { usePlaylistStore } from "@/stores/playlists";
 import { useUiStore } from "@/stores/ui";
 import * as api from "@/lib/api";
+import type { DeviceSection } from "@/lib/mixer";
 import type { MasterMix, MixBlock } from "@/lib/types";
 
 const store = useMasterMixStore();
@@ -312,17 +321,17 @@ function loadVisibleWaveforms() {
 
 watch(() => store.mix.lanes.length, loadVisibleWaveforms);
 watch(() => store.playlistId, loadVisibleWaveforms);
+/**
+ * Keep the mixer pointed at whichever single block is selected.
+ *
+ * The rack along the bottom edits that layer, so selecting a region is what
+ * opens its effects — there is no panel to open and nothing to press first.
+ * Selecting nothing, or several regions, points the mixer back at the global
+ * layer so a stray knob cannot write into a block that is no longer on screen.
+ */
 watch(
   () => store.selection.join("\u0000"),
-  () => {
-    if (
-      mixer.target.kind === "block" &&
-      mixer.target.playlistId === store.playlistId &&
-      (store.selection.length !== 1 || store.selection[0] !== mixer.target.blockId)
-    ) {
-      mixer.panelOpen = false;
-    }
-  },
+  () => void bindMixerToSelection(),
 );
 
 // ---------------------------------------------------------------------------
@@ -1029,7 +1038,6 @@ function laneAudible(laneIndex: number): boolean {
 
 async function close() {
   if (mixer.target.kind === "block" && mixer.target.playlistId === store.playlistId) {
-    mixer.panelOpen = false;
     await mixer.editGlobal();
   }
   await store.close();
@@ -1045,30 +1053,75 @@ const selectedBlock = computed<MixBlock | null>(() => {
   if (store.selection.length !== 1) return null;
   return locate(mix.value, store.selection[0])?.block ?? null;
 });
-const blockMixerOpen = computed(
+function blockName(block: MixBlock): string {
+  return (
+    entryFor(block)?.title ??
+    (block.source.kind === "asset" ? block.source.file : "Audio block")
+  );
+}
+
+/** Whether the mixer is currently editing the selected block's layer. */
+const blockMixerBound = computed(
   () =>
-    mixer.panelOpen &&
+    !!selectedBlock.value &&
     mixer.target.kind === "block" &&
-    mixer.target.playlistId === store.playlistId,
+    mixer.target.playlistId === store.playlistId &&
+    mixer.target.blockId === selectedBlock.value.id,
 );
 
-/** Open effects for exactly one selected audio region. */
-async function openBlockMixer() {
+/** The effects the selected block has, which is what the rack draws. */
+const blockDevices = computed<DeviceSection[]>(() =>
+  blockMixerBound.value
+    ? mixer.overriddenSections.filter((section): section is DeviceSection =>
+        (RACK_DEVICES as string[]).includes(section),
+      )
+    : [],
+);
+
+/** Point the mixer at the one selected region, or back at the global layer. */
+async function bindMixerToSelection() {
+  const block = selectedBlock.value;
+  if (!block) {
+    if (mixer.target.kind === "block" && mixer.target.playlistId === store.playlistId) {
+      await mixer.editGlobal();
+    }
+    return;
+  }
+  if (blockMixerBound.value) return;
+  // The DJ sidebar is no longer where a region's effects live, so it does not
+  // follow the mixer onto one: it would be editing a timeline block from
+  // behind the modal's scrim, where nothing can be seen or reached.
+  mixer.panelOpen = false;
+  const playlistMixer = playlists.open?.mixer ?? null;
+  // Recorded before the rack can write anything, so the first pitch change has
+  // a speed to be measured against and the region resizes by the right amount
+  // rather than from a standing start.
+  store.noteBlockSpeed(block.id, speedFor(block));
+  await mixer.editMixBlock(
+    store.playlistId,
+    block.id,
+    blockName(block),
+    block.mixer,
+    playlistMixer,
+  );
+}
+
+/**
+ * Add an effect to the selected block.
+ *
+ * Written into the block's own layer switched on, which is both what makes it
+ * appear in the rack — a device *is* a section this layer sets — and what lets
+ * it be heard without a second trip to a toggle.
+ */
+async function addBlockDevice(section: DeviceSection) {
   const block = selectedBlock.value;
   if (!block) {
     ui.notify("Select a block first");
     return;
   }
-  const name =
-    entryFor(block)?.title ??
-    (block.source.kind === "asset" ? block.source.file : "Audio block");
-  const playlistMixer = playlists.open?.mixer ?? null;
-  // Recorded before the panel can write anything, so the first pitch change
-  // has a speed to be measured against and the region resizes by the right
-  // amount rather than from a standing start.
-  store.noteBlockSpeed(block.id, speedFor(block));
-  await mixer.editMixBlock(store.playlistId, block.id, name, block.mixer, playlistMixer);
-  mixer.panelOpen = true;
+  await bindMixerToSelection();
+  await mixer.setSection(section, deviceDefault(section));
+  ui.notify(`${SECTION_LABELS[section]} added to ${blockName(block)}`);
 }
 
 async function importPaths(paths: string[], startSecs: number, laneIndex: number) {
@@ -1176,8 +1229,7 @@ function onKeydown(event: KeyboardEvent) {
   switch (event.key) {
     case "Escape":
       event.preventDefault();
-      if (blockMixerOpen.value) mixer.panelOpen = false;
-      else void close();
+      void close();
       break;
     case " ":
       // Pause, never stop. Stopping is the button, and Logic's own space bar
@@ -1330,7 +1382,7 @@ const summary = computed(() => {
 
 <template>
   <div class="mm-scrim" :class="{ 'is-drop': dropping }" @pointerdown.self="close">
-    <div class="mm__workspace" :class="{ 'is-editing': blockMixerOpen }">
+    <div class="mm__workspace">
     <section
       ref="dialog"
       class="mm"
@@ -1371,15 +1423,11 @@ const summary = computed(() => {
         >
           Duplicate
         </button>
-        <button
-          class="mm__mixer-button"
-          type="button"
+        <BlockEffectsMenu
+          :present="blockDevices"
           :disabled="!selectedBlock"
-          :title="selectedBlock ? 'Effects for the selected block' : 'Select exactly one audio block'"
-          @click="openBlockMixer"
-        >
-          Block Mixer
-        </button>
+          @add="addBlockDevice"
+        />
 
         <button class="icon-button" type="button" aria-label="Close master mixer" @click="close">
           <PnmIcon name="close" :size="17" />
@@ -1546,10 +1594,11 @@ const summary = computed(() => {
 
       <p v-if="store.error" class="mm__error" role="alert">{{ store.error }}</p>
 
-      <div
-        v-if="!store.loading"
-        ref="scroller"
-        class="mm__body"
+      <div class="mm__content">
+        <div
+          v-if="!store.loading"
+          ref="scroller"
+          class="mm__body"
         :class="{ 'is-blade': store.tool === 'blade' }"
         @wheel="onWheel"
         @scroll.passive="onBodyScroll"
@@ -1715,7 +1764,7 @@ const summary = computed(() => {
                 :tool="store.tool"
                 @grab="onGrab($event, block.id)"
                 @automation="onAutomation($event, block.id)"
-                @open-mixer="store.select([block.id]); openBlockMixer()"
+                @open-mixer="store.select([block.id])"
               />
             </div>
           </div>
@@ -1759,7 +1808,15 @@ const summary = computed(() => {
         </div>
       </div>
 
-      <p v-else class="mm__loading">Loading the arrangement…</p>
+        <p v-else class="mm__loading">Loading the arrangement…</p>
+        <StereoLevelMeter class="mm__level-meter" />
+      </div>
+
+      <BlockEffectsRack
+        v-if="selectedBlock && blockMixerBound && blockDevices.length"
+        :block-id="selectedBlock.id"
+        :block-name="blockName(selectedBlock)"
+      />
 
       <footer class="mm__footer">
         <span v-if="store.tool === 'blade'">
@@ -1777,9 +1834,6 @@ const summary = computed(() => {
         </span>
       </footer>
     </section>
-    <Transition name="slide-panel">
-      <AdvancedMixer v-if="blockMixerOpen" class="mm__block-mixer" />
-    </Transition>
     </div>
 
     <Teleport to="body">
@@ -2051,9 +2105,16 @@ const summary = computed(() => {
   background: var(--accent-tint);
 }
 
+.mm__content {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
 .mm__body {
   position: relative;
   flex: 1;
+  min-width: 0;
   min-height: 0;
   overflow: auto;
   background: var(--bg);
@@ -2414,18 +2475,6 @@ const summary = computed(() => {
   color: var(--text-tertiary);
 }
 
-.mm__block-mixer {
-  height: 100%;
-  border: 0.5px solid var(--separator);
-  border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
-  overflow: hidden;
-  box-shadow: var(--shadow-popover);
-}
-
-.mm__workspace.is-editing .mm {
-  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
-}
-
 .mm__footer {
   margin: 0;
   padding: 8px 14px;
@@ -2433,20 +2482,6 @@ const summary = computed(() => {
   font-size: 11.5px;
   color: var(--text-tertiary);
   background: var(--bg-sidebar);
-}
-
-@media (max-width: 1180px) {
-  .mm__block-mixer {
-    position: absolute;
-    z-index: 8;
-    top: 0;
-    right: 0;
-    width: min(var(--mixer-width), 92vw);
-  }
-
-  .mm__workspace.is-editing .mm {
-    border-radius: var(--radius-lg);
-  }
 }
 
 @media (max-width: 760px) {

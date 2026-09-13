@@ -1,10 +1,16 @@
 Small Tasks:
-- Atmospheres shaders need more refinement (human task, all agents ignore)
-- Maybe fix the slight clipping of leaving atmospheres to play and having the track slightly clip in the first time that's enabled
+- [ ] Atmospheres shaders need more refinement (human task, all agents ignore)
+- [ ] Maybe fix the slight clipping of leaving atmospheres to play and having the track slightly clip in the first time that's enabled (Opus only, other agents ignore)
+- [x] Fix playlist edge cases:
+  - Shuffle-only mode disables the master mixer when enabled, and vice versa
+  - Shuffle can't happen on a master mix
+- [x] Add new keyboard shortcut for queue view toggle (default "F")
+- [x] Add a level monitor (both stereo channels) in master mix on the right side of the modal (coloured with a green to red gradient, with a peak indicator)
 
 User feedback (from Max):
-- Re-order the advanced DJ effects (not just visually but also the effects chain order (layering))
-- Effects appear in bottom in master mixer as a layout option (look at Abelton for inspiration on this layout and chain order with its levels preview before next level) (perhaps we go full DAW style and have effects selected from a menu and ordered in a chain in the bottom row for each audio block, then have presets the user can save to copy the chain to other blocks)
+- [x] Re-order the advanced DJ effects (not just visually but also the effects chain order (layering))
+- [x] Effects appear in bottom in master mixer as a layout option (look at Abelton for inspiration on this layout and chain order with its levels preview before next level) (effects are picked from the Effects menu and laid out in a chain along the bottom, with a stereo meter in every gap)
+  - Still to do: presets the user can save to copy a whole chain to other blocks
 
 Medium Tasks:
 - Duplicate song handling - (working but needs some refinement as there are a lot of true negatives)

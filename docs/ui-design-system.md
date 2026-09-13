@@ -386,6 +386,7 @@ what the surface is acting on:
 | Advanced mixer panel | `Advanced DJ Mixer` (or `EQ Preset Editor`) | target |
 | Equaliser modal | `Equaliser` | target |
 | Master mixer modal | `Master Mixer` | playlist name |
+| Master mixer effect rack | `Effect Chain` | selected block |
 
 Use the global `.eyebrow` class (theme.css); never restyle it per component.
 Sub-sections *inside* a surface keep `SectionHeader` (mixer) or

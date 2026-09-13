@@ -9,6 +9,7 @@
 import { defaultCrossfade } from "./crossfadeCurve";
 import type {
   BandKind,
+  ChainStage,
   CrossfadeSettings,
   Delay,
   Eq,
@@ -59,6 +60,27 @@ export function defaultBands(): EqBand[] {
   }));
 }
 
+/**
+ * The stages of the effect chain, in the order the engine applies them unless
+ * told otherwise. Mirrors `DEFAULT_CHAIN_ORDER` in `audio/params.rs`.
+ *
+ * This is the chain as it was before the order could be moved, so every mix,
+ * preset and playlist saved until now goes on sounding as it did.
+ */
+export const DEFAULT_CHAIN_ORDER: ChainStage[] = ["eq", "delay", "reverb", "lofi", "panning"];
+
+/**
+ * The sections that are *not* stages of the chain, in the order the panel
+ * shows them below it.
+ *
+ * Pitch is varispeed applied as the file is decoded, normalisation is a gain
+ * ride after the chain (the limiter itself is on the master bus), a crossfade
+ * belongs to the join between two songs, and the ambience beds are laid over
+ * the top. None of them has a place in the chain to be moved to, so none of
+ * them is offered one.
+ */
+export const FIXED_SECTIONS: Section[] = ["pitch", "normalisation", "crossfade", "filters"];
+
 export const DEFAULTS = {
   pitch: (): Pitch => ({ semitones: 0, cents: 0 }),
   panning: (): Panning => ({ mode: "stereoBalance", position: 0, width: 1 }),
@@ -89,10 +111,87 @@ export const DEFAULTS = {
   }),
   lofi: (): Lofi => ({ enabled: false, sampleRateHz: 44100, bitDepth: 16, mix: 1 }),
   filters: (): FilterSetting[] => [],
+  chainOrder: (): string[] => [...DEFAULT_CHAIN_ORDER],
+  layoutOrder: (): string[] => [...FIXED_SECTIONS],
   crossfade: () => defaultCrossfade(),
 };
 
 export type Section = keyof typeof DEFAULTS;
+
+/**
+ * A saved chain order turned into a complete one: unknown ids are dropped and
+ * stages the list does not mention keep their default place, so a layer
+ * written before a stage existed still gets it. The same rule the sidebar's
+ * section order follows, and the same one `ChainStage::order` applies in the
+ * backend — the two must agree or the panel would draw an order the engine is
+ * not playing.
+ */
+export function chainOrder(saved: readonly string[] | null | undefined): ChainStage[] {
+  const out: ChainStage[] = [];
+  for (const id of saved ?? []) {
+    const stage = DEFAULT_CHAIN_ORDER.find((candidate) => candidate === id);
+    if (stage && !out.includes(stage)) out.push(stage);
+  }
+  for (const stage of DEFAULT_CHAIN_ORDER) {
+    if (!out.includes(stage)) out.push(stage);
+  }
+  return out;
+}
+
+/**
+ * The same list with one entry moved, ready to be written back as a section.
+ *
+ * Shared by both orders the panel can be dragged into: the chain's, which the
+ * engine plays, and the layout of the sections outside it, which is only ever
+ * about where they are on the panel.
+ */
+export function withStageMoved<T extends string>(
+  order: readonly T[],
+  from: number,
+  to: number,
+): T[] {
+  const next = [...order];
+  if (from === to || from < 0 || from >= next.length) return next;
+  const target = Math.min(Math.max(to, 0), next.length - 1);
+  const [moved] = next.splice(from, 1);
+  next.splice(target, 0, moved);
+  return next;
+}
+
+/**
+ * What the master mixer's rack can hold: the chain's own stages, and the three
+ * settings that belong to a region without being part of its chain.
+ *
+ * A crossfade is missing on purpose — it describes the join between two
+ * playlist entries, which a region on a timeline does not have, and the
+ * backend ignores one set on a block layer anyway.
+ */
+export type DeviceSection = ChainStage | "pitch" | "normalisation" | "filters";
+
+/** The devices that are not chain stages, and so cannot be moved along it. */
+export const PINNED_DEVICES: DeviceSection[] = ["pitch", "normalisation", "filters"];
+
+export const RACK_DEVICES: DeviceSection[] = [...DEFAULT_CHAIN_ORDER, ...PINNED_DEVICES];
+
+/** Whether a device has a switch of its own, as opposed to only settings. */
+export function hasEnableSwitch(section: DeviceSection): boolean {
+  return ["eq", "delay", "reverb", "lofi", "normalisation"].includes(section);
+}
+
+/**
+ * A device as it should arrive when it is added.
+ *
+ * Switched on, unlike the stored defaults: several effects default to bypassed
+ * so that an untouched mix stays untouched, but a device the user has just
+ * gone to a menu and asked for should do something.
+ */
+export function deviceDefault(section: DeviceSection): MixerSettings[DeviceSection] {
+  const value = DEFAULTS[section]();
+  if (value && typeof value === "object" && !Array.isArray(value) && "enabled" in value) {
+    return { ...value, enabled: true };
+  }
+  return value;
+}
 
 export const SECTIONS: Section[] = [
   "pitch",
@@ -104,6 +203,8 @@ export const SECTIONS: Section[] = [
   "lofi",
   "crossfade",
   "filters",
+  "chainOrder",
+  "layoutOrder",
 ];
 
 /**
@@ -122,6 +223,8 @@ export const SECTION_LABELS: Record<Section, string> = {
   crossfade: "Crossfade",
   filters: "Atmospheres",
   lofi: "Sample Rate",
+  chainOrder: "Signal Chain",
+  layoutOrder: "Outside the Chain",
 };
 
 /**
@@ -167,18 +270,15 @@ export function orderedSections(
   return out.filter((id) => !hidden.includes(id));
 }
 
-/** The sections the sidebar draws, in the order it draws them. */
-export const SIDEBAR_SECTIONS: Section[] = [
-  "eq",
-  "pitch",
-  "reverb",
-  "delay",
-  "normalisation",
-  "panning",
-  "crossfade",
-  "filters",
-  "lofi",
-];
+/**
+ * The sections the sidebar draws, in the order it draws them: the chain's own
+ * stages in their default order, then the sections that are not part of it.
+ *
+ * The panel itself draws the stages in whatever order the layer being edited
+ * resolves to — this is the list of what it can draw, and the fallback order
+ * for a layer that has never been reordered.
+ */
+export const SIDEBAR_SECTIONS: Section[] = [...DEFAULT_CHAIN_ORDER, ...FIXED_SECTIONS];
 
 /** Layer settings, later entries winning section by section. */
 export function overlay(layers: (MixerSettings | null | undefined)[]): MixerSettings {
@@ -207,6 +307,8 @@ export function resolve(layers: (MixerSettings | null | undefined)[]): ResolvedM
     delay: (merged.delay as Delay) ?? DEFAULTS.delay(),
     normalisation: (merged.normalisation as Normalisation) ?? DEFAULTS.normalisation(),
     lofi: (merged.lofi as Lofi) ?? DEFAULTS.lofi(),
+    chainOrder: chainOrder(merged.chainOrder as string[] | undefined),
+    layoutOrder: orderedSections(FIXED_SECTIONS, (merged.layoutOrder as string[]) ?? [], []),
     crossfade: crossfade ?? DEFAULTS.crossfade(),
     filters: (merged.filters as FilterSetting[]) ?? DEFAULTS.filters(),
   };

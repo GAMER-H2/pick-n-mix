@@ -116,3 +116,106 @@ describe("AdvancedMixer sidebar sections", () => {
     }
   });
 });
+
+/**
+ * The panel's order *is* the chain order, so what it draws has to be what the
+ * engine will apply and moving a row has to be what changes it.
+ */
+describe("AdvancedMixer chain order", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    setGlobalMixer.mockReset().mockResolvedValue(undefined);
+  });
+
+  function names(wrapper: ReturnType<typeof mount>, list: string): string[] {
+    return wrapper.findAll(`${list} .header__title`).map((title) => title.text());
+  }
+
+  function stageNames(wrapper: ReturnType<typeof mount>): string[] {
+    return names(wrapper, ".panel__chain-list:not(.panel__layout-list)");
+  }
+
+  function layoutNames(wrapper: ReturnType<typeof mount>): string[] {
+    return names(wrapper, ".panel__layout-list");
+  }
+
+  function grips(wrapper: ReturnType<typeof mount>, list: string) {
+    return wrapper.findAll(`${list} .panel__grip`);
+  }
+
+  it("draws the stages in the order the cascade resolves to", async () => {
+    const mixer = useMixerStore();
+    const wrapper = mount(AdvancedMixer);
+    expect(stageNames(wrapper)).toEqual(["EQ", "Delay", "Reverb", "Sample Rate", "Panning"]);
+
+    mixer.targetLayer = { chainOrder: ["panning", "reverb"] };
+    await wrapper.vm.$nextTick();
+    expect(stageNames(wrapper)).toEqual(["Panning", "Reverb", "EQ", "Delay", "Sample Rate"]);
+  });
+
+  it("writes the whole order into the layer when a stage is moved", async () => {
+    const mixer = useMixerStore();
+    const wrapper = mount(AdvancedMixer);
+
+    // The keyboard path, which is the one every user has.
+    await grips(wrapper, ".panel__chain-list:not(.panel__layout-list)")[2]
+      .trigger("keydown", { key: "ArrowUp" });
+    await flushPromises();
+
+    expect(mixer.targetLayer.chainOrder).toEqual(["eq", "reverb", "delay", "lofi", "panning"]);
+    expect(setGlobalMixer).toHaveBeenLastCalledWith({
+      chainOrder: ["eq", "reverb", "delay", "lofi", "panning"],
+    });
+    expect(stageNames(wrapper)).toEqual(["EQ", "Reverb", "Delay", "Sample Rate", "Panning"]);
+  });
+
+  /**
+   * The sections outside the chain move too, but only on the panel: none of
+   * them is a stage the signal passes through, so the order is layout.
+   */
+  it("moves a section outside the chain without touching the chain", async () => {
+    const mixer = useMixerStore();
+    const wrapper = mount(AdvancedMixer);
+    expect(layoutNames(wrapper)).toEqual([
+      "Pitch",
+      "Normalisation",
+      "Crossfade",
+      "Atmospheres",
+    ]);
+
+    await grips(wrapper, ".panel__layout-list")[3].trigger("keydown", { key: "ArrowUp" });
+    await flushPromises();
+
+    expect(mixer.targetLayer.layoutOrder).toEqual([
+      "pitch",
+      "normalisation",
+      "filters",
+      "crossfade",
+    ]);
+    expect(mixer.targetLayer.chainOrder).toBeUndefined();
+    expect(layoutNames(wrapper)).toEqual([
+      "Pitch",
+      "Normalisation",
+      "Atmospheres",
+      "Crossfade",
+    ]);
+  });
+
+  /**
+   * A stage hidden from the sidebar is still in the chain, so a move past the
+   * gap it leaves has to land where the user saw it land.
+   */
+  it("translates a move between visible rows back onto the whole chain", async () => {
+    useSettingsStore().preferences.hiddenMixerSections = ["delay", "reverb"];
+    const mixer = useMixerStore();
+    const wrapper = mount(AdvancedMixer, { props: { customisable: true } });
+    expect(stageNames(wrapper)).toEqual(["EQ", "Sample Rate", "Panning"]);
+
+    await grips(wrapper, ".panel__chain-list:not(.panel__layout-list)")[1]
+      .trigger("keydown", { key: "ArrowUp" });
+    await flushPromises();
+
+    // Lo-fi lands where EQ was, ahead of the delay and reverb it never saw.
+    expect(mixer.targetLayer.chainOrder).toEqual(["lofi", "eq", "delay", "reverb", "panning"]);
+  });
+});

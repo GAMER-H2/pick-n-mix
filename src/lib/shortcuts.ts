@@ -18,7 +18,8 @@ export type ShortcutAction =
   | "seekForward"
   | "seekBackward"
   | "volumeUp"
-  | "volumeDown";
+  | "volumeDown"
+  | "toggleQueueView";
 
 export interface ShortcutDefinition {
   id: ShortcutAction;
@@ -69,6 +70,12 @@ export const SHORTCUTS: ReadonlyArray<ShortcutDefinition> = [
     label: "Volume down",
     description: "Lower the volume by 5%",
     defaults: ["ArrowDown"],
+  },
+  {
+    id: "toggleQueueView",
+    label: "Toggle queue view",
+    description: "Open or close the full-screen Playing Next view",
+    defaults: ["F"],
   },
 ];
 

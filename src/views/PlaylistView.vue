@@ -184,7 +184,7 @@ function reorder(from: number, to: number) {
 }
 
 async function shuffleAndPlay() {
-  if (!playlist.value) return;
+  if (!playlist.value || playlist.value.masterMix?.enabled) return;
   await player.setShuffle(true);
   await play(0);
 }
@@ -256,6 +256,7 @@ async function saveDescription() {
       :artwork-ids="artworkIds"
       :mixer-active="!!playlist.mixer"
       :disabled="available.length === 0"
+      :shuffle-disabled="!!playlist.masterMix?.enabled"
       @play="play(0)"
       @shuffle="shuffleAndPlay"
       @mixer="openPlaylistMixer"

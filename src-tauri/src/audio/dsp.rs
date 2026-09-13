@@ -3,7 +3,9 @@
 //! Everything here runs on the DSP worker thread and is allocation-free once
 //! `prepare` has run. Buffers are planar stereo: `[[f32; frames]; 2]`.
 
-use crate::audio::params::{BandKind, EqBand, Panning, PanningMode, Resolved};
+use crate::audio::params::{
+    BandKind, ChainStage, EqBand, Panning, PanningMode, Resolved, DEFAULT_CHAIN_ORDER,
+};
 
 pub const CHANNELS: usize = 2;
 
@@ -999,6 +1001,8 @@ pub struct Chain {
     pub reverb: ReverbFx,
     pub lofi: LofiFx,
     pub panning: PanningMatrix,
+    /// The order the stages run in, straight from the resolved cascade.
+    order: Vec<ChainStage>,
     gain: Smoothed,
     bypassed: bool,
 }
@@ -1011,6 +1015,7 @@ impl Chain {
             reverb: ReverbFx::new(),
             lofi: LofiFx::new(),
             panning: PanningMatrix::new(),
+            order: DEFAULT_CHAIN_ORDER.to_vec(),
             gain: Smoothed::new(1.0),
             bypassed: false,
         }
@@ -1028,6 +1033,12 @@ impl Chain {
     /// `track_gain_db` is the per-track normalisation gain worked out from
     /// tags or analysis; it is folded into the master gain here.
     pub fn update(&mut self, settings: &Resolved, track_gain_db: f32) {
+        // Before the bypass check: a chain that comes back from bypassed must
+        // already be in the order the cascade asked for.
+        if self.order != settings.chain_order {
+            self.order.clear();
+            self.order.extend_from_slice(&settings.chain_order);
+        }
         self.bypassed = !settings.enabled;
         if self.bypassed {
             self.gain.set_target(1.0);
@@ -1048,17 +1059,39 @@ impl Chain {
         self.gain.set_target(db_to_gain(norm_db.clamp(-24.0, 24.0)));
     }
 
-    /// Music effects. The ambience bed is mixed in by the caller between this
-    /// and [`Chain::apply_gain`], so beds are not coloured by the track's EQ.
+    /// Music effects, in the order this chain was last updated with. The
+    /// ambience bed is mixed in by the caller between this and
+    /// [`Chain::apply_gain`], so beds are not coloured by the track's EQ.
     pub fn process_music(&mut self, buf: &mut [Vec<f32>], frames: usize) {
+        self.process_music_tapped(buf, frames, |_, _, _| {});
+    }
+
+    /// As [`Chain::process_music`], but showing the signal at every point in
+    /// the chain: `tap(0, ..)` is what went in, `tap(n, ..)` what came out of
+    /// the nth stage. The master mixer's rack meters read these.
+    ///
+    /// A bypassed chain still taps, once, so the meters read the signal that
+    /// is actually passing rather than freezing at their last value.
+    pub fn process_music_tapped(
+        &mut self,
+        buf: &mut [Vec<f32>],
+        frames: usize,
+        mut tap: impl FnMut(usize, &[Vec<f32>], usize),
+    ) {
+        tap(0, buf, frames);
         if self.bypassed {
             return;
         }
-        self.eq.process(buf, frames);
-        self.delay.process(buf, frames);
-        self.reverb.process(buf, frames);
-        self.lofi.process(buf, frames);
-        self.panning.process(buf, frames);
+        for index in 0..self.order.len() {
+            match self.order[index] {
+                ChainStage::Eq => self.eq.process(buf, frames),
+                ChainStage::Delay => self.delay.process(buf, frames),
+                ChainStage::Reverb => self.reverb.process(buf, frames),
+                ChainStage::Lofi => self.lofi.process(buf, frames),
+                ChainStage::Panning => self.panning.process(buf, frames),
+            }
+            tap(index + 1, buf, frames);
+        }
     }
 
     /// This voice's own gain ramp (normalisation plus any manual trim).
@@ -1357,6 +1390,105 @@ mod fade_tests {
             (probe[0][63] - 0.7).abs() < 1e-6,
             "a faded-out reverb still coloured the signal"
         );
+    }
+
+    /// Lo-fi quantises the level and a pan attenuates it, so quantising then
+    /// attenuating cannot give the same numbers as attenuating then
+    /// quantising. That is the whole point of letting the order be moved.
+    #[test]
+    fn the_chain_runs_its_stages_in_the_order_it_was_given() {
+        fn render(order: &[ChainStage]) -> f32 {
+            let settings = Resolved {
+                lofi: crate::audio::params::Lofi {
+                    enabled: true,
+                    sample_rate_hz: 48000.0,
+                    bit_depth: 3.0,
+                    mix: 1.0,
+                },
+                panning: Panning {
+                    mode: PanningMode::MonoPan,
+                    position: -0.5,
+                    width: 1.0,
+                },
+                chain_order: order.to_vec(),
+                ..Resolved::default()
+            };
+
+            let mut chain = Chain::new();
+            chain.prepare(48000.0);
+            chain.update(&settings, 0.0);
+            let mut buf = vec![vec![0.0f32; 256]; CHANNELS];
+            // Long enough for the smoothed pan and wet mix to settle.
+            for _ in 0..20 {
+                for channel in buf.iter_mut() {
+                    channel.fill(0.37);
+                }
+                chain.process_music(&mut buf, 256);
+            }
+            buf[0][255]
+        }
+
+        let lofi_first = render(&[
+            ChainStage::Lofi,
+            ChainStage::Panning,
+            ChainStage::Eq,
+            ChainStage::Delay,
+            ChainStage::Reverb,
+        ]);
+        let panning_first = render(&[
+            ChainStage::Panning,
+            ChainStage::Lofi,
+            ChainStage::Eq,
+            ChainStage::Delay,
+            ChainStage::Reverb,
+        ]);
+        assert!(lofi_first.abs() > 1e-4 && panning_first.abs() > 1e-4);
+        assert!(
+            (lofi_first - panning_first).abs() > 1e-4,
+            "moving lo-fi past the pan changed nothing: {lofi_first} vs {panning_first}"
+        );
+    }
+
+    /// The rack's meters sit between the stages, so there is one more tap than
+    /// there are stages: what went in, then the output of each one.
+    #[test]
+    fn tapping_reports_the_signal_at_every_point_in_the_chain() {
+        let mut chain = Chain::new();
+        chain.prepare(48000.0);
+        chain.update(&Resolved::default(), 0.0);
+
+        let mut buf = vec![vec![0.5f32; 128]; CHANNELS];
+        let mut taps = Vec::new();
+        chain.process_music_tapped(&mut buf, 128, |index, buf, frames| {
+            taps.push((index, buf[0][frames - 1]));
+        });
+
+        assert_eq!(
+            taps.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            (0..=DEFAULT_CHAIN_ORDER.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(taps[0].1, 0.5);
+    }
+
+    /// A bypassed chain must still meter: the rack showing a frozen level for
+    /// a block whose effects are switched off would be a lie about silence.
+    #[test]
+    fn a_bypassed_chain_still_taps_its_input_once() {
+        let mut chain = Chain::new();
+        chain.prepare(48000.0);
+        chain.update(
+            &Resolved {
+                enabled: false,
+                ..Resolved::default()
+            },
+            0.0,
+        );
+
+        let mut buf = vec![vec![0.25f32; 64]; CHANNELS];
+        let mut taps = 0;
+        chain.process_music_tapped(&mut buf, 64, |_, _, _| taps += 1);
+        assert_eq!(taps, 1);
+        assert_eq!(buf[0][63], 0.25);
     }
 
     #[test]

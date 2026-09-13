@@ -200,6 +200,7 @@ describe("SettingsModal", () => {
     const keys = wrapper.findAll(".shortcut__key").map((key) => key.text());
     expect(keys).toContain("Space");
     expect(keys).toContain("→");
+    expect(keys).toContain("F");
   });
 
   it("records a new key and stores it as an override", async () => {

@@ -153,13 +153,18 @@ The released AppImages are built the same way; see the Linux job in
 
 An AppImage carries the WebKitGTK it was built against, which on a
 rolling-release host is far older than the graphics drivers it then has to
-talk to. When the two disagree the webview composites nothing, and because
-the window is transparent that shows up as an *invisible* window rather than
-a blank one. The app detects an AppImage run and falls back to WebKit's own
-compositing (`WEBKIT_DISABLE_DMABUF_RENDERER=1`). To get the accelerated path
-back on a host where it works, set it yourself:
+talk to. Usually they agree and the AppImage runs on WebKit's accelerated
+DMA-BUF renderer like any other build, which is why the app leaves the
+renderer alone and changes no environment variables of its own.
+
+If they *don't* agree the webview composites nothing, and because the window
+is transparent that shows up as an *invisible* window rather than a blank
+one — present in the task switcher, taking up space, drawing nothing. Run it
+once with WebKit's own compositing to get a visible window back:
 ```bash
-WEBKIT_DISABLE_DMABUF_RENDERER=0 ./Pick-n-Mix-*.AppImage
+WEBKIT_DISABLE_DMABUF_RENDERER=1 ./Pick-n-Mix-*.AppImage
 ```
-A native package (`.deb`, `.rpm`, or a local `npm run tauri build`) uses the
-distribution's own WebKit and is unaffected either way.
+That path is off the GPU, so it is noticeably slower: set it only on a host
+that needs it, and put it in the `.desktop` entry or a wrapper script rather
+than making it a global default. A native package (`.deb`, `.rpm`, or a local
+`npm run tauri build`) uses the distribution's own WebKit and never needs it.

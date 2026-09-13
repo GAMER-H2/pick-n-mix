@@ -220,6 +220,25 @@ export interface AnalyserFrame {
   floorDb: number;
 }
 
+/** Post-limiter, pre-player-volume stereo levels ready for a peak meter. */
+export interface OutputLevelFrame {
+  /** Fast-attack, smoothly released left and right levels in dBFS. */
+  levelsDb: [number, number];
+  /** Held left and right peak markers in dBFS. */
+  peaksDb: [number, number];
+  floorDb: number;
+}
+
+/**
+ * Every meter in one master-mix block's rack: what went into the chain, then
+ * what came out of each effect. One longer than the number of effects, which
+ * is what puts a reading between each pair of them.
+ */
+export interface ChainLevelFrame {
+  blockId: string;
+  stages: OutputLevelFrame[];
+}
+
 export interface Pitch {
   semitones: number;
   cents: number;
@@ -234,6 +253,17 @@ export interface Panning {
   /** Half-width used by true-stereo panning, from mono (0) to full width (1). */
   width: number;
 }
+
+/**
+ * A stage of the per-voice effect chain, and so something whose place in that
+ * chain can be moved.
+ *
+ * Pitch, normalisation, crossfade and the ambience beds are deliberately not
+ * here: they are varispeed at decode, a gain ride after the chain, a property
+ * of the join between two songs, and a layer over the top. None of them has a
+ * position in the chain to move.
+ */
+export type ChainStage = "eq" | "delay" | "reverb" | "lofi" | "panning";
 
 export interface Reverb {
   enabled: boolean;
@@ -287,6 +317,10 @@ export interface MixerSettings {
   delay?: Delay | null;
   normalisation?: Normalisation | null;
   lofi?: Lofi | null;
+  /** Stage ids in the order they are applied; unlisted stages keep their default place. */
+  chainOrder?: string[] | null;
+  /** Section ids in the order the panel lists the ones outside the chain. Display only. */
+  layoutOrder?: string[] | null;
   /** Global default or playlist override; entry layers are ignored by the backend. */
   crossfade?: CrossfadeSettings | null;
   filters?: FilterSetting[] | null;
@@ -303,6 +337,10 @@ export interface ResolvedMixer {
   delay: Delay;
   normalisation: Normalisation;
   lofi: Lofi;
+  /** Every stage exactly once, in the order the engine applies them. */
+  chainOrder: ChainStage[];
+  /** The sections outside the chain, in the order they are listed. */
+  layoutOrder: string[];
   crossfade: CrossfadeSettings;
   filters: FilterSetting[];
 }

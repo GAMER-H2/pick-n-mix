@@ -133,6 +133,11 @@ pub struct AppState {
     /// Generated mixes, held for the life of the process. See
     /// [`AppState::mix`].
     pub mixes: Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// Levels either side of each effect in one master-mix block's chain, for
+    /// the meters between the devices in the mixer's rack. Lives here rather
+    /// than on the engine because it belongs to the auditioned timeline, which
+    /// is built here too.
+    pub chain_meter: Arc<crate::audio::meter::ChainMeterBus>,
 }
 
 /// Key under which the global mixer is persisted.
@@ -384,6 +389,7 @@ impl AppState {
             thumbnails,
             plays: crate::history::PlayTracker::new(),
             mixes: Mutex::new(std::collections::HashMap::new()),
+            chain_meter: Arc::new(crate::audio::meter::ChainMeterBus::new()),
         })
     }
 

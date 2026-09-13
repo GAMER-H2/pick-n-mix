@@ -4,9 +4,11 @@ import { createPinia, setActivePinia } from "pinia";
 import NowPlayingBar from "../layout/NowPlayingBar.vue";
 import { useMixerStore } from "@/stores/mixer";
 import { usePlayerStore } from "@/stores/player";
+import { useMasterMixStore } from "@/stores/masterMix";
 import type { MasterMixNowPlaying } from "@/lib/types";
 
 const mixerState = vi.fn();
+const setShuffle = vi.fn();
 
 vi.mock("vue-router", () => ({
   useRoute: () => ({ name: "home" }),
@@ -15,6 +17,7 @@ vi.mock("vue-router", () => ({
 
 vi.mock("@/lib/api", () => ({
   mixerState: (...args: unknown[]) => mixerState(...args),
+  setShuffle: (...args: unknown[]) => setShuffle(...args),
 }));
 
 describe("NowPlayingBar mixer button", () => {
@@ -126,5 +129,61 @@ describe("NowPlayingBar while a master mix plays", () => {
     await flushPromises();
     expect(wrapper.findAll(".slider__marker")).toHaveLength(0);
     expect(wrapper.text()).toContain("Nothing Playing");
+  });
+});
+
+describe("NowPlayingBar shuffle guard", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    mixerState.mockReset().mockResolvedValue({ global: {}, presets: [], filters: [] });
+    setShuffle.mockReset().mockResolvedValue(undefined);
+  });
+
+  function mountBar() {
+    return mount(NowPlayingBar, {
+      global: {
+        stubs: {
+          Artwork: true,
+          AppSlider: true,
+          MixerPopover: true,
+          InfoPopover: true,
+          PnmIcon: true,
+          Teleport: true,
+        },
+      },
+    });
+  }
+
+  it("keeps global shuffle available for ordinary playback", async () => {
+    const wrapper = mountBar();
+    const button = wrapper.get("[aria-label='Shuffle']");
+
+    expect(button.attributes("disabled")).toBeUndefined();
+    await button.trigger("click");
+    await flushPromises();
+
+    expect(setShuffle).toHaveBeenCalledWith(true);
+  });
+
+  it("disables global shuffle while a master mix plays", async () => {
+    const player = usePlayerStore();
+    player.masterMix = playingMix();
+    const wrapper = mountBar();
+    const button = wrapper.get("[aria-label='Shuffle']");
+
+    expect(button.attributes("disabled")).toBeDefined();
+    await button.trigger("click");
+    expect(setShuffle).not.toHaveBeenCalled();
+  });
+
+  it("disables global shuffle while the Master Mixer owns playback", async () => {
+    const masterMix = useMasterMixStore();
+    masterMix.open = true;
+    const wrapper = mountBar();
+    const button = wrapper.get("[aria-label='Shuffle']");
+
+    expect(button.attributes("disabled")).toBeDefined();
+    await button.trigger("click");
+    expect(setShuffle).not.toHaveBeenCalled();
   });
 });

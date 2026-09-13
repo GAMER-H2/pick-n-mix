@@ -17,6 +17,8 @@ import type {
   MasterMixNowPlaying,
   MasterMixView,
   MixAsset,
+  ChainLevelFrame,
+  OutputLevelFrame,
   MixerSettings,
   MixerState,
   MixKind,
@@ -103,6 +105,21 @@ export const streamInfo = () => invoke<StreamInfo | null>("stream_info");
 export const setAnalyserEnabled = (enabled: boolean) =>
   invoke<void>("set_analyser_enabled", { enabled });
 export const analyserFrame = () => invoke<AnalyserFrame>("analyser_frame");
+
+/** Maintain stereo master-bus levels only while the Master Mixer is visible. */
+export const setOutputMeterEnabled = (enabled: boolean) =>
+  invoke<void>("set_output_meter_enabled", { enabled });
+export const outputLevelFrame = () => invoke<OutputLevelFrame>("output_level_frame");
+
+/**
+ * Meter one master-mix block's effect chain, or `null` to stop. Only the
+ * selected block is measured — the rack's meters describe one signal passing
+ * through one chain.
+ */
+export const setChainMeterBlock = (blockId: string | null) =>
+  invoke<void>("set_chain_meter_block", { blockId });
+/** Levels at every point in that chain: in, then after each effect. */
+export const chainLevelFrame = () => invoke<ChainLevelFrame>("chain_level_frame");
 
 /**
  * Narrow the output to one EQ band's own range while its solo button is held,

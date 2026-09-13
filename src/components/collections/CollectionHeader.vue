@@ -19,12 +19,14 @@ withDefaults(
     showMixer?: boolean;
     mixerActive?: boolean;
     disabled?: boolean;
+    shuffleDisabled?: boolean;
   }>(),
   {
     round: false,
     showMixer: true,
     mixerActive: false,
     disabled: false,
+    shuffleDisabled: false,
     artworkIds: () => [],
   },
 );
@@ -58,7 +60,7 @@ const emit = defineEmits<{ play: []; shuffle: []; mixer: []; menu: [event: Mouse
         </button>
         <button
           class="pill-button is-secondary"
-          :disabled="disabled"
+          :disabled="disabled || shuffleDisabled"
           @click="emit('shuffle')"
         >
           <PnmIcon name="shuffle" :size="14" />

@@ -16,6 +16,7 @@ const endMasterMixSession = vi.fn();
 const playMasterMix = vi.fn();
 const setMasterMixPlaying = vi.fn();
 const stopMasterMix = vi.fn();
+const setChainMeterBlock = vi.fn((_blockId: string | null) => Promise.resolve());
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(),
@@ -46,6 +47,16 @@ vi.mock("@/lib/api", () => ({
   currentTrack: vi.fn(),
   queueState: vi.fn(),
   togglePlay: vi.fn(),
+  // Plain functions rather than `vi.fn()`: the suites below clear all mocks
+  // between tests, and a meter whose poll resolves `undefined` renders nothing.
+  setOutputMeterEnabled: () => Promise.resolve(),
+  outputLevelFrame: () =>
+    Promise.resolve({ levelsDb: [-60, -60], peaksDb: [-60, -60], floorDb: -60 }),
+  setChainMeterBlock: (blockId: string | null) => setChainMeterBlock(blockId),
+  chainLevelFrame: () => Promise.resolve({ blockId: "", stages: [] }),
+  setPlaylistMixer: vi.fn(),
+  setPlaylistEntryMixer: vi.fn(),
+  setGlobalMixer: vi.fn(),
 }));
 
 function twoLaneMix(): MasterMix {
@@ -580,33 +591,84 @@ describe("MasterMixModal", () => {
     }
   });
 
-  it("opens an attached mixer and writes effects only to one selected block", async () => {
+  /**
+   * Selecting a region is what opens its effects now: the arrangement is a
+   * mini-DAW, so the rack along the bottom edits whatever is selected rather
+   * than a sidebar being opened for it.
+   */
+  it("points the mixer at the one selected block, and back at global when it is deselected", async () => {
     const { wrapper, store } = await open();
-    const button = wrapper.get(".mm__mixer-button");
-    expect((button.element as HTMLButtonElement).disabled).toBe(true);
+    const mixer = useMixerStore();
+    expect(mixer.target.kind).toBe("global");
 
     await wrapper.findAll(".block")[0].trigger("pointerdown", {
       button: 0,
       clientX: 510,
       clientY: 60,
     });
-    await button.trigger("click");
     await flushPromises();
 
-    expect(wrapper.find(".mm__block-mixer").exists()).toBe(true);
-    expect(wrapper.text()).toContain("Advanced DJ Mixer");
-    // Both are per-voice on the timeline, so a block gets them like anything
-    // else does.
-    expect(wrapper.text()).toContain("Atmospheres");
-    expect(wrapper.text()).toContain("Semitones");
-    const blockMixer = useMixerStore();
-    expect(blockMixer.target).toMatchObject({
-      kind: "block",
-      playlistId: "pl_1",
-      blockId: "a",
-    });
+    expect(mixer.target).toMatchObject({ kind: "block", playlistId: "pl_1", blockId: "a" });
 
-    await blockMixer.setEnabled(false);
+    // Two blocks is not one block, so there is nothing for the rack to edit.
+    store.select(["a", "b"]);
+    await flushPromises();
+    expect(mixer.target.kind).toBe("global");
+  });
+
+  it("adds an effect from the menu and racks it, writing to only that block", async () => {
+    const { wrapper, store } = await open();
+    const trigger = wrapper.get(".effects-menu__trigger");
+    expect((trigger.element as HTMLButtonElement).disabled).toBe(true);
+    expect(wrapper.find(".rack").exists()).toBe(false);
+
+    await wrapper.findAll(".block")[0].trigger("pointerdown", {
+      button: 0,
+      clientX: 510,
+      clientY: 60,
+    });
+    await flushPromises();
+
+    // Selected but with no effects yet: the rack has nothing to show.
+    expect(wrapper.find(".rack").exists()).toBe(false);
+
+    await trigger.trigger("click");
+    await flushPromises();
+    const reverb = wrapper
+      .findAll(".effects-menu__menu [role='menuitem']")
+      .find((item) => item.text() === "Reverb");
+    await reverb?.trigger("click");
+    await flushPromises();
+
+    // Added switched on, so it does something without a second trip to a toggle.
+    expect(locate(store.mix, "a")?.block.mixer?.reverb).toMatchObject({ enabled: true });
+    expect(locate(store.mix, "b")?.block.mixer).toBeNull();
+
+    const rack = wrapper.get(".rack");
+    expect(rack.text()).toContain("Reverb");
+    // One meter either side of the only device in the chain.
+    expect(rack.findAll(".level-meter.is-compact")).toHaveLength(2);
+    expect(setChainMeterBlock).toHaveBeenCalledWith("a");
+
+    // Taking it off again leaves the block with no override at all.
+    await rack.get("[aria-label='Remove Reverb from this block']").trigger("click");
+    await flushPromises();
+    expect(locate(store.mix, "a")?.block.mixer).toBeNull();
+    expect(wrapper.find(".rack").exists()).toBe(false);
+  });
+
+  it("keeps a block's own mixer writes off every other block", async () => {
+    const { wrapper, store } = await open();
+    await wrapper.findAll(".block")[0].trigger("pointerdown", {
+      button: 0,
+      clientX: 510,
+      clientY: 60,
+    });
+    await flushPromises();
+
+    const mixer = useMixerStore();
+    await mixer.setEnabled(false);
+
     expect(locate(store.mix, "a")?.block.mixer?.enabled).toBe(false);
     expect(locate(store.mix, "b")?.block.mixer).toBeNull();
   });

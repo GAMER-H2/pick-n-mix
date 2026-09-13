@@ -16,13 +16,28 @@
  * pause turns into a stop.
  */
 
-import type { Router } from "vue-router";
 import { actionFor, bindingFor } from "@/lib/shortcuts";
-import type { usePlayerStore } from "@/stores/player";
-import type { useUiStore } from "@/stores/ui";
 
-type Player = ReturnType<typeof usePlayerStore>;
-type Ui = ReturnType<typeof useUiStore>;
+interface ShortcutPlayer {
+  toggle(): unknown;
+  next(): unknown;
+  previous(): unknown;
+  seek(position: number): unknown;
+  setVolume(volume: number): unknown;
+  position: number;
+  duration: number;
+  snapshot: { volume: number };
+}
+
+interface ShortcutUi {
+  queueOpen: boolean;
+}
+
+interface ShortcutRouter {
+  currentRoute: { value: { name: unknown } };
+  back(): unknown;
+  push(to: { name: string }): unknown;
+}
 
 /** How much the volume keys move. The seek step is a preference instead. */
 const DEFAULT_SEEK_SECONDS = 10;
@@ -50,9 +65,9 @@ export interface ShortcutOptions {
 }
 
 export function installShortcuts(
-  player: Player,
-  ui?: Ui,
-  router?: Router,
+  player: ShortcutPlayer,
+  ui?: ShortcutUi,
+  router?: ShortcutRouter,
   options: ShortcutOptions = {},
 ): () => void {
   async function onKeydown(event: KeyboardEvent) {
@@ -98,6 +113,12 @@ export function installShortcuts(
         break;
       case "volumeDown":
         await player.setVolume(Math.max(0, player.snapshot.volume - VOLUME_STEP));
+        break;
+      case "toggleQueueView":
+        if (!ui || !router) break;
+        ui.queueOpen = false;
+        if (router.currentRoute.value.name === "nowPlaying") router.back();
+        else await router.push({ name: "nowPlaying" });
         break;
     }
   }

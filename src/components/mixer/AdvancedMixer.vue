@@ -9,17 +9,15 @@
 import { computed, ref } from "vue";
 import PnmIcon from "../icons/PnmIcon.vue";
 import AppSlider from "../ui/AppSlider.vue";
-import AppKnob from "../ui/AppKnob.vue";
 import AppToggle from "../ui/AppToggle.vue";
-import SelectMenu, { type SelectOption } from "../ui/SelectMenu.vue";
-import EqSliders from "./EqSliders.vue";
 import EqModal from "./EqModal.vue";
 import PresetSelect from "./PresetSelect.vue";
 import FilterGrid from "./FilterGrid.vue";
 import SectionHeader from "./SectionHeader.vue";
+import EffectControls from "./EffectControls.vue";
 import CrossfadeGraph from "./CrossfadeGraph.vue";
-import { audibleMix, defaultBands, tempoPercent, SECTION_LABELS } from "@/lib/mixer";
-import { formatHz, semitonesLabel } from "@/lib/format";
+import { defaultBands, SECTION_LABELS } from "@/lib/mixer";
+import { useDragReorder } from "@/lib/dragReorder";
 import { formatSeconds } from "@/lib/crossfadeCurve";
 import { withCrossfadeLength } from "@/lib/crossfadeCurve";
 import { useMixerStore } from "@/stores/mixer";
@@ -28,7 +26,7 @@ import { usePresetEditorStore } from "@/stores/presetEditor";
 import { useSettingsStore } from "@/stores/settings";
 import { useUiStore } from "@/stores/ui";
 import type { Section } from "@/lib/mixer";
-import type { CrossfadeCurve, Eq, MixerSettings, PanningMode } from "@/lib/types";
+import type { ChainStage, CrossfadeCurve, Eq, MixerSettings } from "@/lib/types";
 
 const props = withDefaults(
   defineProps<{
@@ -78,12 +76,97 @@ function sectionShown(section: Section): boolean {
   return !props.customisable || !settings.preferences.hiddenMixerSections.includes(section);
 }
 
+/*
+ * The chain, in the order it is heard.
+ *
+ * The panel used to list its sections in a fixed order that only looked like a
+ * signal chain; now the list *is* the chain, top to bottom, and moving a row
+ * moves the effect. The sections that are not stages — pitch, normalisation,
+ * crossfade and the ambience beds — are drawn underneath in their own group
+ * rather than pretending to a place in it.
+ */
+const chainStages = computed<ChainStage[]>(() =>
+  isEqPreset.value ? ["eq"] : fx.value.chainOrder.filter((stage) => sectionShown(stage)),
+);
+
+/**
+ * The sections that are not stages of the chain, in the order the user has put
+ * them in. That order is layout and nothing else — none of these is a place
+ * the signal passes through — but where a control sits is still worth being
+ * able to decide, so they move like the chain's rows do.
+ */
+const layoutSections = computed<Section[]>(() =>
+  isEqPreset.value
+    ? []
+    : (fx.value.layoutOrder as Section[]).filter(
+        (section) =>
+          sectionShown(section) && (section !== "crossfade" || canEditCrossfade.value),
+      ),
+);
+
+/** Reordering an EQ preset's chain of one would mean nothing. */
+const canReorder = computed(() => !isEqPreset.value && chainStages.value.length > 1);
+const canReorderLayout = computed(() => layoutSections.value.length > 1);
+const chainListEl = ref<HTMLElement | null>(null);
+const layoutListEl = ref<HTMLElement | null>(null);
+
+/**
+ * Move a row, in indices into the *visible* list.
+ *
+ * The sidebar can have sections hidden, so a drop between two visible rows is
+ * translated back into a position in the whole order: what the user sees moved
+ * past is what it is moved past, hidden sections and all.
+ */
+function moveRow(visible: readonly string[], order: readonly string[], from: number, to: number) {
+  const moved = visible[from];
+  const landing = visible[Math.min(Math.max(to, 0), visible.length - 1)];
+  if (!moved || !landing || moved === landing) return [-1, -1] as const;
+  return [order.indexOf(moved), order.indexOf(landing)] as const;
+}
+
+function moveStage(from: number, to: number) {
+  const [fromIndex, toIndex] = moveRow(chainStages.value, fx.value.chainOrder, from, to);
+  if (fromIndex < 0 || toIndex < 0) return;
+  if (isPreset.value) presetEditor.moveChainStage(fromIndex, toIndex);
+  else void mixer.moveChainStage(fromIndex, toIndex);
+}
+
+function moveLayout(from: number, to: number) {
+  const [fromIndex, toIndex] = moveRow(layoutSections.value, fx.value.layoutOrder, from, to);
+  if (fromIndex < 0 || toIndex < 0) return;
+  if (isPreset.value) presetEditor.moveLayoutSection(fromIndex, toIndex);
+  else void mixer.moveLayoutSection(fromIndex, toIndex);
+}
+
+const chainDrag = useDragReorder(chainListEl, moveStage);
+const layoutDrag = useDragReorder(layoutListEl, moveLayout);
+
+/** Arrow keys move a row too: a reorder only a pointer can do is not one
+ *  everybody can do. */
+function gripKey(event: KeyboardEvent, index: number, move: (from: number, to: number) => void) {
+  const delta = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
+  if (delta === 0) return;
+  event.preventDefault();
+  move(index, index + delta);
+}
+
 const MAX_CROSSFADE_SECS = 12;
 const crossfadeSettings = computed(() => fx.value.crossfade);
 
 function setSection<K extends Section>(section: K, value: MixerSettings[K]) {
   if (isPreset.value) presetEditor.setSection(section, value);
   else void mixer.setSection(section, value);
+}
+
+/**
+ * A change from one section's controls. They emit a patch naming their own
+ * section rather than writing anything themselves, so the same controls serve
+ * this panel and the master mixer's rack.
+ */
+function onControlChange(patch: MixerSettings) {
+  for (const [section, value] of Object.entries(patch)) {
+    setSection(section as Section, value as MixerSettings[Section]);
+  }
 }
 
 function clearSection(section: Section) {
@@ -126,61 +209,12 @@ function overridden(section: Section) {
   return mixer.overriddenSections.includes(section);
 }
 
-// -- pitch -------------------------------------------------------------------
-const semitones = computed({
-  get: () => fx.value.pitch.semitones,
-  set: (semitones: number) => setSection("pitch", { ...fx.value.pitch, semitones }),
-});
-const cents = computed({
-  get: () => fx.value.pitch.cents,
-  set: (cents: number) => setSection("pitch", { ...fx.value.pitch, cents }),
-});
-
-// -- panning -----------------------------------------------------------------
-function setPanning(patch: Partial<typeof fx.value.panning>) {
-  setSection("panning", { ...fx.value.panning, ...patch });
-}
-
-const PANNING_MODES: ReadonlyArray<SelectOption> = [
-  { id: "monoPan", label: "Mono Pan" },
-  { id: "stereoBalance", label: "Stereo Balance" },
-  { id: "trueStereo", label: "True Stereo" },
-];
-
-const panningLabel = computed(() => {
-  switch (fx.value.panning.mode) {
-    case "monoPan":
-      return "Pan";
-    case "stereoBalance":
-      return "Balance";
-    case "trueStereo":
-      return "Centre";
-  }
-});
-
-function panningPositionDisplay(position: number): string {
-  if (Math.abs(position) < 0.005) return "C";
-  return `${position < 0 ? "L" : "R"} ${Math.round(Math.abs(position) * 100)}`;
-}
-
-// -- reverb ------------------------------------------------------------------
-function setReverb(patch: Partial<typeof fx.value.reverb>) {
-  setSection("reverb", { ...fx.value.reverb, ...patch });
-}
-
-// -- delay -------------------------------------------------------------------
-function setDelay(patch: Partial<typeof fx.value.delay>) {
-  setSection("delay", { ...fx.value.delay, ...patch });
-}
-
-// -- normalisation -----------------------------------------------------------
-function setNorm(patch: Partial<typeof fx.value.normalisation>) {
-  setSection("normalisation", { ...fx.value.normalisation, ...patch });
-}
-
-// -- lo-fi -------------------------------------------------------------------
-function setLofi(patch: Partial<typeof fx.value.lofi>) {
-  setSection("lofi", { ...fx.value.lofi, ...patch });
+/** The enable toggle an effect's heading carries. */
+function setSectionEnabled(
+  section: "eq" | "delay" | "reverb" | "lofi" | "normalisation",
+  enabled: boolean,
+) {
+  setSection(section, { ...fx.value[section], enabled });
 }
 
 // -- eq ----------------------------------------------------------------------
@@ -253,407 +287,234 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
         >. Untouched sections follow your global mixer.
       </p>
 
-      <!-- EQ ---------------------------------------------------------------->
-      <section v-if="sectionShown('eq')" class="panel__section">
+      <!-- The chain, in the order it is applied ---------------------------->
+      <div v-if="chainStages.length" class="panel__chain">
         <SectionHeader
-          :title="SECTION_LABELS.eq"
-          :overridden="overridden('eq')"
-          :can-override="canOverride && !isEqPreset"
-          @clear="clearSection('eq')"
+          v-if="canReorder"
+          :title="SECTION_LABELS.chainOrder"
+          :overridden="overridden('chainOrder')"
+          :can-override="canOverride"
+          @clear="clearSection('chainOrder')"
         >
           <div class="panel__spacer" />
-          <button class="panel__link" @click="resetEq">Reset</button>
-          <button
-            class="icon-button"
-            aria-label="Expand EQ"
-            title="Expand EQ"
-            @click="eqExpanded = true"
-          >
-            <PnmIcon name="expand" :size="16" />
-          </button>
+          <span class="panel__global-note">Top is applied first</span>
         </SectionHeader>
-
-        <EqSliders :eq="fx.eq" @change="onEq" />
-      </section>
-
-      <template v-if="!isEqPreset">
-
-      <!-- Pitch ------------------------------------------------------------->
-      <section v-if="sectionShown('pitch')" class="panel__section">
-        <SectionHeader
-          :title="SECTION_LABELS.pitch"
-          :overridden="overridden('pitch')"
-          :can-override="canOverride"
-          @clear="clearSection('pitch')"
-        />
-        <div class="row">
-          <label>Semitones</label>
-          <AppSlider v-model="semitones" :min="-12" :max="12" :step="1" :origin="0" />
-          <span class="row__value">{{ semitonesLabel(fx.pitch.semitones, 0) }}</span>
-        </div>
-        <div class="row">
-          <label>Fine</label>
-          <AppSlider v-model="cents" :min="-100" :max="100" :step="1" :origin="0" />
-          <span class="row__value">{{ Math.round(fx.pitch.cents) }}¢</span>
-        </div>
-        <p class="panel__hint">
-          Varispeed: pitch and tempo move together, so this also changes speed by
-          {{ tempoPercent(fx.pitch) > 0 ? "+" : "" }}{{ tempoPercent(fx.pitch).toFixed(1) }}%.
-          <template v-if="isBlockTarget">
-            The region on the timeline resizes to match, so it keeps covering the
-            same part of the song.
-          </template>
+        <p v-if="canReorder" class="panel__hint panel__hint--lead">
+          These run in the order they are listed. Drag one by its handle, or focus a
+          handle and use the arrow keys, to change what the signal meets first.
         </p>
-      </section>
 
-      <!-- Reverb ------------------------------------------------------------>
-      <section v-if="sectionShown('reverb')" class="panel__section">
-        <SectionHeader
-          :title="SECTION_LABELS.reverb"
-          :overridden="overridden('reverb')"
-          :can-override="canOverride"
-          @clear="clearSection('reverb')"
-        >
-          <div class="panel__spacer" />
-          <AppToggle
-            :model-value="fx.reverb.enabled"
-            label="Enable reverb"
-            @update:model-value="setReverb({ enabled: $event })"
-          />
-        </SectionHeader>
-        <div class="knobs">
-          <AppKnob
-            :model-value="fx.reverb.size"
-            label="Size"
-            :display="`${Math.round(fx.reverb.size * 100)}%`"
-            :disabled="!fx.reverb.enabled"
-            @update:model-value="setReverb({ size: $event })"
-          />
-          <AppKnob
-            :model-value="fx.reverb.damping"
-            label="Damping"
-            :display="`${Math.round(fx.reverb.damping * 100)}%`"
-            :disabled="!fx.reverb.enabled"
-            @update:model-value="setReverb({ damping: $event })"
-          />
-          <AppKnob
-            :model-value="audibleMix(fx.reverb)"
-            label="Mix"
-            :display="`${Math.round(audibleMix(fx.reverb) * 100)}%`"
-            :disabled="!fx.reverb.enabled"
-            @update:model-value="setReverb({ mix: $event })"
-          />
-          <AppKnob
-            :model-value="fx.reverb.width"
-            label="Width"
-            :display="`${Math.round(fx.reverb.width * 100)}%`"
-            :disabled="!fx.reverb.enabled"
-            @update:model-value="setReverb({ width: $event })"
-          />
-          <AppKnob
-            :model-value="fx.reverb.predelayMs"
-            :min="0"
-            :max="250"
-            label="Pre-delay"
-            :display="`${Math.round(fx.reverb.predelayMs)} ms`"
-            :disabled="!fx.reverb.enabled"
-            @update:model-value="setReverb({ predelayMs: $event })"
-          />
-        </div>
-      </section>
-
-      <!-- Delay ------------------------------------------------------------->
-      <section v-if="sectionShown('delay')" class="panel__section">
-        <SectionHeader
-          :title="SECTION_LABELS.delay"
-          :overridden="overridden('delay')"
-          :can-override="canOverride"
-          @clear="clearSection('delay')"
-        >
-          <div class="panel__spacer" />
-          <AppToggle
-            :model-value="fx.delay.enabled"
-            label="Enable delay"
-            @update:model-value="setDelay({ enabled: $event })"
-          />
-        </SectionHeader>
-        <div class="knobs">
-          <AppKnob
-            :model-value="fx.delay.timeMs"
-            :min="10"
-            :max="2000"
-            label="Time"
-            :display="`${Math.round(fx.delay.timeMs)} ms`"
-            :disabled="!fx.delay.enabled"
-            @update:model-value="setDelay({ timeMs: $event })"
-          />
-          <AppKnob
-            :model-value="fx.delay.feedback"
-            :max="0.95"
-            label="Feedback"
-            :display="`${Math.round(fx.delay.feedback * 100)}%`"
-            :disabled="!fx.delay.enabled"
-            @update:model-value="setDelay({ feedback: $event })"
-          />
-          <AppKnob
-            :model-value="audibleMix(fx.delay)"
-            label="Mix"
-            :display="`${Math.round(audibleMix(fx.delay) * 100)}%`"
-            :disabled="!fx.delay.enabled"
-            @update:model-value="setDelay({ mix: $event })"
-          />
-          <AppKnob
-            :model-value="fx.delay.toneHz"
-            :min="500"
-            :max="18000"
-            label="Tone"
-            :display="formatHz(Math.round(fx.delay.toneHz))"
-            :disabled="!fx.delay.enabled"
-            @update:model-value="setDelay({ toneHz: $event })"
-          />
-          <AppKnob
-            :model-value="fx.delay.spread"
-            label="Ping-Pong"
-            :display="`${Math.round(fx.delay.spread * 100)}%`"
-            :disabled="!fx.delay.enabled"
-            @update:model-value="setDelay({ spread: $event })"
-          />
-        </div>
-      </section>
-
-      <!-- Normalisation ----------------------------------------------------->
-      <section v-if="sectionShown('normalisation')" class="panel__section">
-        <SectionHeader
-          :title="SECTION_LABELS.normalisation"
-          :overridden="overridden('normalisation')"
-          :can-override="canOverride"
-          @clear="clearSection('normalisation')"
-        >
-          <div class="panel__spacer" />
-          <AppToggle
-            :model-value="fx.normalisation.enabled"
-            label="Enable normalisation"
-            @update:model-value="setNorm({ enabled: $event })"
-          />
-        </SectionHeader>
-
-        <div class="row">
-          <label>Gain</label>
-          <AppSlider
-            :model-value="fx.normalisation.gainDb"
-            :min="-12"
-            :max="12"
-            :step="0.5"
-            :origin="0"
-            @update:model-value="setNorm({ gainDb: $event })"
-          />
-          <span class="row__value">{{ fx.normalisation.gainDb.toFixed(1) }} dB</span>
-        </div>
-
-        <div class="row">
-          <label>Limiter</label>
-          <AppSlider
-            :model-value="fx.normalisation.limiterCeilingDb"
-            :min="-12"
-            :max="0"
-            :step="0.1"
-            @update:model-value="setNorm({ limiterCeilingDb: $event })"
-          />
-          <span class="row__value">{{ fx.normalisation.limiterCeilingDb.toFixed(1) }} dB</span>
-        </div>
-
-        <div class="row">
-          <label>Release</label>
-          <AppSlider
-            :model-value="fx.normalisation.limiterReleaseMs"
-            :min="5"
-            :max="1000"
-            :step="5"
-            :disabled="!fx.normalisation.limiterEnabled"
-            @update:model-value="setNorm({ limiterReleaseMs: $event })"
-          />
-          <span class="row__value">{{ Math.round(fx.normalisation.limiterReleaseMs) }} ms</span>
-        </div>
-
-        <div class="row row--toggle">
-          <label>Safety limiter</label>
-          <AppToggle
-            :model-value="fx.normalisation.limiterEnabled"
-            label="Safety limiter"
-            @update:model-value="setNorm({ limiterEnabled: $event })"
-          />
-        </div>
-
-        <div class="meter" :title="`Gain reduction: ${player.snapshot.limiterReductionDb.toFixed(1)} dB`">
-          <span class="meter__label">Reduction</span>
-          <div class="meter__track">
-            <div
-              class="meter__fill"
-              :style="{ width: `${Math.min(100, player.snapshot.limiterReductionDb * 8.33)}%` }"
+        <ul ref="chainListEl" class="panel__chain-list">
+          <template v-for="(stage, index) in chainStages" :key="stage">
+            <li
+              v-if="chainDrag.isDragging.value && chainDrag.dropAt.value === index"
+              class="panel__chain-drop"
+              aria-hidden="true"
             />
-          </div>
-          <span class="row__value">-{{ player.snapshot.limiterReductionDb.toFixed(1) }} dB</span>
-        </div>
+            <li
+              data-row
+              class="panel__chain-row"
+              :class="{ 'is-lifted': chainDrag.dragFrom.value === index }"
+            >
+              <section class="panel__section" :data-testid="`${stage}-section`">
+                <SectionHeader
+                  :title="SECTION_LABELS[stage]"
+                  :overridden="overridden(stage)"
+                  :can-override="canOverride && !isEqPreset"
+                  @clear="clearSection(stage)"
+                >
+                  <template v-if="canReorder" #lead>
+                    <button
+                      class="panel__grip"
+                      type="button"
+                      :aria-label="`Reorder ${SECTION_LABELS[stage]}`"
+                      :title="`Drag, or use the arrow keys, to move ${SECTION_LABELS[stage]} along the chain`"
+                      @pointerdown="chainDrag.onHandleDown($event, index)"
+                      @pointermove="chainDrag.onHandleMove"
+                      @pointerup="chainDrag.onHandleUp"
+                      @pointercancel="chainDrag.onHandleCancel"
+                      @keydown="gripKey($event, index, moveStage)"
+                    >
+                      <PnmIcon name="grip" :size="15" />
+                    </button>
+                  </template>
+                  <template v-if="stage === 'eq'">
+                      <div class="panel__spacer" />
+                      <button class="panel__link" @click="resetEq">Reset</button>
+                      <button
+                        class="icon-button"
+                        aria-label="Expand EQ"
+                        title="Expand EQ"
+                        @click="eqExpanded = true"
+                      >
+                        <PnmIcon name="expand" :size="16" />
+                      </button>
+                  </template>
+                  <template v-if="stage === 'delay'">
+                      <div class="panel__spacer" />
+                      <AppToggle
+                        :model-value="fx.delay.enabled"
+                        label="Enable delay"
+                        @update:model-value="setSectionEnabled('delay', $event)"
+                      />
+                  </template>
+                  <template v-if="stage === 'reverb'">
+                      <div class="panel__spacer" />
+                      <AppToggle
+                        :model-value="fx.reverb.enabled"
+                        label="Enable reverb"
+                        @update:model-value="setSectionEnabled('reverb', $event)"
+                      />
+                  </template>
+                  <template v-if="stage === 'lofi'">
+                      <div class="panel__spacer" />
+                      <AppToggle
+                        :model-value="fx.lofi.enabled"
+                        label="Enable lo-fi"
+                        @update:model-value="setSectionEnabled('lofi', $event)"
+                      />
+                  </template>
+                </SectionHeader>
 
-        <p class="panel__hint">
-          Per-track gain comes from ReplayGain tags where a file has them. The limiter stays
-          active even when normalisation is off, so effects cannot clip the output.
-        </p>
-      </section>
-
-      <!-- Panning ----------------------------------------------------------->
-      <section v-if="sectionShown('panning')" class="panel__section" data-testid="panning-section">
-        <SectionHeader
-          :title="SECTION_LABELS.panning"
-          :overridden="overridden('panning')"
-          :can-override="canOverride"
-          @clear="clearSection('panning')"
-        />
-        <SelectMenu
-          class="panning-mode"
-          label="Mode"
-          :model-value="fx.panning.mode"
-          :options="PANNING_MODES"
-          @update:model-value="setPanning({ mode: $event as PanningMode })"
-        />
-        <div class="knobs knobs--panning">
-          <AppKnob
-            :model-value="fx.panning.position"
-            :min="-1"
-            :max="1"
-            :detents="[0]"
-            :label="panningLabel"
-            :display="panningPositionDisplay(fx.panning.position)"
-            @update:model-value="setPanning({ position: $event })"
+                <EffectControls
+                  :section="stage"
+                  :fx="fx"
+                  :block-target="isBlockTarget"
+                  @change="onControlChange"
+                />
+              </section>
+            </li>
+          </template>
+          <li
+            v-if="chainDrag.isDragging.value && chainDrag.dropAt.value === chainStages.length"
+            class="panel__chain-drop"
+            aria-hidden="true"
           />
-          <AppKnob
-            v-if="fx.panning.mode === 'trueStereo'"
-            :model-value="fx.panning.width"
-            label="Width"
-            :display="`${Math.round(fx.panning.width * 100)}%`"
-            @update:model-value="setPanning({ width: $event })"
-          />
-        </div>
-      </section>
+        </ul>
+      </div>
 
-      <!-- Crossfade ----------------------------------------------------------->
-      <section v-if="canEditCrossfade && sectionShown('crossfade')" class="panel__section">
+      <!-- Everything that is not a stage of the chain ---------------------->
+      <div v-if="layoutSections.length" class="panel__chain panel__layout">
         <SectionHeader
-          :title="SECTION_LABELS.crossfade"
-          :overridden="overridden('crossfade')"
+          :title="SECTION_LABELS.layoutOrder"
+          :overridden="overridden('layoutOrder')"
           :can-override="canOverride"
-          @clear="clearSection('crossfade')"
+          @clear="clearSection('layoutOrder')"
         >
           <div class="panel__spacer" />
-          <span v-if="!isPreset && mixer.target.kind === 'playlist'" class="panel__global-note">
-            Applies to this playlist
-          </span>
+          <span class="panel__global-note">Order is layout only</span>
         </SectionHeader>
-
-        <div class="row">
-          <label>Length</label>
-          <AppSlider
-            :model-value="crossfadeSettings.lengthSecs"
-            :min="0"
-            :max="MAX_CROSSFADE_SECS"
-            :step="0.5"
-            @update:model-value="onCrossfadeLength($event)"
-          />
-          <span class="row__value">{{ formatSeconds(crossfadeSettings.lengthSecs) }}</span>
-        </div>
-
-        <CrossfadeGraph
-          class="panel__crossfade-graph"
-          :curve="crossfadeSettings.curve"
-          :length-secs="crossfadeSettings.lengthSecs"
-          :disabled="crossfadeSettings.lengthSecs <= 0"
-          @change="onCrossfadeCurve"
-        />
-
-        <p class="panel__hint">
-          Drag a point to change when each song starts or finishes fading. Orange is the song
-          ending, blue is the one starting. Double-click a point to reset it.
+        <p class="panel__hint panel__hint--lead">
+          None of these is a stage the signal passes through — varispeed happens as
+          the file is read, the gain ride comes after the effects, a crossfade
+          belongs to the join between two songs, and a bed is laid over the top. Move
+          them to suit how you work; the sound does not change.
         </p>
-      </section>
 
-      <!-- Atmospheres ------------------------------------------------------->
-      <section v-if="sectionShown('filters')" class="panel__section">
-        <SectionHeader
-          :title="SECTION_LABELS.filters"
-          :overridden="overridden('filters')"
-          :can-override="canOverride"
-          @clear="clearSection('filters')"
-        />
-        <FilterGrid
-          show-volumes
-          :settings="isPreset ? fx.filters : undefined"
-          @toggle="presetEditor.toggleFilter"
-          @volume="presetEditor.setFilterVolume"
-        />
-        <p v-if="isBlockTarget" class="panel__hint">
-          A bed here plays for as long as this region does and fades with it,
-          rather than running under the whole mix.
-        </p>
-      </section>
+        <ul ref="layoutListEl" class="panel__chain-list panel__layout-list">
+          <template v-for="(section, index) in layoutSections" :key="section">
+            <li
+              v-if="layoutDrag.isDragging.value && layoutDrag.dropAt.value === index"
+              class="panel__chain-drop"
+              aria-hidden="true"
+            />
+            <li
+              data-row
+              class="panel__chain-row"
+              :class="{ 'is-lifted': layoutDrag.dragFrom.value === index }"
+            >
+              <section class="panel__section" :data-testid="`${section}-section`">
+                <SectionHeader
+                  :title="SECTION_LABELS[section]"
+                  :overridden="overridden(section)"
+                  :can-override="canOverride"
+                  @clear="clearSection(section)"
+                >
+                  <template v-if="canReorderLayout" #lead>
+                    <button
+                      class="panel__grip"
+                      type="button"
+                      :aria-label="`Reorder ${SECTION_LABELS[section]}`"
+                      :title="`Drag, or use the arrow keys, to move ${SECTION_LABELS[section]} up or down the panel`"
+                      @pointerdown="layoutDrag.onHandleDown($event, index)"
+                      @pointermove="layoutDrag.onHandleMove"
+                      @pointerup="layoutDrag.onHandleUp"
+                      @pointercancel="layoutDrag.onHandleCancel"
+                      @keydown="gripKey($event, index, moveLayout)"
+                    >
+                      <PnmIcon name="grip" :size="15" />
+                    </button>
+                  </template>
+                  <template v-if="section === 'normalisation'">
+                      <div class="panel__spacer" />
+                      <AppToggle
+                        :model-value="fx.normalisation.enabled"
+                        label="Enable normalisation"
+                        @update:model-value="setSectionEnabled('normalisation', $event)"
+                      />
+                  </template>
+                  <template v-if="section === 'crossfade'">
+                      <div class="panel__spacer" />
+                      <span v-if="!isPreset && mixer.target.kind === 'playlist'" class="panel__global-note">
+                        Applies to this playlist
+                      </span>
+                  </template>
+                </SectionHeader>
 
-      <!-- Sample rate ------------------------------------------------------->
-      <section v-if="sectionShown('lofi')" class="panel__section">
-        <SectionHeader
-          :title="SECTION_LABELS.lofi"
-          :overridden="overridden('lofi')"
-          :can-override="canOverride"
-          @clear="clearSection('lofi')"
-        >
-          <div class="panel__spacer" />
-          <AppToggle
-            :model-value="fx.lofi.enabled"
-            label="Enable lo-fi"
-            @update:model-value="setLofi({ enabled: $event })"
+                <template v-if="section === 'pitch'">
+                  <EffectControls section="pitch" :fx="fx" :block-target="isBlockTarget" @change="onControlChange" />
+                </template>
+                <template v-if="section === 'normalisation'">
+                  <EffectControls section="normalisation" :fx="fx" :block-target="isBlockTarget" @change="onControlChange" />
+                </template>
+                <template v-if="section === 'crossfade'">
+                  <div class="row">
+                    <label>Length</label>
+                    <AppSlider
+                      :model-value="crossfadeSettings.lengthSecs"
+                      :min="0"
+                      :max="MAX_CROSSFADE_SECS"
+                      :step="0.5"
+                      @update:model-value="onCrossfadeLength($event)"
+                    />
+                    <span class="row__value">{{ formatSeconds(crossfadeSettings.lengthSecs) }}</span>
+                  </div>
+
+                  <CrossfadeGraph
+                    class="panel__crossfade-graph"
+                    :curve="crossfadeSettings.curve"
+                    :length-secs="crossfadeSettings.lengthSecs"
+                    :disabled="crossfadeSettings.lengthSecs <= 0"
+                    @change="onCrossfadeCurve"
+                  />
+
+                  <p class="panel__hint">
+                    Drag a point to change when each song starts or finishes fading. Orange is the song
+                    ending, blue is the one starting. Double-click a point to reset it.
+                  </p>
+                </template>
+                <template v-if="section === 'filters'">
+                  <FilterGrid
+                    show-volumes
+                    :settings="isPreset ? fx.filters : undefined"
+                    @toggle="presetEditor.toggleFilter"
+                    @volume="presetEditor.setFilterVolume"
+                  />
+                  <p v-if="isBlockTarget" class="panel__hint">
+                    A bed here plays for as long as this region does and fades with it,
+                    rather than running under the whole mix.
+                  </p>
+                </template>
+              </section>
+            </li>
+          </template>
+          <li
+            v-if="layoutDrag.isDragging.value && layoutDrag.dropAt.value === layoutSections.length"
+            class="panel__chain-drop"
+            aria-hidden="true"
           />
-        </SectionHeader>
-
-        <div class="row">
-          <label>Rate</label>
-          <AppSlider
-            :model-value="fx.lofi.sampleRateHz"
-            :min="1000"
-            :max="48000"
-            :step="100"
-            :disabled="!fx.lofi.enabled"
-            @update:model-value="setLofi({ sampleRateHz: $event })"
-          />
-          <span class="row__value">{{ formatHz(Math.round(fx.lofi.sampleRateHz)) }}</span>
-        </div>
-
-        <div class="row">
-          <label>Bit depth</label>
-          <AppSlider
-            :model-value="fx.lofi.bitDepth"
-            :min="2"
-            :max="16"
-            :step="1"
-            :disabled="!fx.lofi.enabled"
-            @update:model-value="setLofi({ bitDepth: $event })"
-          />
-          <span class="row__value">{{ Math.round(fx.lofi.bitDepth) }} bit</span>
-        </div>
-
-        <div class="row">
-          <label>Mix</label>
-          <AppSlider
-            :model-value="audibleMix(fx.lofi)"
-            :disabled="!fx.lofi.enabled"
-            @update:model-value="setLofi({ mix: $event })"
-          />
-          <span class="row__value">{{ Math.round(audibleMix(fx.lofi) * 100) }}%</span>
-        </div>
-
-        <p class="panel__hint">
-          A creative crusher, not the output device's rate. Your device is running at
-          {{ formatHz(deviceRate) }}.
-        </p>
-      </section>
-      </template>
+        </ul>
+      </div>
     </div>
 
     <!-- Edits whichever layer this panel is pointed at, like every other
@@ -761,6 +622,64 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   padding-top: 0;
 }
 
+/* The chain's rows carry the hairline themselves, so the sections inside them
+   do not draw a second one. */
+.panel__chain-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.panel__layout {
+  border-top: 1px solid var(--separator);
+  padding-top: 16px;
+}
+
+.panel__chain-row + .panel__chain-row {
+  margin-top: 14px;
+  border-top: 1px solid var(--separator);
+  padding-top: 14px;
+}
+
+.panel__chain-row .panel__section {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.panel__chain-row.is-lifted {
+  opacity: 0.45;
+}
+
+/* The insertion marker the queue and the sidebar both use: a hairline in the
+   gap the row will land in, not a filled row of its own. */
+.panel__chain-drop {
+  height: 2px;
+  margin: 6px 0;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.panel__grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 26px;
+  margin-left: -5px;
+  color: var(--text-tertiary);
+  cursor: grab;
+  touch-action: none;
+}
+
+.panel__grip:active {
+  cursor: grabbing;
+}
+
+.panel__hint--lead {
+  margin: -2px 0 12px;
+}
+
 .panel__spacer {
   flex: 1;
 }
@@ -795,10 +714,6 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   margin-top: 7px;
 }
 
-.row--toggle {
-  grid-template-columns: 1fr auto;
-}
-
 .row label {
   font-size: 11.5px;
   color: var(--text-secondary);
@@ -811,45 +726,4 @@ const deviceRate = computed(() => player.snapshot.deviceSampleRate);
   font-variant-numeric: tabular-nums;
 }
 
-.knobs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px 6px;
-  justify-content: space-between;
-}
-
-.panning-mode {
-  margin-bottom: 10px;
-}
-
-.knobs--panning {
-  justify-content: flex-start;
-  gap: 24px;
-}
-
-.meter {
-  display: grid;
-  grid-template-columns: 68px 1fr 58px;
-  align-items: center;
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.meter__label {
-  font-size: 11.5px;
-  color: var(--text-secondary);
-}
-
-.meter__track {
-  height: 4px;
-  border-radius: 999px;
-  background: var(--control-track);
-  overflow: hidden;
-}
-
-.meter__fill {
-  height: 100%;
-  background: var(--accent);
-  transition: width 0.15s linear;
-}
 </style>

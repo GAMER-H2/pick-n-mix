@@ -60,6 +60,40 @@ another playlist, or played straight from the library, is unaffected.
 A layer that only sets `reverb` leaves every other section inherited. See
 [docs/playlist-format.md](docs/playlist-format.md).
 
+### Chain order
+
+The advanced panel lists the chain's stages — EQ, delay, reverb, sample rate
+and panning — in the order the engine applies them, and dragging a row by its
+handle (or focusing the handle and using the arrow keys) is what changes that
+order. It cascades like any other section, as `chainOrder`, and an order that
+does not mention a stage leaves that stage where it was, so a layer saved
+before this existed still gets every stage exactly once.
+
+Pitch, normalisation, crossfade and atmospheres are listed separately, under
+their own heading: varispeed happens as the file is decoded, normalisation is a
+gain ride after the chain (with the one limiter on the master bus), a crossfade
+belongs to the join between two songs, and an ambience bed is laid over the top
+rather than passed through the effects. They drag into any order too — stored
+as `layoutOrder`, and display only, so moving one changes the panel and never
+the sound.
+
+## The master mixer's effect rack
+
+A playlist's master mix is a small DAW, so its effects read like one. Selecting
+a region points the mixer at it; **Effects** in the modal's header offers
+everything the app can put on one, and what has been added is laid out along
+the bottom of the arrangement, left to right in the order it is applied. The
+arrows on a device move it along the chain; the cross takes it off, and the
+EQ's expand button opens the full equaliser on that block. The devices that are
+not chain stages sit after the chain and move the same way, for layout only.
+
+Between each pair of devices — and before the first and after the last — is a
+small stereo meter, so what an effect does to the level is the difference
+between the reading on its left and the reading on its right. They are fed by
+the engine while the mix is being auditioned and rest at the floor otherwise.
+The chain is metered at every stage whether or not a device is racked for it,
+so a gap that spans an untouched stage still reads the right place.
+
 ## Home
 
 The home page is built from what you actually listen to: three generated
@@ -174,6 +208,7 @@ a media app.
 | <kbd>J</kbd> | Previous track |
 | <kbd>←</kbd> / <kbd>→</kbd> | Skip back / forward (configurable step in Settings ▸ Playback) |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Volume |
+| <kbd>F</kbd> | Open / close the full-screen queue view |
 | <kbd>Esc</kbd> | Close the full-screen view, then the queue panel |
 
 The queue button opens the full-screen now-playing view; hold <kbd>Shift</kbd>

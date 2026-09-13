@@ -17,6 +17,14 @@ function makePlayer() {
 
 type Player = ReturnType<typeof makePlayer>;
 
+function makeRouter(routeName: string) {
+  return {
+    push: vi.fn(),
+    back: vi.fn(),
+    currentRoute: { value: { name: routeName } },
+  };
+}
+
 function press(key: string, target?: EventTarget, modifiers: Partial<KeyboardEvent> = {}) {
   const event = new KeyboardEvent("keydown", { key, cancelable: true, ...modifiers });
   if (target) Object.defineProperty(event, "target", { value: target });
@@ -30,8 +38,7 @@ describe("keyboard shortcuts", () => {
 
   beforeEach(() => {
     player = makePlayer();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    uninstall = installShortcuts(player as any);
+    uninstall = installShortcuts(player);
     return () => uninstall();
   });
 
@@ -108,8 +115,7 @@ describe("keyboard shortcuts", () => {
 
   it("reads the seek step on every press, like the bindings", () => {
     let step = 30;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const off = installShortcuts(player as any, undefined, undefined, {
+    const off = installShortcuts(player, undefined, undefined, {
       seekStep: () => step,
     });
 
@@ -140,17 +146,80 @@ describe("keyboard shortcuts", () => {
   });
 });
 
-describe("escape closes overlays", () => {
-  function makeRouter(routeName: string) {
-    return { back: vi.fn(), currentRoute: { value: { name: routeName } } };
-  }
+describe("queue view shortcut", () => {
+  it("opens the full-screen queue view and closes the compact panel", () => {
+    const player = makePlayer();
+    const ui = { queueOpen: true };
+    const router = makeRouter("library");
+    const off = installShortcuts(player, ui, router);
 
+    const event = press("f");
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(ui.queueOpen).toBe(false);
+    expect(router.push).toHaveBeenCalledWith({ name: "nowPlaying" });
+    expect(router.back).not.toHaveBeenCalled();
+    off();
+  });
+
+  it("closes the full-screen queue view through history", () => {
+    const player = makePlayer();
+    const ui = { queueOpen: false };
+    const router = makeRouter("nowPlaying");
+    const off = installShortcuts(player, ui, router);
+
+    press("F");
+
+    expect(router.back).toHaveBeenCalledTimes(1);
+    expect(router.push).not.toHaveBeenCalled();
+    off();
+  });
+
+  it("does not navigate while typing or while shortcuts are suspended", () => {
+    const player = makePlayer();
+    const ui = { queueOpen: true };
+    const router = makeRouter("library");
+    let suspended = false;
+    const off = installShortcuts(player, ui, router, {
+      isSuspended: () => suspended,
+    });
+    const input = document.createElement("input");
+    document.body.append(input);
+
+    press("f", input);
+    suspended = true;
+    press("f");
+
+    expect(router.push).not.toHaveBeenCalled();
+    expect(router.back).not.toHaveBeenCalled();
+    expect(ui.queueOpen).toBe(true);
+    input.remove();
+    off();
+  });
+
+  it("uses a rebound key instead of F", () => {
+    const player = makePlayer();
+    const ui = { queueOpen: false };
+    const router = makeRouter("library");
+    const off = installShortcuts(player, ui, router, {
+      bindings: () => ({ toggleQueueView: ["Ctrl+Q"] }),
+    });
+
+    press("f");
+    expect(router.push).not.toHaveBeenCalled();
+
+    press("q", undefined, { ctrlKey: true });
+    expect(router.push).toHaveBeenCalledWith({ name: "nowPlaying" });
+    off();
+  });
+});
+
+describe("escape closes overlays", () => {
   it("leaves the full-screen view before closing the side panel", () => {
     const player = makePlayer();
     const ui = { queueOpen: true };
     const router = makeRouter("nowPlaying");
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const off = installShortcuts(player as any, ui as any, router as any);
+    const off = installShortcuts(player, ui, router);
 
     // The full-screen player is a route, so leaving it is a navigation.
     press("Escape");
@@ -167,8 +236,7 @@ describe("escape closes overlays", () => {
     const player = makePlayer();
     const ui = { queueOpen: false };
     const router = makeRouter("library");
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const off = installShortcuts(player as any, ui as any, router as any);
+    const off = installShortcuts(player, ui, router);
     const event = press("Escape");
     expect(event.defaultPrevented).toBe(false);
     expect(router.back).not.toHaveBeenCalled();
@@ -180,8 +248,7 @@ describe("escape closes overlays", () => {
 describe("rebound shortcuts", () => {
   it("runs the user's binding and not the default it replaced", () => {
     const player = makePlayer();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const off = installShortcuts(player as any, undefined, undefined, {
+    const off = installShortcuts(player, undefined, undefined, {
       bindings: () => ({ playPause: ["Ctrl+Shift+P"] }),
     });
 
@@ -208,8 +275,7 @@ describe("standing aside for another transport", () => {
   it("ignores every key while playback is owned elsewhere", () => {
     const player = makePlayer();
     let suspended = true;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const off = installShortcuts(player as any, undefined, undefined, {
+    const off = installShortcuts(player, undefined, undefined, {
       isSuspended: () => suspended,
     });
 

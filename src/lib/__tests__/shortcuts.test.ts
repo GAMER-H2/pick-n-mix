@@ -28,6 +28,8 @@ describe("resolving a binding to an action", () => {
     expect(bindingsFor("playPause", {})).toEqual(["Space", "K"]);
     expect(actionFor("Space", {})).toBe("playPause");
     expect(actionFor("L", {})).toBe("nextTrack");
+    expect(bindingsFor("toggleQueueView", {})).toEqual(["F"]);
+    expect(actionFor("F", {})).toBe("toggleQueueView");
   });
 
   /** The point of an override: the default it replaced stops working. */
@@ -38,6 +40,13 @@ describe("resolving a binding to an action", () => {
     expect(actionFor("Space", overrides)).toBeNull();
     // Untouched actions are unaffected.
     expect(actionFor("L", overrides)).toBe("nextTrack");
+    expect(actionFor("F", overrides)).toBe("toggleQueueView");
+  });
+
+  it("replaces the queue view default when it is rebound", () => {
+    const overrides = { toggleQueueView: ["Ctrl+Q"] };
+    expect(actionFor("Ctrl+Q", overrides)).toBe("toggleQueueView");
+    expect(actionFor("F", overrides)).toBeNull();
   });
 
   it("has nothing bound to an unknown key", () => {

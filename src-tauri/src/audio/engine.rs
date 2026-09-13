@@ -35,6 +35,7 @@ use crate::audio::ambience::{AmbienceMixer, Bank};
 use crate::audio::crossfade::CrossfadeSettings;
 use crate::audio::decode::{StreamInfo, TrackDecoder};
 use crate::audio::dsp::{BandSolo, Chain, Limiter, CHANNELS};
+use crate::audio::meter::{OutputLevelFrame, OutputMeter};
 use crate::audio::params::{EqBand, Resolved};
 use crate::audio::timeline::TimelineSource;
 
@@ -152,6 +153,10 @@ struct Shared {
     /// while something is actually looking at it.
     analyser_bins: ArcSwap<Vec<f32>>,
     analyser_on: AtomicBool,
+    /// Latest post-limiter stereo levels. Kept separate from the FFT analyser:
+    /// the Master Mixer and its nested EQ can be open at the same time.
+    output_level_frame: ArcSwap<OutputLevelFrame>,
+    output_meter_on: AtomicBool,
     /// Let reverb and delay tails ring out after a pause instead of stopping
     /// with the music.
     keep_tail: AtomicBool,
@@ -194,6 +199,8 @@ impl Shared {
                 crate::audio::analyser::BINS
             ]),
             analyser_on: AtomicBool::new(false),
+            output_level_frame: ArcSwap::from_pointee(OutputLevelFrame::silence()),
+            output_meter_on: AtomicBool::new(false),
             keep_tail: AtomicBool::new(false),
             tail_active: AtomicBool::new(false),
             ambience_alone: AtomicBool::new(false),
@@ -600,6 +607,26 @@ impl AudioEngine {
         self.shared.analyser_on.store(enabled, Ordering::Relaxed);
     }
 
+    /// Start or stop maintaining the post-limiter stereo output meter.
+    ///
+    /// This has its own enable flag rather than sharing the FFT analyser's:
+    /// the Master Mixer can host an expanded EQ, and closing either consumer
+    /// must not stop the other one. A transition clears the published frame so
+    /// reopening never flashes a peak left over from an earlier session.
+    pub fn set_output_meter_enabled(&self, enabled: bool) {
+        let previous = self.shared.output_meter_on.swap(enabled, Ordering::Relaxed);
+        if previous != enabled {
+            self.shared
+                .output_level_frame
+                .store(Arc::new(OutputLevelFrame::silence()));
+        }
+    }
+
+    /// Latest post-limiter, pre-player-volume stereo levels in dBFS.
+    pub fn output_level_frame(&self) -> Arc<OutputLevelFrame> {
+        self.shared.output_level_frame.load_full()
+    }
+
     /// Narrow the output to one EQ band's own range, or `None` to restore
     /// the full range.
     ///
@@ -951,6 +978,13 @@ fn worker(
     // driven while the UI has asked for it; see `set_analyser_enabled`.
     let mut analyser = crate::audio::analyser::Analyser::new(device_rate as f32);
 
+    // Independent stereo peak ballistics for the Master Mixer. The state is
+    // fixed-size and allocation-free; only the throttled ArcSwap publication
+    // below allocates, around fifty times a second while enabled.
+    let mut output_meter = OutputMeter::new();
+    let mut output_meter_was_on = false;
+    let mut output_meter_idle_at = Instant::now();
+
     // Scratch buffers, sized once. `mix` doubles as voice A's buffer: voice B
     // (when present) is decoded into `scratch_b` and added into `mix` in
     // place, rather than allocating a third buffer.
@@ -1210,6 +1244,11 @@ fn worker(
                     band_solo.prepare(device_rate as f32);
                     ambience.prepare(device_rate as f32);
                     analyser = crate::audio::analyser::Analyser::new(device_rate as f32);
+                    output_meter.reset();
+                    shared
+                        .output_level_frame
+                        .store(Arc::new(OutputLevelFrame::silence()));
+                    output_meter_idle_at = Instant::now();
                     current = None;
                     abandon_next(
                         &mut next,
@@ -1225,6 +1264,16 @@ fn worker(
         }
         if shutdown {
             return;
+        }
+
+        let output_meter_on = shared.output_meter_on.load(Ordering::Relaxed);
+        if output_meter_on != output_meter_was_on {
+            output_meter.reset();
+            shared
+                .output_level_frame
+                .store(Arc::new(OutputLevelFrame::silence()));
+            output_meter_was_on = output_meter_on;
+            output_meter_idle_at = Instant::now();
         }
 
         // --- current voice's live parameters -----------------------------
@@ -1400,6 +1449,7 @@ fn worker(
 
         let draining = tail_blocks > 0;
         if draining {
+            output_meter_idle_at = Instant::now();
             if producer.slots() >= BLOCK * CHANNELS {
                 let quiet = match current.as_mut() {
                     Some(voice) => drain_tail_block(
@@ -1412,6 +1462,11 @@ fn worker(
                     ),
                     None => true,
                 };
+                if output_meter_on && output_meter.push(&mix, BLOCK, device_rate as f32) {
+                    shared
+                        .output_level_frame
+                        .store(Arc::new(output_meter.frame()));
+                }
                 tail_blocks -= 1;
                 if quiet {
                     tail_blocks = 0;
@@ -1435,17 +1490,30 @@ fn worker(
         let idle = (!playing || current.is_none()) && !beds_sounding;
         let room = producer.slots() >= BLOCK * CHANNELS;
         if idle || !room {
-            // Let the spectrum fall away rather than freezing the last frame
-            // on screen for as long as playback is stopped.
+            // Let the spectrum and levels fall away rather than freezing the
+            // last frame on screen for as long as playback is stopped.
             if idle && shared.analyser_on.load(Ordering::Relaxed) && !analyser.is_silent() {
                 analyser.decay();
                 shared
                     .analyser_bins
                     .store(Arc::new(analyser.bins().to_vec()));
             }
+            if idle && output_meter_on && !output_meter.is_silent() {
+                let now = Instant::now();
+                let elapsed = now.duration_since(output_meter_idle_at);
+                output_meter_idle_at = now;
+                if output_meter.decay(elapsed) {
+                    shared
+                        .output_level_frame
+                        .store(Arc::new(output_meter.frame()));
+                }
+            } else {
+                output_meter_idle_at = Instant::now();
+            }
             std::thread::sleep(Duration::from_millis(3));
             continue;
         }
+        output_meter_idle_at = Instant::now();
 
         // --- crossfade: ask for the next track once close enough ----------
         let playing_a_mix = current
@@ -1721,6 +1789,11 @@ fn worker(
             shared
                 .analyser_bins
                 .store(Arc::new(analyser.bins().to_vec()));
+        }
+        if output_meter_on && output_meter.push(&mix, frames, device_rate as f32) {
+            shared
+                .output_level_frame
+                .store(Arc::new(output_meter.frame()));
         }
 
         for f in 0..frames {

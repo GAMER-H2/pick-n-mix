@@ -76,6 +76,7 @@ function goToPlaylist() {
  * pressing it would fight the audition — so it stands aside and says so.
  */
 const suspended = computed(() => masterMix.open);
+const shuffleDisabled = computed(() => player.masterMix !== null || masterMix.open);
 
 const volumeIcon = computed(() => {
   const level = player.snapshot.volume;
@@ -177,6 +178,11 @@ function onQueueButton(event: MouseEvent) {
   // Navigation, so back and forward close and reopen it like any page.
   if (onNowPlaying.value) router.back();
   else router.push({ name: "nowPlaying" });
+}
+
+function toggleShuffle() {
+  if (shuffleDisabled.value) return;
+  return player.setShuffle(!player.queue.shuffle);
 }
 
 /** Shift skips the compact bubble and toggles the full panel. */
@@ -382,7 +388,8 @@ async function openMixer(event: MouseEvent) {
         label="Shuffle"
         :size="19"
         :active="player.queue.shuffle"
-        @click="player.setShuffle(!player.queue.shuffle)"
+        :disabled="shuffleDisabled"
+        @click="toggleShuffle"
       />
 
       <button

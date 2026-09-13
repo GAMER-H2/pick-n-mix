@@ -476,11 +476,7 @@ fn spawn_ambience_loader(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Before anything touches the webview: on some hosts the default
-    // renderer draws nothing at all.
-    window_frame::configure_renderer();
-
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         // Asynchronous, not the plain synchronous variant: the webview
         // delivers every scheme request on its own UI thread and blocks on
@@ -573,6 +569,10 @@ pub fn run() {
             commands::playback_state,
             commands::set_analyser_enabled,
             commands::analyser_frame,
+            commands::set_output_meter_enabled,
+            commands::output_level_frame,
+            commands::set_chain_meter_block,
+            commands::chain_level_frame,
             commands::set_eq_solo,
             // home
             commands::home_shelves,
@@ -651,8 +651,28 @@ pub fn run() {
             // window
             commands::window_is_flush,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Pick n Mix");
+        .run(tauri::generate_context!());
+
+    if let Err(error) = result {
+        report_startup_error(&error);
+    }
+}
+
+/// Preserve runner and setup errors even in a release build, where Windows has
+/// no console attached. Keeping this in the system temporary directory makes
+/// it available even when resolving or creating the app-data directory was the
+/// operation that failed.
+fn report_startup_error(error: &tauri::Error) {
+    let path = std::env::temp_dir().join("pick-n-mix-startup.log");
+    let message = format!(
+        "Pick n Mix failed to start.\n\n{error}\n\nLog file: {}\n",
+        path.display()
+    );
+    if let Err(write_error) = std::fs::write(&path, &message) {
+        eprintln!("{message}\nThe startup log could not be written: {write_error}");
+    } else {
+        eprintln!("{message}");
+    }
 }
 
 #[cfg(test)]

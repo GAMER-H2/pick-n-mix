@@ -25,6 +25,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -32,6 +33,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use crate::audio::ambience::{AmbienceMixer, Bank};
 use crate::audio::decode::{StreamInfo, TrackDecoder};
 use crate::audio::dsp::{Chain, CHANNELS};
+use crate::audio::meter::{ChainLevelFrame, ChainMeterBus, ChainMeters};
 use crate::audio::params::{Filter, Resolved};
 use crate::master_mix::Block;
 
@@ -174,6 +176,17 @@ pub struct TimelineSource {
     /// Beds a block wanted that the bank did not have. Drained by whoever is
     /// driving this source, so it can go and decode them.
     wanted_beds: HashSet<String>,
+    /// Where the master mixer's rack meters are read and published, when it
+    /// has asked for a block. `None` for a bounce or any other render nobody
+    /// is watching.
+    meter_bus: Option<Arc<ChainMeterBus>>,
+    /// Meters for whichever block `meter_bus` has chosen: one per tap point in
+    /// its chain.
+    chain_meters: ChainMeters,
+    /// Whether the metered block sounded during the stretch being rendered.
+    /// When it did not — it has not started, or has played out — its meters
+    /// fall rather than freezing at the last level it had.
+    metered_sounded: bool,
     interleaved: Vec<f32>,
     planar: Vec<Vec<f32>>,
     mix: Vec<Vec<f32>>,
@@ -218,6 +231,9 @@ impl TimelineSource {
             free_chains: Vec::new(),
             bank: Arc::new(Bank::new()),
             wanted_beds: HashSet::new(),
+            meter_bus: None,
+            chain_meters: ChainMeters::new(),
+            metered_sounded: false,
             interleaved: Vec::new(),
             planar: vec![Vec::new(); CHANNELS],
             mix: vec![Vec::new(); CHANNELS],
@@ -262,6 +278,9 @@ impl TimelineSource {
         while let Some(voice) = self.active.pop() {
             self.release_chain(voice.chain_ix);
         }
+        // The levels either side of an effect describe a moment in the mix,
+        // and this is a different moment.
+        self.chain_meters.reset();
         Ok(())
     }
 
@@ -296,7 +315,9 @@ impl TimelineSource {
 
         self.collect_ready();
         self.request_openings();
+        self.metered_sounded = false;
         self.render_active(frames)?;
+        self.settle_chain_meters(frames);
 
         for f in 0..frames {
             for ch in 0..CHANNELS {
@@ -315,6 +336,38 @@ impl TimelineSource {
         self.request_openings();
         self.wait_pending()?;
         self.read(out)
+    }
+
+    /// Point the rack meters at a bus. Only the editor's audition sets one: a
+    /// bounce and ordinary playback are not being watched, and metering them
+    /// would be work nobody has asked for.
+    pub fn set_meter_bus(&mut self, bus: Arc<ChainMeterBus>) {
+        self.meter_bus = Some(bus);
+    }
+
+    /// Publish what every tap on the metered block's chain currently reads.
+    fn publish_chain_levels(&self, block_id: &str) {
+        if let Some(bus) = self.meter_bus.as_ref() {
+            bus.publish(ChainLevelFrame {
+                block_id: block_id.to_string(),
+                stages: self.chain_meters.frames(),
+            });
+        }
+    }
+
+    /// Let the rack meters fall when the block they belong to did not sound in
+    /// the stretch just rendered.
+    fn settle_chain_meters(&mut self, frames: usize) {
+        if self.metered_sounded || self.chain_meters.is_empty() || self.chain_meters.is_silent() {
+            return;
+        }
+        let Some(block_id) = self.meter_bus.as_ref().and_then(|bus| bus.selected()) else {
+            return;
+        };
+        let elapsed = Duration::from_secs_f64(frames as f64 / self.rate as f64);
+        if self.chain_meters.decay(elapsed) {
+            self.publish_chain_levels(&block_id);
+        }
     }
 
     fn ensure_capacity(&mut self, frames: usize) {
@@ -508,11 +561,30 @@ impl TimelineSource {
             }
 
             let plan_block = &self.plan.blocks[block_ix];
+            let metered = self
+                .meter_bus
+                .as_ref()
+                .is_some_and(|bus| bus.wants(&plan_block.block.id));
             let chain = &mut self.chains[chain_ix];
             chain.update(&plan_block.settings, plan_block.track_gain_db);
-            if plan_block.settings.enabled {
+            if metered {
+                // The tapped path runs even for a bypassed chain, which taps
+                // once: the rack must show the level passing through it rather
+                // than the last level it happened to see.
+                let rate = self.rate as f32;
+                let meters = &mut self.chain_meters;
+                let mut due = false;
+                chain.process_music_tapped(&mut self.planar, count, |index, buf, frames| {
+                    due |= meters.push(index, buf, frames, rate);
+                });
+                if due {
+                    self.publish_chain_levels(&self.plan.blocks[block_ix].block.id);
+                }
+                self.metered_sounded = true;
+            } else if plan_block.settings.enabled {
                 chain.process_music(&mut self.planar, count);
             }
+            let chain = &mut self.chains[chain_ix];
             chain.apply_gain(&mut self.planar, count);
 
             // Atmospheres, laid over this block's music the same way the main

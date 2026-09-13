@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { symmetricCurve } from "../crossfadeCurve";
 import {
+  DEFAULT_CHAIN_ORDER,
   POPOVER_SECTIONS,
+  chainOrder,
+  deviceDefault,
+  withStageMoved,
   REVERB_MACRO_MAX_MIX,
   defaultBands,
   hasGain,
@@ -217,5 +221,97 @@ describe("the one-slider reverb", () => {
     expect(reverbAmount(byHand)).toBe(1);
     expect(reverbAmount({ ...byHand, enabled: false })).toBe(0);
     expect(reverbAmount({ ...byHand, mix: 0.3 })).toBeCloseTo(0.5, 6);
+  });
+});
+
+/**
+ * The chain order.
+ *
+ * The panel draws what the engine plays, so this has to resolve exactly the
+ * way `ChainStage::order` does in `audio/params.rs`: unknown ids dropped,
+ * missing stages left where they were, every stage exactly once.
+ */
+describe("chain order", () => {
+  it("defaults to the chain as it was before the order could be moved", () => {
+    expect(chainOrder(null)).toEqual(["eq", "delay", "reverb", "lofi", "panning"]);
+    expect(resolve([]).chainOrder).toEqual(DEFAULT_CHAIN_ORDER);
+  });
+
+  it("keeps every stage exactly once, whatever it was given", () => {
+    const order = chainOrder(["panning", "nonsense", "panning"]);
+    expect(order[0]).toBe("panning");
+    expect([...order].sort()).toEqual([...DEFAULT_CHAIN_ORDER].sort());
+  });
+
+  it("cascades like any other section", () => {
+    const resolved = resolve([{ chainOrder: ["reverb"] }, { chainOrder: ["lofi"] }]);
+    expect(resolved.chainOrder[0]).toBe("lofi");
+    expect(resolve([{ chainOrder: ["reverb"] }, {}]).chainOrder[0]).toBe("reverb");
+  });
+
+  it("moves a stage without losing or duplicating one", () => {
+    expect(withStageMoved(DEFAULT_CHAIN_ORDER, 3, 0)).toEqual([
+      "lofi",
+      "eq",
+      "delay",
+      "reverb",
+      "panning",
+    ]);
+    // Out-of-range moves clamp rather than dropping the stage.
+    expect(withStageMoved(DEFAULT_CHAIN_ORDER, 0, -4)).toEqual(DEFAULT_CHAIN_ORDER);
+    expect(withStageMoved(DEFAULT_CHAIN_ORDER, 0, 9)).toEqual([
+      "delay",
+      "reverb",
+      "lofi",
+      "panning",
+      "eq",
+    ]);
+    expect(withStageMoved(DEFAULT_CHAIN_ORDER, 7, 0)).toEqual(DEFAULT_CHAIN_ORDER);
+  });
+});
+
+/**
+ * The sections outside the chain have an order too, but it is only ever about
+ * where they are drawn: the engine never reads it.
+ */
+describe("layout order", () => {
+  it("defaults to the order the panel lists them in", () => {
+    expect(resolve([]).layoutOrder).toEqual([
+      "pitch",
+      "normalisation",
+      "crossfade",
+      "filters",
+    ]);
+  });
+
+  it("keeps every section once and cascades like any other", () => {
+    const resolved = resolve([{ layoutOrder: ["filters", "nonsense"] }]);
+    expect(resolved.layoutOrder).toEqual([
+      "filters",
+      "pitch",
+      "normalisation",
+      "crossfade",
+    ]);
+    // It is layout, so it says nothing about what the engine plays.
+    expect(resolved.chainOrder).toEqual(DEFAULT_CHAIN_ORDER);
+  });
+});
+
+/**
+ * A device arrives switched on: several effects default to bypassed so an
+ * untouched mix stays untouched, but one the user has gone to a menu and asked
+ * for should do something.
+ */
+describe("rack devices", () => {
+  it("adds effects switched on, and leaves the ones without a switch alone", () => {
+    expect(deviceDefault("reverb")).toMatchObject({ enabled: true });
+    expect(deviceDefault("delay")).toMatchObject({ enabled: true });
+    expect(deviceDefault("normalisation")).toMatchObject({ enabled: true });
+    expect(deviceDefault("panning")).toEqual({
+      mode: "stereoBalance",
+      position: 0,
+      width: 1,
+    });
+    expect(deviceDefault("filters")).toEqual([]);
   });
 });

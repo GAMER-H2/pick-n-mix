@@ -18,6 +18,9 @@ const emit = defineEmits<{ clear: [] }>();
 
 <template>
   <div class="header">
+    <!-- Anything that belongs in front of the title: the chain's drag grips
+         sit here so a stage's heading and its handle are one row. -->
+    <slot name="lead" />
     <span class="header__title">{{ title }}</span>
     <button
       v-if="canOverride && overridden"
